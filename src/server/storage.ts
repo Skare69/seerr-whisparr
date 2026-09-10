@@ -1056,10 +1056,38 @@ function isUniqueConflict(e: unknown, columns: readonly string[]): boolean {
   );
 }
 
-/** Opens (and migrates) the database eagerly. Call from the server-start hook,
- * never from a request path. */
+/** Opens (and migrates) the database eagerly, then repairs an upgraded
+ * configuration that predates the stored Whisparr instance identity. Without
+ * this, approvals on such an installation succeed while silently enqueueing no
+ * shared work. Call from the server-start hook, never from a request path. */
 export function initializeStorage(): void {
-  open();
+  const d = open();
+  const config = getConfig();
+  const whisparr = config?.whisparr;
+  if (!config || !whisparr) return;
+  if (!whisparr.instanceId) saveConfig(config);
+  const instanceId = getConfig()?.whisparr?.instanceId;
+  if (!instanceId) return;
+  // Approvals recorded before this instance identity existed enqueued nothing.
+  // INSERT OR IGNORE leaves already-tracked identities untouched.
+  inTransaction(d, () => {
+    const now = Date.now();
+    const state = whisparr.delivery?.enabled ? "unsent" : "blocked";
+    for (const row of S().listAllRequests.all() as RequestRow[]) {
+      if (row.decision !== "approved") continue;
+      S().insertAcquisition.run(
+        randomUUID(),
+        instanceId,
+        row.provider,
+        row.kind,
+        row.external_id,
+        state,
+        state === "unsent" ? now : null,
+        now,
+        now,
+      );
+    }
+  });
 }
 
 export function upsertCatalogRecord(detail: CatalogDetail): CatalogRecord {
@@ -1208,9 +1236,18 @@ export function decideRequest(
     S().decideRequest.run(decision, now, requestId);
     if (decision === "approved") {
       const whisparr = getConfig()?.whisparr;
+      if (whisparr && !whisparr.instanceId) {
+        // An approval that enqueues nothing is a silent no-op; refuse instead.
+        // initializeStorage backfills this identity for upgraded installs.
+        throw new AppError(
+          500,
+          "instance_identity_missing",
+          "the configured Whisparr connection has no stored instance identity",
+        );
+      }
       if (whisparr?.instanceId) {
         // Delivery disabled or unset leaves actionable blocked work, never a
-        // pretend success. No config identity means no acquisition exists yet.
+        // pretend success. No Whisparr at all means nothing to deliver to yet.
         const state = whisparr.delivery?.enabled ? "unsent" : "blocked";
         S().insertAcquisition.run(
           randomUUID(),

@@ -1092,3 +1092,40 @@ test("enabling delivery revives work approved while it was disabled", () => {
   assert.equal(due[0]?.state, "unsent");
   assert.equal(due[0]?.id, blocked?.id, "the same shared row is revived");
 });
+
+test("an upgraded config without an instance identity is repaired at startup", () => {
+  freshDir();
+  const config = deliveryConfig(true);
+  storage.bootstrap(config, ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // Simulate a pre-instanceId installation: same server, identity stripped.
+  const legacy = storage.getConfig() as IntegrationConfig;
+  const whisparr = legacy.whisparr as NonNullable<
+    IntegrationConfig["whisparr"]
+  >;
+  delete whisparr.instanceId;
+  storage.closeStorage();
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  raw
+    .prepare("UPDATE config SET data = ?, updated_at = ? WHERE id = 0")
+    .run(encryptForTest(JSON.stringify(legacy)), Date.now());
+  raw.close();
+  assert.equal(storage.getConfig()?.whisparr?.instanceId, undefined);
+
+  // Approving before repair must refuse rather than silently enqueue nothing.
+  const early = storage.createRequest(owner.id, MOVIE);
+  assert.throws(
+    () => storage.decideRequest(owner, early.id, "approved"),
+    (e: { code: string }) => e.code === "instance_identity_missing",
+  );
+
+  storage.initializeStorage();
+  assert.ok(storage.getConfig()?.whisparr?.instanceId, "identity backfilled");
+  storage.decideRequest(owner, early.id, "approved");
+  assert.equal(
+    storage.listDueAcquisitions(Date.now() + 60_000).length,
+    1,
+    "approval after repair enqueues real shared work",
+  );
+});
