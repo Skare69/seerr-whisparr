@@ -278,6 +278,18 @@ async function jellyfinHandler(
     if (!item) return json(res, 404, {});
     return json(res, 200, { MediaSources: jfItem(item).MediaSources });
   }
+  // Membership proof on Jellyfin 12.0.0: ancestors, never query scoping.
+  // Jellyfin reports the true library regardless of Velvarr grants; Velvarr
+  // compares it against the account's effective libraries.
+  if (/^\/Items\/[0-9a-f]{32}\/Ancestors$/.test(p) && req.method === "GET") {
+    const itemId = /Items\/([0-9a-f]{32})\/Ancestors/.exec(p)?.[1];
+    const item = fx.items.find((entry) => entry.Id === itemId);
+    if (!item) return json(res, 404, {});
+    return json(res, 200, [
+      { Id: item.libraryId, Name: "Fixture library", Type: "CollectionFolder" },
+      { Id: "f".repeat(32), Name: "media", Type: "UserRootFolder" },
+    ]);
+  }
   if (/^\/(?:Users\/[^/]+\/)?Items\/[0-9a-f]{32}\/Images\/Primary$/.test(p)) {
     const itemId = /Items\/([0-9a-f]{32})\/Images/.exec(p)?.[1];
     const item = fx.items.find((entry) => entry.Id === itemId);

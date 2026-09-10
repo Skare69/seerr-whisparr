@@ -12,11 +12,15 @@ import {
 } from "./http.ts";
 import type {
   Account,
+  CatalogProvider,
   ExternalUser,
   IntegrationConfig,
   Library,
   LibraryItem,
   LibraryPage,
+  MediaKind,
+  PlaybackAccess,
+  WhisparrPathMapping,
 } from "../lib/contracts.ts";
 
 // --- upstream DTO shapes (only the fields we consume) ---
@@ -36,6 +40,8 @@ interface UserDto {
 
 interface MediaSource {
   Id?: string;
+  Path?: string;
+  Size?: number;
   SupportsDirectPlay?: boolean;
   SupportsDirectStream?: boolean;
   SupportsTranscoding?: boolean;
@@ -50,6 +56,8 @@ interface BaseItemDto {
   Overview?: string;
   RunTimeTicks?: number;
   LocationType?: string;
+  Path?: string;
+  ProviderIds?: Record<string, string>;
   SortName?: string;
   ImageTags?: Record<string, string>;
   MediaSources?: MediaSource[];
@@ -286,6 +294,26 @@ function effectiveLibraries(
   return [...granted];
 }
 
+// Single home of the library-membership guarantee: some ancestor of the
+// item must be one of this account's granted (configured-intersected)
+// library folders. Every compared id goes through normalizeItemId.
+function hasGrantedAncestor(
+  config: IntegrationConfig,
+  account: Account,
+  ancestors: unknown,
+): boolean {
+  const grantedLibraries = new Set(effectiveLibraries(config, account));
+  return Array.isArray(ancestors)
+    ? ancestors.some((a) => {
+        try {
+          return grantedLibraries.has(normalizeItemId(a?.Id));
+        } catch {
+          return false;
+        }
+      })
+    : false;
+}
+
 // Credential-free browser link against the external web base, preserving any
 // reverse-proxy prefix. Undefined when the external URL is unusable.
 function watchUrlFor(
@@ -354,12 +382,15 @@ async function fetchItems(
     startIndex: number;
     limit: number;
     search: string;
+    // Extra /Items fields for identity matching (ProviderIds, Path).
+    extraFields?: string;
   },
 ): Promise<{ items: BaseItemDto[]; total: number }> {
   const params: Record<string, string> = {
     includeItemTypes: "Movie,Video,MusicVideo",
     fields:
-      "PrimaryImageAspectRatio,Overview,ProductionYear,RuntimeTicks,MediaSources,LocationType,SortName",
+      "PrimaryImageAspectRatio,Overview,ProductionYear,RuntimeTicks,MediaSources,LocationType,SortName" +
+      (opts.extraFields ? `,${opts.extraFields}` : ""),
     startIndex: String(opts.startIndex),
     limit: String(opts.limit),
   };
@@ -548,10 +579,14 @@ export async function listLibraryItems(
   );
 }
 
-// Exact membership proof: the item must be returned by a user-token query
-// scoped to BOTH the item id and one granted library folder. This is folder
-// proof, never a title/type guess, and the user token enforces the caller's
-// own item-level access on every call.
+// Exact membership proof: the item must be visible to the caller's user
+// token AND its ancestor chain must contain a granted library folder. This
+// is folder proof, never a title/type guess, and the user token enforces the
+// caller's own item-level access on every call.
+// ponytail: never reintroduce ids+parentId query scoping here — the lab
+// Jellyfin 12.0.0 silently ignores parentId whenever ids is present, so only
+// the ancestor chain (GET /Items/{id}/Ancestors) proves library membership
+// on that build.
 async function findGrantedItem(
   config: IntegrationConfig,
   userToken: string,
@@ -559,22 +594,36 @@ async function findGrantedItem(
   account: Account,
   itemId: string,
 ): Promise<BaseItemDto> {
-  for (const libraryId of effectiveLibraries(config, account)) {
-    const { items } = await fetchItems(config, userToken, user.id, {
-      parentId: libraryId,
-      ids: itemId,
-      startIndex: 0,
-      limit: 1,
-      search: "",
-    });
-    const found = items[0];
-    if (found) return found;
+  const { items } = await fetchItems(config, userToken, user.id, {
+    ids: itemId,
+    startIndex: 0,
+    limit: 1,
+    search: "",
+  });
+  const dto = items[0];
+  if (!dto) {
+    throw new AppError(
+      404,
+      "item_not_found",
+      "That item is not available to this account.",
+    );
   }
-  throw new AppError(
-    404,
-    "item_not_found",
-    "That item is not available to this account.",
+  // Outages here propagate as upstream errors — never a silent allow and
+  // never a fabricated denial.
+  const ancestors = await requestJson<BaseItemDto[]>(
+    config.jellyfin.url,
+    `/Items/${itemId}/Ancestors`,
+    userToken,
+    { service: "jellyfin" },
   );
+  if (!hasGrantedAncestor(config, account, ancestors)) {
+    throw new AppError(
+      404,
+      "item_not_found",
+      "That item is not available to this account.",
+    );
+  }
+  return dto;
 }
 
 export async function getLibraryItem(
@@ -649,4 +698,315 @@ export async function getLibraryImage(
     );
   }
   return { bytes: res.bytes, contentType: mime };
+}
+
+// --- M2 per-user playback resolution ---
+
+/** Identity hints for resolvePlaybackAccess. A MediaReference
+ * ({provider, kind, id}) is valid as-is; the remaining fields are optional
+ * enrichment from the acquisition record. */
+export type PlaybackHints = {
+  provider: CatalogProvider;
+  kind: MediaKind;
+  /** External provider UUID (TPDB movie/scene id, StashDB scene id). */
+  id: string;
+  /** Whisparr may store a TMDB id for movies. */
+  tmdbId?: number;
+  title?: string;
+  year?: number;
+  /** Whisparr's stored movie/scene path, before any path mapping. */
+  whisparrPath?: string;
+};
+
+interface CandidateItem {
+  dto: BaseItemDto;
+  paths: string[];
+  providerValues: string[];
+}
+
+// ponytail: the lab Jellyfin 12.0.0 (verified live) supplies empty
+// ProviderIds on items and silently ignores anyProviderIdEquals/providerIds
+// query filters, so identity matching must enumerate visible items once per
+// resolve and compare in-process. The caps bound that sweep; if a server's
+// library outgrows them, add a persisted item index keyed by provider id.
+const SWEEP_PAGE = 300;
+const SWEEP_MAX_ITEMS = 12_000;
+
+function pathComponents(path: string): string[] {
+  return path.split(/[\\/]+/).filter((c) => c.length > 0);
+}
+
+function looksWindows(path: string): boolean {
+  return path.includes("\\") || /^[a-zA-Z]:[\\/]/.test(path);
+}
+
+// Full-component prefix test. Never a loose substring: components must line
+// up exactly, with case folding only for Windows-style paths.
+function samePathPrefix(
+  prefix: string[],
+  full: string[],
+  fold: boolean,
+): boolean {
+  if (full.length < prefix.length) return false;
+  return prefix.every((part, i) =>
+    fold
+      ? part.toLowerCase() === (full[i] ?? "").toLowerCase()
+      : part === full[i],
+  );
+}
+
+// Maps a Whisparr path through the first matching configured mapping and
+// returns comparable components plus the case-fold decision. With no
+// matching mapping the path is compared as-is (shared-mount deployments).
+function mappedPrefix(
+  whisparrPath: string,
+  mappings: WhisparrPathMapping[] | undefined,
+): { comps: string[]; fold: boolean } {
+  const pathComps = pathComponents(whisparrPath);
+  for (const mapping of mappings ?? []) {
+    const prefixComps = pathComponents(mapping.whisparrPrefix);
+    const fold =
+      looksWindows(whisparrPath) ||
+      looksWindows(mapping.whisparrPrefix) ||
+      looksWindows(mapping.jellyfinPrefix);
+    if (
+      prefixComps.length > 0 &&
+      samePathPrefix(prefixComps, pathComps, fold)
+    ) {
+      return {
+        comps: [
+          ...pathComponents(mapping.jellyfinPrefix),
+          ...pathComps.slice(prefixComps.length),
+        ],
+        fold,
+      };
+    }
+  }
+  return { comps: pathComps, fold: looksWindows(whisparrPath) };
+}
+
+function toCandidate(dto: BaseItemDto): CandidateItem {
+  const paths = [
+    dto.Path ?? "",
+    ...(dto.MediaSources ?? []).map((s) => s.Path ?? ""),
+  ]
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  const providerValues = Object.values(dto.ProviderIds ?? {})
+    .map((v) => String(v).trim().toLowerCase())
+    .filter((v) => v.length > 0);
+  return { dto, paths, providerValues };
+}
+
+function providerIdMatches(
+  candidate: CandidateItem,
+  hints: PlaybackHints,
+): boolean {
+  if (candidate.providerValues.includes(hints.id.trim().toLowerCase())) {
+    return true;
+  }
+  return (
+    hints.tmdbId !== undefined &&
+    hints.tmdbId > 0 &&
+    candidate.providerValues.includes(String(hints.tmdbId))
+  );
+}
+
+function pathMatches(
+  candidate: CandidateItem,
+  prefix: string[],
+  hintFold: boolean,
+): boolean {
+  return candidate.paths.some((p) =>
+    samePathPrefix(prefix, pathComponents(p), hintFold || looksWindows(p)),
+  );
+}
+
+// Title/year agreement is similarity, never identity; it only ever
+// contributes an 'ambiguous' verdict for administrator review.
+function titleYearSimilar(dto: BaseItemDto, hints: PlaybackHints): boolean {
+  if (!hints.title || !dto.Name) return false;
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  if (norm(dto.Name) !== norm(hints.title)) return false;
+  if (
+    hints.year !== undefined &&
+    dto.ProductionYear !== undefined &&
+    dto.ProductionYear !== hints.year
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function sweepVisibleItems(
+  config: IntegrationConfig,
+  userToken: string,
+  userId: string,
+): Promise<CandidateItem[]> {
+  const out: CandidateItem[] = [];
+  for (let start = 0; start < SWEEP_MAX_ITEMS; start += SWEEP_PAGE) {
+    const { items } = await fetchItems(config, userToken, userId, {
+      startIndex: start,
+      limit: SWEEP_PAGE,
+      search: "",
+      extraFields: "ProviderIds,Path",
+    });
+    for (const dto of items) out.push(toCandidate(dto));
+    if (items.length < SWEEP_PAGE) break;
+  }
+  return out;
+}
+
+// Verdict for one exactly matched candidate. Every call re-runs under the
+// user token, so item-level policy applies each time. A visible-but-ungranted
+// item is 'denied', never 'missing'; a placeholder or empty file is
+// 'denied', never 'available'.
+async function verdictForItem(
+  config: IntegrationConfig,
+  userToken: string,
+  user: ExternalUser,
+  account: Account,
+  candidate: CandidateItem,
+): Promise<PlaybackAccess> {
+  const itemId = normalizeItemId(candidate.dto.Id);
+  if (!user.enableMediaPlayback) {
+    return {
+      outcome: "denied",
+      reason: "Playback is disabled for this Jellyfin user.",
+    };
+  }
+  // Grant proof by ancestry — the only exact folder-membership proof on the
+  // lab Jellyfin 12.0.0 (parentId is ignored alongside ids there); shares
+  // hasGrantedAncestor with findGrantedItem.
+  let ancestors: BaseItemDto[];
+  try {
+    ancestors = await requestJson<BaseItemDto[]>(
+      config.jellyfin.url,
+      `/Items/${itemId}/Ancestors`,
+      userToken,
+      { service: "jellyfin" },
+    );
+  } catch (err) {
+    if (err instanceof AppError && err.upstreamStatus === 404) {
+      // Invisible to this user at the item level: denied, never missing.
+      return {
+        outcome: "denied",
+        reason: "The matched item is outside this account's granted libraries.",
+      };
+    }
+    throw err; // the outer catch maps non-auth failures to 'unavailable'
+  }
+  if (!hasGrantedAncestor(config, account, ancestors)) {
+    return {
+      outcome: "denied",
+      reason: "The matched item is outside this account's granted libraries.",
+    };
+  }
+  const playback = await requestJson<PlaybackInfoResponse>(
+    config.jellyfin.url,
+    `/Items/${itemId}/PlaybackInfo?userId=${user.id}&autoOpenLiveStream=false`,
+    userToken,
+    { service: "jellyfin" },
+  );
+  if (candidate.dto.LocationType === "Virtual") {
+    return {
+      outcome: "denied",
+      reason: "The matched item is a placeholder without media.",
+    };
+  }
+  const sources = playback?.MediaSources ?? candidate.dto.MediaSources ?? [];
+  const playable = sources.some(
+    (s) =>
+      (s.SupportsDirectPlay === true ||
+        s.SupportsDirectStream === true ||
+        s.SupportsTranscoding === true) &&
+      s.Size !== 0,
+  );
+  if (!playable) {
+    return {
+      outcome: "denied",
+      reason: "No playable media source (file missing or empty).",
+    };
+  }
+  // mapLibraryItem embeds watchUrlFor: the credential-free link is present
+  // only when playback is actually permitted, and absent otherwise.
+  const item = mapLibraryItem(
+    candidate.dto,
+    user,
+    config,
+    playback?.MediaSources,
+  );
+  if (!item.canPlay) {
+    return {
+      outcome: "denied",
+      reason: "Playback is not permitted for this item.",
+    };
+  }
+  return {
+    outcome: "available",
+    item,
+    ...(item.watchUrl ? { watchUrl: item.watchUrl } : {}),
+  };
+}
+
+// Per-user availability verdict for one external identity. Runs entirely
+// under the caller's Jellyfin user token, reads existing state only, and
+// never mutates the server. Matching precedence, strictest first:
+// 1. exact ProviderIds match, compared in-process (no server-side filter
+//    exists on Jellyfin 12.0.0 — verified live);
+// 2. exact Whisparr-to-Jellyfin path correspondence through the configured
+//    pathMappings, full components only;
+// 3. title/year similarity alone is 'ambiguous', never a guess.
+// Auth failures (401, dead user token) propagate; every other upstream
+// failure is 'unavailable', so an outage is never reported as 'missing'.
+export async function resolvePlaybackAccess(
+  config: IntegrationConfig,
+  userToken: string,
+  account: Account,
+  hints: PlaybackHints,
+): Promise<PlaybackAccess> {
+  requireJellyfinConfig(config);
+  if (!hints || typeof hints.id !== "string" || hints.id.trim() === "") {
+    throw new AppError(400, "invalid_reference", "A provider id is required.");
+  }
+  if (effectiveLibraries(config, account).length === 0) {
+    return {
+      outcome: "denied",
+      reason: "No libraries are granted to this account.",
+    };
+  }
+  try {
+    const user = await getCurrentUser(config, userToken);
+    const candidates = await sweepVisibleItems(config, userToken, user.id);
+    const mapped = hints.whisparrPath
+      ? mappedPrefix(hints.whisparrPath, config.whisparr?.pathMappings)
+      : undefined;
+    const exact = candidates.filter(
+      (c) =>
+        providerIdMatches(c, hints) ||
+        (mapped !== undefined && pathMatches(c, mapped.comps, mapped.fold)),
+    );
+    if (exact.length > 1) {
+      return {
+        outcome: "ambiguous",
+        reason: "Multiple Jellyfin items match this identity.",
+      };
+    }
+    if (exact.length === 1) {
+      return await verdictForItem(config, userToken, user, account, exact[0]!);
+    }
+    if (candidates.some((c) => titleYearSimilar(c.dto, hints))) {
+      return {
+        outcome: "ambiguous",
+        reason: "Title/year similarity only; administrator review required.",
+      };
+    }
+    return { outcome: "missing" };
+  } catch (err) {
+    if (err instanceof AppError && err.upstreamStatus === 401) throw err;
+    if (err instanceof AppError) {
+      return { outcome: "unavailable", reason: err.message };
+    }
+    throw err;
+  }
 }

@@ -1057,13 +1057,24 @@ function membershipHandler(): {
     const path = pathOf(url);
     if (path === "/users/me") return sendJson(res, 200, ME);
     if (path === `/users/${ME_ID}/items`) {
-      const query = queryOf(url);
-      const found =
-        query.get("ids") === ITEM_ID && query.get("parentId") === LIB_B;
+      // The lab Jellyfin 12.0.0 ignores parentId whenever ids is present,
+      // so this stub returns the item for ANY ids query — exactly like the
+      // real build. Membership must therefore come from the ancestor chain.
+      const found = queryOf(url).get("ids") === ITEM_ID;
       return sendJson(res, 200, {
         Items: found ? [ITEM_DTO] : [],
         TotalRecordCount: found ? 1 : 0,
       });
+    }
+    if (path === `/items/${ITEM_ID}/ancestors`) {
+      // The item lives in LIB_B.
+      return sendJson(res, 200, [
+        {
+          Id: dashed(LIB_B),
+          Name: "Adult Movies",
+          Type: "CollectionFolder",
+        },
+      ]);
     }
     if (path === `/items/${ITEM_ID}/playbackinfo`) {
       playbackAuthorization = req.headers.authorization;
@@ -1093,10 +1104,17 @@ test("getLibraryItem proves membership under a granted library before detail", a
       item.watchUrl,
       `${fx.origin}/jf/web/index.html#!/details?id=${ITEM_ID}&serverId=${SERVER_ID}`,
     );
-    // PlaybackInfo ran under the caller's own user token.
+    // PlaybackInfo and the ancestor proof both ran under the caller's own
+    // user token; ungranted LIB_C was never part of any check.
     assert.ok((playbackAuth() ?? "").includes(`Token="${TOKEN}"`));
-    // No upstream Paths leak, and ungranted LIB_C was never queried.
     assert.equal(JSON.stringify(item).includes("/mnt/secret"), false);
+    const ancestorsQuery = fx.log.find(
+      (r) => pathOf(r.url) === `/items/${ITEM_ID}/ancestors`,
+    );
+    assert.ok(ancestorsQuery, "expected the ancestor membership probe");
+    assert.ok(
+      (ancestorsQuery.headers.authorization ?? "").includes(`Token="${TOKEN}"`),
+    );
     assert.equal(
       fx.log.some((r) => queryOf(r.url).get("parentId") === LIB_C),
       false,
@@ -1107,8 +1125,10 @@ test("getLibraryItem proves membership under a granted library before detail", a
 test("getLibraryItem denies items that live outside granted libraries", async () => {
   const { handler } = membershipHandler();
   await withFixture(handler, async (fx) => {
-    // Upstream keeps the item in LIB_B, but grants cover LIB_A only: the
-    // proof query never touches LIB_B, so the item stays unreachable.
+    // Regression for the lab Jellyfin 12.0.0, which ignores parentId when
+    // ids is present: the fixture returns the item for ANY ids query, so the
+    // old ids+parentId proof wrongly granted access here. Only the ancestor
+    // chain (item lives in LIB_B, grants cover LIB_A) can deny it.
     await assert.rejects(
       getLibraryItem(
         jellyfinConfig(fx.origin, [LIB_A]),
@@ -1126,7 +1146,43 @@ test("getLibraryItem denies items that live outside granted libraries", async ()
       fx.log.some((r) => queryOf(r.url).get("parentId") === LIB_B),
       false,
     );
+    // The denial came from the ancestor chain, not from query scoping.
+    assert.ok(
+      fx.log.some((r) => pathOf(r.url) === `/items/${ITEM_ID}/ancestors`),
+    );
   });
+});
+
+test("getLibraryItem reports an ancestors outage as an upstream error", async () => {
+  // A genuine outage during the membership proof is an error — never a
+  // silent allow and never a fabricated denial.
+  await withFixture(
+    (req, res) => {
+      const path = pathOf(req.url ?? "");
+      if (path === "/users/me") return sendJson(res, 200, ME);
+      if (path === `/users/${ME_ID}/items`) {
+        const found = queryOf(req.url ?? "").get("ids") === ITEM_ID;
+        return sendJson(res, 200, {
+          Items: found ? [ITEM_DTO] : [],
+          TotalRecordCount: found ? 1 : 0,
+        });
+      }
+      if (path === `/items/${ITEM_ID}/ancestors`)
+        return sendJson(res, 500, { message: "boom" });
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      await assert.rejects(
+        getLibraryItem(
+          jellyfinConfig(fx.origin, [LIB_A, LIB_B]),
+          TOKEN,
+          account([LIB_A, LIB_B]),
+          ITEM_ID,
+        ),
+        appError(502, "upstream_unavailable"),
+      );
+    },
+  );
 });
 
 test("getLibraryItem denies empty grant sets without upstream calls", async () => {
@@ -1154,13 +1210,17 @@ test("getLibraryImage returns authorized raster bytes with allowlisted MIME", as
       const path = pathOf(req.url ?? "");
       if (path === "/users/me") return sendJson(res, 200, ME);
       if (path === `/users/${ME_ID}/items`) {
-        const query = queryOf(req.url ?? "");
-        const found =
-          query.get("ids") === ITEM_ID && query.get("parentId") === LIB_A;
+        // Real-build mimicry: ids wins, parentId is ignored.
+        const found = queryOf(req.url ?? "").get("ids") === ITEM_ID;
         return sendJson(res, 200, {
           Items: found ? [ITEM_DTO] : [],
           TotalRecordCount: found ? 1 : 0,
         });
+      }
+      if (path === `/items/${ITEM_ID}/ancestors`) {
+        return sendJson(res, 200, [
+          { Id: dashed(LIB_A), Name: "Adult Movies", Type: "CollectionFolder" },
+        ]);
       }
       if (path === `/items/${ITEM_ID}/images/primary`) {
         return sendBytes(res, 200, PNG_BYTES, "image/png");
@@ -1198,13 +1258,16 @@ test("getLibraryImage reauthorizes membership first and enforces bounds", async 
       const path = pathOf(req.url ?? "");
       if (path === "/users/me") return sendJson(res, 200, ME);
       if (path === `/users/${ME_ID}/items`) {
-        const query = queryOf(req.url ?? "");
-        const member =
-          query.get("ids") === ITEM_ID && query.get("parentId") === LIB_A;
+        const member = queryOf(req.url ?? "").get("ids") === ITEM_ID;
         return sendJson(res, 200, {
           Items: member ? [ITEM_DTO] : [],
           TotalRecordCount: member ? 1 : 0,
         });
+      }
+      if (path === `/items/${ITEM_ID}/ancestors`) {
+        return sendJson(res, 200, [
+          { Id: dashed(LIB_A), Name: "Adult Movies", Type: "CollectionFolder" },
+        ]);
       }
       if (path === `/items/${ITEM_ID}/images/primary`) {
         const next = imageBehaviors.shift();
@@ -1265,6 +1328,11 @@ test("getLibraryImage rejects items without a primary image before fetching", as
           Items: [{ ...ITEM_DTO, ImageTags: {} }],
           TotalRecordCount: 1,
         });
+      }
+      if (path === `/items/${ITEM_ID}/ancestors`) {
+        return sendJson(res, 200, [
+          { Id: dashed(LIB_A), Name: "Adult Movies", Type: "CollectionFolder" },
+        ]);
       }
       sendJson(res, 404, {});
     },
@@ -1368,4 +1436,1231 @@ test("normalizeItemId canonicalizes external UUIDs and rejects everything else",
     () => normalizeItemId(`${"a".repeat(31)}g`),
     appError(400, "invalid_id"),
   );
+});
+
+// --- M2 availability: per-user resolvePlaybackAccess ---
+// Disjoint block owned by M2Availability. All fixtures are local 127.0.0.1
+// HTTP stubs; every verdict must run under the caller's user token and never
+// mutate the server (GET only, user token only).
+
+import { resolvePlaybackAccess } from "../src/server/jellyfin.ts";
+import type { PlaybackAccess } from "../src/lib/contracts.ts";
+
+const AV_PID = hexId(0x101);
+const AV_PATH = hexId(0x102);
+const AV_ED1 = hexId(0x103);
+const AV_ED2 = hexId(0x104);
+const AV_DENY = hexId(0x105);
+const AV_OUTSIDE = hexId(0x106);
+const AV_SEQ = hexId(0x107);
+const AV_SIM = hexId(0x108);
+const AV_PHANTOM = hexId(0x109);
+
+interface AvEntry {
+  item: Record<string, unknown>;
+  lib: string;
+}
+
+function avItem(o: {
+  id: string;
+  name: string;
+  year?: number;
+  providerIds?: Record<string, string>;
+  path?: string;
+  locationType?: string;
+}): Record<string, unknown> {
+  const path = o.path ?? "";
+  return {
+    Id: dashed(o.id),
+    Name: o.name,
+    Type: "Movie",
+    ...(o.year ? { ProductionYear: o.year } : {}),
+    LocationType: o.locationType ?? "FileSystem",
+    ProviderIds: o.providerIds ?? {},
+    ...(path ? { Path: path } : {}),
+    ...(path
+      ? {
+          MediaSources: [
+            {
+              Id: "src1",
+              Path: path,
+              Size: 21_000,
+              SupportsDirectPlay: true,
+              SupportsDirectStream: true,
+              SupportsTranscoding: true,
+            },
+          ],
+        }
+      : { MediaSources: [] }),
+  };
+}
+
+function avEntries(): AvEntry[] {
+  return [
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_PID,
+        name: "Provider Movie",
+        year: 2024,
+        providerIds: { Tmdb: "6789", Tpdb: "tpdb-movie-uuid" },
+        path: "C:\\media\\movies\\Provider Movie\\Provider Movie.mkv",
+      }),
+    },
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_PATH,
+        name: "Path Movie",
+        year: 2020,
+        path: "C:\\media\\movies\\Path Movie (2020)\\Path Movie (2020).mkv",
+      }),
+    },
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_ED1,
+        name: "Edition Split",
+        year: 2019,
+        path: "C:\\media\\movies\\Edition Split\\Edition A.mkv",
+      }),
+    },
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_ED2,
+        name: "Edition Split",
+        year: 2019,
+        path: "C:\\media\\movies\\Edition Split\\Edition B.mkv",
+      }),
+    },
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_DENY,
+        name: "Empty File Movie",
+        providerIds: { Tpdb: "tpdb-deny-uuid" },
+        path: "C:\\media\\movies\\Empty File Movie\\Empty File Movie.mkv",
+      }),
+    },
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_OUTSIDE,
+        name: "Ungranted Movie",
+        providerIds: { Tpdb: "tpdb-outside-uuid" },
+        path: "C:\\media\\movies\\Ungranted Movie\\Ungranted Movie.mkv",
+      }),
+    },
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_SEQ,
+        name: "Path Movie (2020) Sequel",
+        year: 2023,
+        path: "C:\\media\\movies\\Path Movie (2020) Sequel\\Sequel.mkv",
+      }),
+    },
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_SIM,
+        name: "Similar Title",
+        year: 2021,
+        path: "C:\\media\\movies\\Similar Title\\Similar Title.mkv",
+      }),
+    },
+    {
+      lib: LIB_A,
+      item: avItem({
+        id: AV_PHANTOM,
+        name: "Phantom Movie",
+        providerIds: { Tpdb: "tpdb-phantom-uuid" },
+        locationType: "Virtual",
+      }),
+    },
+  ];
+}
+
+function avConfig(origin: string, libraryIds: string[]): IntegrationConfig {
+  return {
+    ...jellyfinConfig(origin, libraryIds),
+    whisparr: {
+      url: origin,
+      apiKey: WH_KEY,
+      pathMappings: [
+        {
+          whisparrPrefix: "X:\\Media\\Movies",
+          jellyfinPrefix: "C:\\media\\movies",
+        },
+      ],
+    },
+  };
+}
+
+function avHandler(opts: {
+  entries: AvEntry[];
+  me?: Record<string, unknown>;
+  meStatus?: number;
+  sweepStatus?: number;
+  /** compact item id -> PlaybackInfo MediaSources override. */
+  playback?: Record<string, unknown[]>;
+}): FixtureHandler {
+  return (req, res) => {
+    const path = pathOf(req.url ?? "");
+    const q = queryOf(req.url ?? "");
+    if (path === "/users/me") {
+      if (opts.meStatus) return sendJson(res, opts.meStatus, {});
+      return sendJson(res, 200, opts.me ?? ME);
+    }
+    if (path === `/users/${ME_ID}/items`) {
+      if (opts.sweepStatus) return sendJson(res, opts.sweepStatus, {});
+      const items = opts.entries.map((e) => e.item);
+      return sendJson(res, 200, {
+        Items: items,
+        TotalRecordCount: items.length,
+      });
+    }
+    const anc = path.match(/^\/items\/([0-9a-f]{32})\/ancestors$/);
+    if (anc) {
+      const entry = opts.entries.find(
+        (e) => String(e.item.Id).replace(/-/g, "") === (anc[1] ?? ""),
+      );
+      if (!entry) return sendJson(res, 404, {});
+      // The item's library folder is its only meaningful ancestor here.
+      return sendJson(res, 200, [
+        {
+          Id: dashed(entry.lib),
+          Name: "Adult Library",
+          Type: "CollectionFolder",
+        },
+      ]);
+    }
+    const info = path.match(/^\/items\/([0-9a-f]{32})\/playbackinfo$/);
+    if (info) {
+      const sources = opts.playback?.[info[1] ?? ""] ?? [
+        {
+          Id: "src1",
+          Size: 21_000,
+          SupportsDirectPlay: true,
+          SupportsDirectStream: true,
+          SupportsTranscoding: true,
+        },
+      ];
+      return sendJson(res, 200, { MediaSources: sources });
+    }
+    sendJson(res, 404, {});
+  };
+}
+
+function avItemId(verdict: PlaybackAccess): string {
+  return verdict.outcome === "available" ? verdict.item.id : "";
+}
+
+function avSweepRequest(fx: Fixture): RecordedRequest {
+  const sweep = fx.log.find((r) => pathOf(r.url) === `/users/${ME_ID}/items`);
+  assert.ok(sweep, "expected a user-token candidate sweep request");
+  return sweep;
+}
+
+test("resolvePlaybackAccess matches exactly by provider id and links only playable items", async () => {
+  await withFixture(avHandler({ entries: avEntries() }), async (fx) => {
+    const verdict = await resolvePlaybackAccess(
+      avConfig(fx.origin, [LIB_A]),
+      TOKEN,
+      account([LIB_A]),
+      { provider: "tpdb", kind: "movie", id: "tpdb-movie-uuid" },
+    );
+    const watchUrl = `${fx.origin}/jf/web/index.html#!/details?id=${AV_PID}&serverId=${SERVER_ID}`;
+    assert.deepEqual(verdict, {
+      outcome: "available",
+      item: {
+        id: AV_PID,
+        name: "Provider Movie",
+        kind: "movie",
+        year: 2024,
+        canPlay: true,
+        watchUrl,
+      },
+      watchUrl,
+    });
+    // Security posture: the sweep is a user-token GET that asks for
+    // ProviderIds and Path (no provider-id filter exists on this build).
+    const sweep = avSweepRequest(fx);
+    const fields = queryOf(sweep.url).get("fields") ?? "";
+    assert.ok(fields.includes("ProviderIds"));
+    assert.ok(fields.includes("Path"));
+    const auth = String(sweep.headers.authorization ?? "");
+    assert.ok(auth.includes(`Token="${TOKEN}"`));
+    assert.ok(!auth.includes(ADMIN_KEY));
+    assert.equal(sweep.body, "");
+    assert.ok(
+      fx.log.every((r) => r.method === "GET"),
+      "read-only",
+    );
+  });
+});
+
+test("resolvePlaybackAccess matches by mapped path with full components only", async () => {
+  await withFixture(avHandler({ entries: avEntries() }), async (fx) => {
+    const cfg = avConfig(fx.origin, [LIB_A]);
+    const grants = account([LIB_A]);
+    // Forward-slash Whisparr path maps onto the Windows Jellyfin path.
+    assert.equal(
+      avItemId(
+        await resolvePlaybackAccess(cfg, TOKEN, grants, {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-unmapped-uuid",
+          whisparrPath: "X:/Media/Movies/Path Movie (2020)",
+        }),
+      ),
+      AV_PATH,
+    );
+    // Windows-style mappings are case-insensitive on components.
+    assert.equal(
+      avItemId(
+        await resolvePlaybackAccess(cfg, TOKEN, grants, {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-unmapped-uuid",
+          whisparrPath: "x:\\MEDIA\\MOVIES\\Path Movie (2020)",
+        }),
+      ),
+      AV_PATH,
+    );
+    // A suffix inside one component is never a substring match.
+    assert.deepEqual(
+      await resolvePlaybackAccess(cfg, TOKEN, grants, {
+        provider: "tpdb",
+        kind: "movie",
+        id: "tpdb-unmapped-uuid",
+        whisparrPath: "X:\\Media\\Movies\\Path Movie (2020) x",
+      }),
+      { outcome: "missing" },
+    );
+    // The Sequel item is its own exact match, not a collision.
+    assert.equal(
+      avItemId(
+        await resolvePlaybackAccess(cfg, TOKEN, grants, {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-unmapped-uuid",
+          whisparrPath: "X:\\Media\\Movies\\Path Movie (2020) Sequel",
+        }),
+      ),
+      AV_SEQ,
+    );
+  });
+});
+
+test("resolvePlaybackAccess reports ambiguity instead of guessing", async () => {
+  await withFixture(avHandler({ entries: avEntries() }), async (fx) => {
+    const cfg = avConfig(fx.origin, [LIB_A]);
+    // Two editions share one mapped folder: ambiguous, never a guess.
+    assert.deepEqual(
+      await resolvePlaybackAccess(cfg, TOKEN, account([LIB_A]), {
+        provider: "tpdb",
+        kind: "movie",
+        id: "tpdb-unmapped-uuid",
+        whisparrPath: "X:\\Media\\Movies\\Edition Split",
+      }),
+      {
+        outcome: "ambiguous",
+        reason: "Multiple Jellyfin items match this identity.",
+      },
+    );
+    // Title/year agreement alone is also ambiguous for review.
+    assert.deepEqual(
+      await resolvePlaybackAccess(cfg, TOKEN, account([LIB_A]), {
+        provider: "tpdb",
+        kind: "movie",
+        id: "tpdb-unknown-uuid",
+        title: "Similar Title",
+        year: 2021,
+      }),
+      {
+        outcome: "ambiguous",
+        reason: "Title/year similarity only; administrator review required.",
+      },
+    );
+  });
+});
+
+test("resolvePlaybackAccess denies playback for policy, empty, and placeholder items", async () => {
+  await withFixture(
+    avHandler({
+      entries: avEntries(),
+      me: {
+        ...ME,
+        Policy: { ...ME.Policy, EnableMediaPlayback: false },
+      },
+    }),
+    async (fx) => {
+      const cfg = avConfig(fx.origin, [LIB_A]);
+      assert.deepEqual(
+        await resolvePlaybackAccess(cfg, TOKEN, account([LIB_A]), {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-movie-uuid",
+        }),
+        {
+          outcome: "denied",
+          reason: "Playback is disabled for this Jellyfin user.",
+        },
+      );
+    },
+  );
+  await withFixture(
+    avHandler({
+      entries: avEntries(),
+      playback: {
+        // Zero-length media: proven present but unplayable.
+        [AV_DENY]: [
+          {
+            Id: "src1",
+            Size: 0,
+            SupportsDirectPlay: true,
+            SupportsDirectStream: true,
+            SupportsTranscoding: true,
+          },
+        ],
+      },
+    }),
+    async (fx) => {
+      const cfg = avConfig(fx.origin, [LIB_A]);
+      const grants = account([LIB_A]);
+      assert.deepEqual(
+        await resolvePlaybackAccess(cfg, TOKEN, grants, {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-deny-uuid",
+        }),
+        {
+          outcome: "denied",
+          reason: "No playable media source (file missing or empty).",
+        },
+      );
+      assert.deepEqual(
+        await resolvePlaybackAccess(cfg, TOKEN, grants, {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-phantom-uuid",
+        }),
+        {
+          outcome: "denied",
+          reason: "The matched item is a placeholder without media.",
+        },
+      );
+    },
+  );
+});
+
+test("resolvePlaybackAccess reports absent items as missing", async () => {
+  await withFixture(avHandler({ entries: avEntries() }), async (fx) => {
+    assert.deepEqual(
+      await resolvePlaybackAccess(
+        avConfig(fx.origin, [LIB_A]),
+        TOKEN,
+        account([LIB_A]),
+        {
+          provider: "tpdb",
+          kind: "scene",
+          id: "tpdb-nothing",
+        },
+      ),
+      { outcome: "missing" },
+    );
+  });
+});
+
+test("resolvePlaybackAccess reports outages as unavailable and propagates auth failures", async () => {
+  await withFixture(
+    avHandler({ entries: avEntries(), sweepStatus: 500 }),
+    async (fx) => {
+      const verdict = await resolvePlaybackAccess(
+        avConfig(fx.origin, [LIB_A]),
+        TOKEN,
+        account([LIB_A]),
+        { provider: "tpdb", kind: "movie", id: "tpdb-movie-uuid" },
+      );
+      assert.equal(verdict.outcome, "unavailable");
+      if (verdict.outcome !== "unavailable") return assert.fail("unreachable");
+      assert.ok(verdict.reason !== undefined && verdict.reason.length > 0);
+    },
+  );
+  await withFixture(
+    avHandler({ entries: avEntries(), meStatus: 401 }),
+    async (fx) => {
+      await assert.rejects(
+        resolvePlaybackAccess(
+          avConfig(fx.origin, [LIB_A]),
+          TOKEN,
+          account([LIB_A]),
+          {
+            provider: "tpdb",
+            kind: "movie",
+            id: "tpdb-movie-uuid",
+          },
+        ),
+        appError(401, "upstream_auth"),
+      );
+    },
+  );
+});
+
+test("resolvePlaybackAccess enforces grant scope before availability", async () => {
+  await withFixture(avHandler({ entries: avEntries() }), async (fx) => {
+    // Empty grants deny without contacting Jellyfin at all.
+    assert.deepEqual(
+      await resolvePlaybackAccess(avConfig(fx.origin, []), TOKEN, account([]), {
+        provider: "tpdb",
+        kind: "movie",
+        id: "tpdb-outside-uuid",
+      }),
+      {
+        outcome: "denied",
+        reason: "No libraries are granted to this account.",
+      },
+    );
+    assert.equal(fx.log.length, 0, "empty grants must not touch upstream");
+    // Visible to the user's token but outside the account's grants:
+    // denied, never missing.
+    assert.deepEqual(
+      await resolvePlaybackAccess(
+        avConfig(fx.origin, [LIB_B]),
+        TOKEN,
+        account([LIB_B]),
+        {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-outside-uuid",
+        },
+      ),
+      {
+        outcome: "denied",
+        reason: "The matched item is outside this account's granted libraries.",
+      },
+    );
+  });
+});
+
+// --- M2 delivery: Whisparr resolution, adoption, observation, gated adds ---
+// Disjoint block owned by M2Delivery. Fixture-local helpers; every flow is
+// GET-only except the explicitly POSTed add path, which is only ever pointed
+// at the local stub.
+
+import {
+  buildMoviePayload,
+  deliverToWhisparr,
+  findWhisparrItem,
+  getWhisparrItem,
+  observeWhisparrItem,
+  resolveWhisparrItem,
+  type WhisparrDeliveryTarget,
+} from "../src/server/whisparr.ts";
+import type { WhisparrDelivery } from "../src/lib/contracts.ts";
+
+const MOVIE_UUID = dashed(hexId(0x2a1));
+const SCENE_UUID = dashed(hexId(0x2b2));
+const OTHER_UUID = dashed(hexId(0x2c3));
+
+const DELIVERY: WhisparrDelivery = {
+  enabled: true,
+  rootFolderPath: "/data/xxx",
+  qualityProfileId: 7,
+  searchOnAdd: true,
+};
+function deliveryConfig(
+  origin: string,
+  delivery?: WhisparrDelivery,
+): IntegrationConfig {
+  return {
+    ...whisparrConfig(origin),
+    whisparr: {
+      url: origin,
+      apiKey: WH_KEY,
+      // Absent delivery is the disabled state; gate variants pass a full but
+      // invalid/disabled WhisparrDelivery.
+      ...(delivery ? { delivery } : {}),
+    },
+  };
+}
+const movieRef = { provider: "tpdb", kind: "movie", id: MOVIE_UUID } as const;
+const sceneRef = {
+  provider: "stashdb",
+  kind: "scene",
+  id: SCENE_UUID,
+} as const;
+
+/** Stored TPDB movie resource, using exactly the fields observed live on
+ * GET /api/v3/movie/{id} (rootFolderPath only appears on the unfiltered
+ * list, so it is never required on a read). */
+function storedMovie(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 2,
+    itemType: "movie",
+    title: "Sample Movie",
+    monitored: true,
+    hasFile: false,
+    movieFileId: 0,
+    movieFile: null,
+    sizeOnDisk: 0,
+    status: "released",
+    isAvailable: true,
+    path: "/data/xxx/Sample Movie",
+    foreignId: `tpdbId:${MOVIE_UUID}`,
+    tmdbId: 0,
+    tpdbId: MOVIE_UUID,
+    statistics: { movieFileCount: 0, sizeOnDisk: 0, releaseGroups: [] },
+    ...overrides,
+  };
+}
+
+/** Stored StashDB scene resource: bare UUID ForeignId, no tpdbId key. */
+function storedScene(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 3,
+    itemType: "scene",
+    title: "Sample Scene",
+    monitored: true,
+    hasFile: false,
+    movieFileId: 0,
+    movieFile: null,
+    sizeOnDisk: 0,
+    status: "released",
+    isAvailable: true,
+    path: "/data/xxx/Sample Scene",
+    foreignId: SCENE_UUID,
+    tmdbId: 0,
+    stashId: SCENE_UUID,
+    statistics: { movieFileCount: 0, sizeOnDisk: 0, releaseGroups: [] },
+    ...overrides,
+  };
+}
+
+/** Lookup results carry no stored id and no path — they are never stored
+ * items and must never be spread into an add body. */
+function lookupMovie(overrides: Record<string, unknown> = {}) {
+  return {
+    itemType: "movie",
+    title: "Sample Movie",
+    foreignId: `tpdbId:${MOVIE_UUID}`,
+    tmdbId: 0,
+    tpdbId: MOVIE_UUID,
+    ...overrides,
+  };
+}
+
+function lookupScene(overrides: Record<string, unknown> = {}) {
+  return {
+    itemType: "scene",
+    title: "Sample Scene",
+    foreignId: SCENE_UUID,
+    tmdbId: 0,
+    stashId: SCENE_UUID,
+    ...overrides,
+  };
+}
+
+/** Test-side mirror of the documented Whisparr AddMovieService.GetMetadata
+ * precedence: numeric ForeignId -> TmdbId>0 -> TpdbId -> ForeignId
+ * "tpdbid:" prefix -> GetSceneInfo(ForeignId). Used to prove the constructed
+ * payloads route to the intended metadata source. */
+function metadataSource(payload: {
+  foreignId: string;
+  tmdbId: number;
+  tpdbId?: string;
+}): "tmdb-numeric" | "tmdb" | "tpdb" | "scene" {
+  if (/^-?\d+$/.test(payload.foreignId)) return "tmdb-numeric";
+  if (payload.tmdbId > 0) return "tmdb";
+  if (payload.tpdbId) return "tpdb";
+  if (/^tpdbid:/i.test(payload.foreignId)) return "tpdb";
+  return "scene";
+}
+
+// --- resolution ---
+
+test("resolveWhisparrItem verifies the movie identity from the typed tpdb lookup", async () => {
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/api/v3/movie/lookup/tpdb")
+        return sendJson(res, 200, lookupMovie());
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      assert.deepEqual(
+        await resolveWhisparrItem(deliveryConfig(fx.origin), movieRef),
+        {
+          itemType: "movie",
+          identity: MOVIE_UUID,
+          title: "Sample Movie",
+        },
+      );
+      assert.equal(fx.log.length, 1);
+      assert.equal(fx.log[0]!.method, "GET");
+      assert.equal(fx.log[0]!.headers["x-api-key"], WH_KEY);
+      assert.equal(pathOf(fx.log[0]!.url), "/api/v3/movie/lookup/tpdb");
+      assert.equal(queryOf(fx.log[0]!.url).get("tpdbId"), MOVIE_UUID);
+    },
+  );
+});
+
+test("resolveWhisparrItem matches the exact stash scene among lookup results", async () => {
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/api/v3/movie/lookup")
+        return sendJson(res, 200, [
+          lookupScene({
+            foreignId: OTHER_UUID,
+            stashId: OTHER_UUID,
+            title: "x",
+          }),
+          lookupScene(),
+        ]);
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      assert.deepEqual(
+        await resolveWhisparrItem(deliveryConfig(fx.origin), sceneRef),
+        {
+          itemType: "scene",
+          identity: SCENE_UUID,
+          title: "Sample Scene",
+        },
+      );
+      assert.equal(queryOf(fx.log[0]!.url).get("term"), `stash:${SCENE_UUID}`);
+    },
+  );
+});
+
+test("resolveWhisparrItem treats identity and kind mismatches as hard errors", async () => {
+  const wrongIdentity = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ) => {
+    if (pathOf(req.url ?? "") === "/api/v3/movie/lookup/tpdb")
+      return sendJson(res, 200, lookupMovie({ tpdbId: OTHER_UUID }));
+    sendJson(res, 404, {});
+  };
+  const wrongKind = (req: http.IncomingMessage, res: http.ServerResponse) => {
+    // A scene-shaped resource cannot satisfy a movie reference.
+    if (pathOf(req.url ?? "") === "/api/v3/movie/lookup/tpdb")
+      return sendJson(res, 200, lookupScene());
+    sendJson(res, 404, {});
+  };
+  await withFixture(wrongIdentity, async (fx) => {
+    await assert.rejects(
+      resolveWhisparrItem(deliveryConfig(fx.origin, DELIVERY), movieRef),
+      appError(502, "identity_mismatch"),
+    );
+  });
+  await withFixture(wrongKind, async (fx) => {
+    await assert.rejects(
+      resolveWhisparrItem(deliveryConfig(fx.origin, DELIVERY), movieRef),
+      appError(502, "identity_mismatch"),
+    );
+  });
+});
+
+test("resolveWhisparrItem surfaces import exclusion only when the API reveals it", async () => {
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/api/v3/movie/lookup/tpdb")
+        return sendJson(res, 200, lookupMovie({ isExcluded: true }));
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      const resolved = await resolveWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.equal(resolved.importExcluded, true);
+    },
+  );
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/api/v3/movie/lookup/tpdb")
+        return sendJson(res, 200, lookupMovie());
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      const resolved = await resolveWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.equal("importExcluded" in resolved, false);
+    },
+  );
+});
+
+// --- adoption reads ---
+
+test("findWhisparrItem and getWhisparrItem read stored items by exact identity", async () => {
+  await withFixture(
+    (req, res) => {
+      const p = pathOf(req.url ?? "");
+      if (p === "/api/v3/movie") {
+        const query = queryOf(req.url ?? "");
+        if (query.get("tpdbId") === MOVIE_UUID)
+          return sendJson(res, 200, [storedMovie()]);
+        if (query.get("stashId") === SCENE_UUID)
+          return sendJson(res, 200, [storedScene()]);
+        return sendJson(res, 200, []);
+      }
+      if (p === "/api/v3/movie/2") return sendJson(res, 200, storedMovie());
+      if (p === "/api/v3/movie/3") return sendJson(res, 200, storedScene());
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      const movie = await findWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.equal(movie?.whisparrId, 2);
+      assert.equal(movie?.itemType, "movie");
+      assert.equal(movie?.identity, MOVIE_UUID);
+      assert.equal(movie?.path, "/data/xxx/Sample Movie");
+      const scene = await findWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        sceneRef,
+      );
+      assert.equal(scene?.whisparrId, 3);
+      assert.equal(scene?.itemType, "scene");
+      // 200 + [] is authoritative absence, never an error.
+      const other = { ...movieRef, id: OTHER_UUID };
+      assert.equal(
+        await findWhisparrItem(deliveryConfig(fx.origin, DELIVERY), other),
+        null,
+      );
+      const byId = await getWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        2,
+      );
+      assert.equal(byId?.identity, MOVIE_UUID);
+    },
+  );
+  // Conflicting duplicates are an upstream inconsistency, not a pick.
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/api/v3/movie")
+        return sendJson(res, 200, [storedMovie(), storedMovie({ id: 9 })]);
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      await assert.rejects(
+        findWhisparrItem(deliveryConfig(fx.origin, DELIVERY), movieRef),
+        appError(502, "identity_mismatch"),
+      );
+    },
+  );
+});
+
+test("getWhisparrItem treats a proven 404 as absence and reports outages", async () => {
+  await withFixture(
+    (req, res) => {
+      const p = pathOf(req.url ?? "");
+      if (p === "/api/v3/movie/2") return sendJson(res, 200, storedMovie());
+      if (p === "/api/v3/movie/404") return sendJson(res, 404, {});
+      sendJson(res, 500, {});
+    },
+    async (fx) => {
+      assert.equal(
+        (await getWhisparrItem(deliveryConfig(fx.origin, DELIVERY), 2))
+          ?.whisparrId,
+        2,
+      );
+      assert.equal(
+        await getWhisparrItem(deliveryConfig(fx.origin, DELIVERY), 404),
+        null,
+      );
+      await assert.rejects(
+        getWhisparrItem(deliveryConfig(fx.origin, DELIVERY), 5),
+        appError(502, "upstream_unavailable"),
+      );
+    },
+  );
+});
+
+// --- observation mapping ---
+
+test("observeWhisparrItem maps monitoring, downloading, and imported from real fields", async () => {
+  const queueFixture = { reads: 0 };
+  await withFixture(
+    (req, res) => {
+      const p = pathOf(req.url ?? "");
+      if (p === "/api/v3/movie") {
+        if (queryOf(req.url ?? "").get("tpdbId") === MOVIE_UUID)
+          return sendJson(res, 200, [storedMovie()]);
+        return sendJson(res, 200, []);
+      }
+      if (p === "/api/v3/queue") {
+        // First read: empty queue (monitoring). Second read: the item is
+        // queued (downloading).
+        queueFixture.reads += 1;
+        return sendJson(
+          res,
+          200,
+          queueFixture.reads > 1
+            ? {
+                page: 1,
+                pageSize: 200,
+                totalRecords: 1,
+                records: [
+                  { movieId: 2, movie: { id: 2, title: "Sample Movie" } },
+                ],
+              }
+            : { page: 1, pageSize: 200, totalRecords: 0, records: [] },
+        );
+      }
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      // Monitoring with no release is not failure.
+      const idle = await observeWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.deepEqual(
+        {
+          state: idle.found ? idle.state : null,
+          monitored: idle.found ? idle.item.monitored : null,
+        },
+        { state: "monitoring", monitored: true },
+      );
+      // Queue presence (by movieId or nested movie.id) means downloading.
+      const busy = await observeWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.equal(busy.found && busy.state, "downloading");
+      // Unknown identity is simply not found.
+      const missing = await observeWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        {
+          ...movieRef,
+          id: OTHER_UUID,
+        },
+      );
+      assert.deepEqual(missing, { found: false });
+    },
+  );
+  // A file on disk means imported — the queue is not even consulted.
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/api/v3/movie")
+        return sendJson(res, 200, [
+          storedMovie({ hasFile: true, movieFileId: 7 }),
+        ]);
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      const imported = await observeWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.equal(imported.found && imported.state, "imported");
+      assert.equal(
+        fx.log.some((r) => r.url.includes("/queue")),
+        false,
+      );
+    },
+  );
+  // An unreadable queue falls back to monitoring, never a fabricated failure.
+  await withFixture(
+    (req, res) => {
+      const p = pathOf(req.url ?? "");
+      if (p === "/api/v3/movie") return sendJson(res, 200, [storedMovie()]);
+      if (p === "/api/v3/queue") return sendJson(res, 500, {});
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      const degraded = await observeWhisparrItem(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.equal(degraded.found && degraded.state, "monitoring");
+    },
+  );
+});
+
+// --- delivery gating and add path ---
+
+test("delivery requires an enabled and complete delivery config and makes no calls otherwise", async () => {
+  const variants: Record<string, WhisparrDelivery | undefined> = {
+    absent: undefined,
+    disabled: { ...DELIVERY, enabled: false },
+    badRoot: { ...DELIVERY, rootFolderPath: " /data/xxx" },
+    badProfile: { ...DELIVERY, qualityProfileId: 0 },
+  };
+  for (const [name, delivery] of Object.entries(variants)) {
+    await withFixture(
+      () => {
+        throw new Error("no upstream call may happen for a gated delivery");
+      },
+      async (fx) => {
+        await assert.rejects(
+          deliverToWhisparr(deliveryConfig(fx.origin, delivery), movieRef),
+          appError(409, "delivery_disabled"),
+        );
+        assert.equal(fx.log.length, 0, `${name} must block before any request`);
+      },
+    );
+  }
+});
+
+test("deliverToWhisparr adopts an existing exact identity without adding", async () => {
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/api/v3/movie")
+        return sendJson(res, 200, [storedMovie()]);
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      const result = await deliverToWhisparr(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.equal(result.outcome, "adopted");
+      assert.ok(
+        fx.log.every((r) => r.method === "GET"),
+        "adoption never POSTs",
+      );
+      assert.equal(fx.log.length, 1);
+    },
+  );
+});
+
+test("deliverToWhisparr sends an exact server-owned payload and accepts the stored echo", async () => {
+  const posted: string[] = [];
+  const handler = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    body: string,
+  ) => {
+    const p = pathOf(req.url ?? "");
+    if (req.method === "POST" && p === "/api/v3/movie") {
+      posted.push(body);
+      return sendJson(res, 201, storedMovie());
+    }
+    if (p === "/api/v3/movie") return sendJson(res, 200, []);
+    if (p === "/api/v3/movie/lookup/tpdb")
+      return sendJson(res, 200, lookupMovie());
+    sendJson(res, 404, {});
+  };
+  await withFixture(handler, async (fx) => {
+    const result = await deliverToWhisparr(
+      deliveryConfig(fx.origin, DELIVERY),
+      movieRef,
+    );
+    assert.equal(result.outcome, "accepted");
+    assert.equal(result.outcome === "accepted" && result.item.whisparrId, 2);
+    assert.equal(posted.length, 1);
+    assert.deepEqual(JSON.parse(posted[0]!), {
+      title: "Sample Movie",
+      foreignId: `tpdbId:${MOVIE_UUID}`,
+      tmdbId: 0,
+      tpdbId: MOVIE_UUID,
+      rootFolderPath: "/data/xxx",
+      qualityProfileId: 7,
+      monitored: true,
+      addOptions: { searchForMovie: true, addMethod: "Manual" },
+    });
+    assert.deepEqual(
+      fx.log.map((r) => `${r.method} ${pathOf(r.url)}`),
+      [
+        "GET /api/v3/movie",
+        "GET /api/v3/movie/lookup/tpdb",
+        "POST /api/v3/movie",
+      ],
+    );
+  });
+});
+
+test("scene payloads carry a bare UUID ForeignId with no tpdbId and route to scene lookup", async () => {
+  const posted: string[] = [];
+  await withFixture(
+    (req: http.IncomingMessage, res: http.ServerResponse, body: string) => {
+      const p = pathOf(req.url ?? "");
+      if (req.method === "POST" && p === "/api/v3/movie") {
+        posted.push(body);
+        return sendJson(res, 201, storedScene());
+      }
+      if (p === "/api/v3/movie") return sendJson(res, 200, []);
+      if (p === "/api/v3/movie/lookup")
+        return sendJson(res, 200, [lookupScene()]);
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      const result = await deliverToWhisparr(
+        deliveryConfig(fx.origin, { ...DELIVERY, searchOnAdd: false }),
+        sceneRef,
+      );
+      assert.equal(result.outcome, "accepted");
+      assert.deepEqual(JSON.parse(posted[0]!), {
+        title: "Sample Scene",
+        foreignId: SCENE_UUID,
+        tmdbId: 0,
+        rootFolderPath: "/data/xxx",
+        qualityProfileId: 7,
+        monitored: true,
+        addOptions: { searchForMovie: false, addMethod: "Manual" },
+      });
+      assert.equal(queryOf(fx.log[1]!.url).get("term"), `stash:${SCENE_UUID}`);
+    },
+  );
+});
+
+test("payload routing holds under the documented precedence, not by accident", () => {
+  // Precedence order: numeric ForeignId, then TmdbId>0, then TpdbId, then
+  // the tpdbid: prefix, then scene lookup.
+  assert.equal(
+    metadataSource({ foreignId: "12345", tmdbId: 5, tpdbId: MOVIE_UUID }),
+    "tmdb-numeric",
+  );
+  assert.equal(
+    metadataSource({
+      foreignId: `tpdbId:${MOVIE_UUID}`,
+      tmdbId: 9,
+      tpdbId: MOVIE_UUID,
+    }),
+    "tmdb",
+  );
+  assert.equal(
+    metadataSource({
+      foreignId: `tpdbId:${MOVIE_UUID}`,
+      tmdbId: 0,
+      tpdbId: MOVIE_UUID,
+    }),
+    "tpdb",
+  );
+  assert.equal(
+    metadataSource({ foreignId: `tpdbId:${MOVIE_UUID}`, tmdbId: 0 }),
+    "tpdb",
+  );
+  assert.equal(metadataSource({ foreignId: SCENE_UUID, tmdbId: 0 }), "scene");
+  // The builder emits exactly one routing source per kind.
+  assert.equal(
+    metadataSource(buildMoviePayload(movieRef, "Sample Movie", DELIVERY)),
+    "tpdb",
+  );
+  assert.equal(
+    metadataSource(buildMoviePayload(sceneRef, "Sample Scene", DELIVERY)),
+    "scene",
+  );
+});
+
+test("deliverToWhisparr explains a revealed import exclusion instead of adding", async () => {
+  await withFixture(
+    (req, res) => {
+      const p = pathOf(req.url ?? "");
+      if (p === "/api/v3/movie") return sendJson(res, 200, []);
+      if (p === "/api/v3/movie/lookup/tpdb")
+        return sendJson(res, 200, lookupMovie({ isExcluded: true }));
+      sendJson(res, 404, {});
+    },
+    async (fx) => {
+      const result = await deliverToWhisparr(
+        deliveryConfig(fx.origin, DELIVERY),
+        movieRef,
+      );
+      assert.equal(result.outcome, "failed");
+      assert.ok(
+        result.outcome === "failed" &&
+          result.reason.includes("import-excluded"),
+      );
+      assert.equal(
+        fx.log.some((r) => r.method === "POST"),
+        false,
+      );
+    },
+  );
+});
+
+test("rejected adds fail without already-exists guessing; uncertain adds re-resolve first", async () => {
+  // Proven 400: absence after re-read fails; nothing is guessed.
+  const rejected = (req: http.IncomingMessage, res: http.ServerResponse) => {
+    const p = pathOf(req.url ?? "");
+    if (req.method === "POST" && p === "/api/v3/movie")
+      return sendJson(res, 400, {});
+    if (p === "/api/v3/movie") return sendJson(res, 200, []);
+    if (p === "/api/v3/movie/lookup/tpdb")
+      return sendJson(res, 200, lookupMovie());
+    sendJson(res, 404, {});
+  };
+  await withFixture(rejected, async (fx) => {
+    const result = await deliverToWhisparr(
+      deliveryConfig(fx.origin, DELIVERY),
+      movieRef,
+    );
+    assert.equal(result.outcome, "failed");
+    assert.ok(
+      fx.log.filter((r) => r.method === "GET" && r.url.includes("tpdbId="))
+        .length >= 2,
+      "the identity is re-read before deciding",
+    );
+  });
+  // Timeout-class 500 whose identity re-read finds the item: accepted.
+  const recovered = (req: http.IncomingMessage, res: http.ServerResponse) => {
+    const p = pathOf(req.url ?? "");
+    if (req.method === "POST" && p === "/api/v3/movie")
+      return sendJson(res, 500, {});
+    if (p === "/api/v3/movie") {
+      // First adoption read: absent. Re-read after the failed submission:
+      // present.
+      recovered.reads += 1;
+      return sendJson(res, 200, recovered.reads > 1 ? [storedMovie()] : []);
+    }
+    if (p === "/api/v3/movie/lookup/tpdb")
+      return sendJson(res, 200, lookupMovie());
+    sendJson(res, 404, {});
+  };
+  recovered.reads = 0;
+  await withFixture(recovered, async (fx) => {
+    const result = await deliverToWhisparr(
+      deliveryConfig(fx.origin, DELIVERY),
+      movieRef,
+    );
+    assert.equal(result.outcome, "accepted");
+  });
+  // 500 whose re-read proves absence: failed.
+  const absent = (req: http.IncomingMessage, res: http.ServerResponse) => {
+    const p = pathOf(req.url ?? "");
+    if (req.method === "POST" && p === "/api/v3/movie")
+      return sendJson(res, 500, {});
+    if (p === "/api/v3/movie") return sendJson(res, 200, []);
+    if (p === "/api/v3/movie/lookup/tpdb")
+      return sendJson(res, 200, lookupMovie());
+    sendJson(res, 404, {});
+  };
+  await withFixture(absent, async (fx) => {
+    const result = await deliverToWhisparr(
+      deliveryConfig(fx.origin, DELIVERY),
+      movieRef,
+    );
+    assert.equal(result.outcome, "failed");
+  });
+  // 500 whose re-read stays broken: uncertain, never fabricated.
+  const opaque = (req: http.IncomingMessage, res: http.ServerResponse) => {
+    const p = pathOf(req.url ?? "");
+    if (req.method === "POST" && p === "/api/v3/movie")
+      return sendJson(res, 500, {});
+    if (p === "/api/v3/movie") {
+      // First adoption read succeeds; the re-read after the failed
+      // submission stays broken, so the outcome stays unknown.
+      opaque.reads += 1;
+      if (opaque.reads === 1) return sendJson(res, 200, []);
+    }
+    if (p === "/api/v3/movie/lookup/tpdb")
+      return sendJson(res, 200, lookupMovie());
+    sendJson(res, 500, {});
+  };
+  opaque.reads = 0;
+  await withFixture(opaque, async (fx) => {
+    const result = await deliverToWhisparr(
+      deliveryConfig(fx.origin, DELIVERY),
+      movieRef,
+    );
+    assert.equal(result.outcome, "uncertain");
+  });
 });
