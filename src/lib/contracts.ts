@@ -7,7 +7,7 @@ export type CatalogProvider = "tpdb" | "stashdb";
 
 export type MediaKind = "movie" | "scene";
 
-export type CatalogKind = MediaKind | "performer";
+export type CatalogKind = MediaKind | "performer" | "studio";
 
 /** Provider-scoped external identity. `id` is the provider's external UUID,
  * never the application-owned catalog record id. */

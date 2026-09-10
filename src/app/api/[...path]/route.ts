@@ -57,6 +57,8 @@ import {
   isProviderImageUrl,
   searchCatalog,
   type CatalogSearchQuery,
+  type CatalogSortDirection,
+  type CatalogSortKey,
 } from "../../../server/providers.ts";
 import { getWhisparrStatus } from "../../../server/whisparr.ts";
 
@@ -840,23 +842,29 @@ function parseCatalogProvider(raw: string | null): CatalogProvider {
   if (raw === "tpdb" || raw === "stashdb") return raw;
   throw new AppError(400, "invalid_reference", "Unknown catalog provider.");
 }
-
 function parseCatalogKind(
   provider: "stashdb",
   raw: string,
-): "scene" | "performer";
+): "scene" | "performer" | "studio";
 function parseCatalogKind(provider: "tpdb", raw: string): CatalogKind;
 function parseCatalogKind(provider: CatalogProvider, raw: string): CatalogKind;
 function parseCatalogKind(provider: CatalogProvider, raw: string): CatalogKind {
   if (provider === "tpdb") {
-    if (raw === "movie" || raw === "scene" || raw === "performer") return raw;
+    if (
+      raw === "movie" ||
+      raw === "scene" ||
+      raw === "performer" ||
+      raw === "studio"
+    ) {
+      return raw;
+    }
     throw new AppError(400, "invalid_reference", "Unknown catalog kind.");
   }
-  if (raw === "scene" || raw === "performer") return raw;
+  if (raw === "scene" || raw === "performer" || raw === "studio") return raw;
   throw new AppError(
     400,
     "invalid_reference",
-    "StashDB hosts scenes and performers only.",
+    "StashDB hosts scenes, performers, and studios only.",
   );
 }
 
@@ -900,7 +908,7 @@ function parseMediaReference(
     throw new AppError(
       400,
       "invalid_reference",
-      "Performers are not requestable media.",
+      "Performers and studios are not requestable media.",
     );
   }
   return reference;
@@ -921,8 +929,105 @@ interface CatalogSearchParams {
   q: string | null;
   year: number | undefined;
   performer: string | null;
+  studio: string | null;
+  tags: string[] | undefined;
+  tagsAll: string[] | undefined;
+  tagsExclude: string[] | undefined;
+  sort: CatalogSortKey | undefined;
+  direction: CatalogSortDirection | undefined;
   page: number;
   perPage: number;
+}
+
+// Runtime check, never a cast: the vocabulary mirrors providers'
+// CatalogSortKey so an unknown sort is the route's explicit 400.
+function isCatalogSortKey(v: string): v is CatalogSortKey {
+  switch (v) {
+    case "relevance":
+    case "recency":
+    case "duration":
+    case "title":
+    case "date":
+    case "created":
+    case "updated":
+    case "trending":
+    case "popularity":
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Tag lists arrive repeatable (?tags=a&tags=b) or comma-separated
+// (?tags=a,b). Ids stay provider-native; only shape is validated here —
+// uuid-ness and provider acceptance stay the provider's explicit errors.
+function tagList(params: URLSearchParams, key: string): string[] | undefined {
+  const ids = params
+    .getAll(key)
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  if (ids.length === 0) return undefined;
+  if (ids.some((id) => id.length > 64)) {
+    throw new AppError(400, "invalid_query", `Invalid ${key} filter id.`);
+  }
+  if (ids.length > 25) {
+    throw new AppError(400, "invalid_query", `Too many ${key} ids.`);
+  }
+  return [...new Set(ids)];
+}
+
+// Sorts each provider+kind genuinely implements, mirroring resolveSort in
+// providers.ts so an unsupported order is rejected here with the route's
+// invalid_query error before any upstream call.
+const SORT_SUPPORT: Partial<
+  Record<
+    CatalogProvider,
+    Partial<Record<CatalogKind, readonly CatalogSortKey[]>>
+  >
+> = {
+  tpdb: {
+    movie: ["relevance", "recency", "duration"],
+    scene: ["relevance", "recency", "duration"],
+  },
+  stashdb: {
+    scene: [
+      "title",
+      "date",
+      "duration",
+      "trending",
+      "popularity",
+      "created",
+      "updated",
+    ],
+  },
+};
+
+function supportedSort(
+  provider: CatalogProvider,
+  kind: CatalogKind,
+  sort: CatalogSortKey | undefined,
+  direction: CatalogSortDirection | undefined,
+): { sort?: CatalogSortKey; direction?: CatalogSortDirection } {
+  if (sort === undefined) {
+    if (direction !== undefined) {
+      throw new AppError(
+        400,
+        "invalid_query",
+        "direction requires an explicit sort.",
+      );
+    }
+    return {};
+  }
+  const supported = SORT_SUPPORT[provider]?.[kind];
+  if (supported === undefined || !supported.includes(sort)) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      `No ${sort} order for ${provider} ${kind} search.`,
+    );
+  }
+  return direction !== undefined ? { sort, direction } : { sort };
 }
 
 function catalogSearchParams(
@@ -944,10 +1049,39 @@ function catalogSearchParams(
   const performer = params.get("performer");
   if (performer !== null && (performer === "" || performer.length > 128))
     throw new AppError(400, "invalid_query", "Invalid performer.");
+  const studio = params.get("studio");
+  if (studio !== null && (studio === "" || studio.length > 64))
+    throw new AppError(400, "invalid_query", "Invalid studio filter.");
+  const sortRaw = params.get("sort");
+  let sort: CatalogSortKey | undefined;
+  if (sortRaw !== null) {
+    if (!isCatalogSortKey(sortRaw)) {
+      throw new AppError(400, "invalid_query", "Unknown sort.");
+    }
+    sort = sortRaw;
+  }
+  const directionRaw = params.get("direction");
+  let direction: CatalogSortDirection | undefined;
+  if (directionRaw !== null) {
+    if (directionRaw !== "asc" && directionRaw !== "desc") {
+      throw new AppError(
+        400,
+        "invalid_query",
+        "direction must be asc or desc.",
+      );
+    }
+    direction = directionRaw;
+  }
   return {
     q,
     year: yearRaw !== null ? Number(yearRaw) : undefined,
     performer,
+    studio,
+    tags: tagList(params, "tags"),
+    tagsAll: tagList(params, "tagsAll"),
+    tagsExclude: tagList(params, "tagsExclude"),
+    sort,
+    direction,
     page: params.has("page") ? queryInt(url, "page", 1, 1, 10000) : 1,
     perPage: params.has("perPage") ? queryInt(url, "perPage", 24, 1, 100) : 24,
   };
@@ -963,37 +1097,65 @@ function catalogSearchQuery(url: URL): CatalogSearchQuery {
   if (kindRaw === null)
     throw new AppError(400, "invalid_query", "kind is required.");
   if (provider === "stashdb") {
-    // The overload types stashdb kinds as "scene" | "performer": StashDB
-    // has no movie entity, and parseCatalogKind already rejects movie
-    // here with an explicit 400.
+    // The overload types stashdb kinds as "scene" | "performer" | "studio":
+    // StashDB has no movie entity, and parseCatalogKind already rejects
+    // movie here with an explicit 400.
     return stashdbSearchQuery(params, parseCatalogKind(provider, kindRaw), url);
   }
   return tpdbSearchQuery(params, parseCatalogKind(provider, kindRaw), url);
 }
 
-// StashDB: unpaged performer search (query only) and scene search with
-// optional query/performer filters; year is not supported.
+// StashDB: unpaged performer and studio searches (query only) and scene
+// search with optional query/performer/studio/tag filters; year and tagsAll
+// are not supported.
 function stashdbSearchQuery(
   params: URLSearchParams,
-  kind: "scene" | "performer",
+  kind: "scene" | "performer" | "studio",
   url: URL,
 ): CatalogSearchQuery {
   const s = catalogSearchParams(url, params);
-  if (kind === "performer") {
-    if (s.q === null)
-      throw new AppError(400, "invalid_query", "Performer search requires q.");
-    if (s.performer !== null) {
+  if (s.tagsAll !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      "tagsAll is a TPDB-only filter; StashDB scenes expose tags and tagsExclude.",
+    );
+  }
+  if (s.tags !== undefined && s.tagsExclude !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      "StashDB exposes one tag criterion per query; combine include and exclude lists client-side.",
+    );
+  }
+  if (kind !== "scene") {
+    if (s.q === null) {
+      throw new AppError(400, "invalid_query", `${kind} search requires q.`);
+    }
+    if (
+      s.performer !== null ||
+      s.studio !== null ||
+      s.tags !== undefined ||
+      s.tagsExclude !== undefined
+    ) {
       throw new AppError(
         400,
         "invalid_query",
-        "performer filter cannot be combined with kind=performer.",
+        `StashDB ${kind} search supports only a query term.`,
+      );
+    }
+    if (s.sort !== undefined || s.direction !== undefined) {
+      throw new AppError(
+        400,
+        "invalid_query",
+        `StashDB ${kind} search supports no sort.`,
       );
     }
     if (params.has("page") || params.has("perPage")) {
       throw new AppError(
         400,
         "invalid_query",
-        "StashDB performer search is not paged.",
+        `StashDB ${kind} search is not paged.`,
       );
     }
     return { provider: "stashdb", kind, query: s.q };
@@ -1010,34 +1172,59 @@ function stashdbSearchQuery(
     kind,
     ...(s.q !== null ? { query: s.q } : {}),
     ...(s.performer !== null ? { performer: s.performer } : {}),
+    ...(s.studio !== null ? { studio: s.studio } : {}),
+    ...(s.tags !== undefined ? { tags: s.tags } : {}),
+    ...(s.tagsExclude !== undefined ? { tagsExclude: s.tagsExclude } : {}),
+    ...supportedSort("stashdb", kind, s.sort, s.direction),
     page: s.page,
     perPage: s.perPage,
   };
 }
 
-// TPDB hosts all three kinds; performer search requires q and takes no
-// other filters.
+// TPDB hosts movies, scenes, performers, and studios (sites); performer and
+// studio searches require q and take no other filters.
 function tpdbSearchQuery(
   params: URLSearchParams,
   kind: CatalogKind,
   url: URL,
 ): CatalogSearchQuery {
   const s = catalogSearchParams(url, params);
-  if (kind === "performer") {
-    if (s.q === null)
-      throw new AppError(400, "invalid_query", "Performer search requires q.");
-    if (s.performer !== null) {
+  if (s.tagsExclude !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      "tagsExclude is a StashDB-only filter; TPDB exposes tags and tagsAll.",
+    );
+  }
+  if (s.tags !== undefined && s.tagsAll !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      "Choose either tags (any-of) or tagsAll (all-of); TPDB exposes one tag criterion per query.",
+    );
+  }
+  if (kind === "performer" || kind === "studio") {
+    if (s.q === null) {
+      throw new AppError(400, "invalid_query", `${kind} search requires q.`);
+    }
+    if (
+      s.performer !== null ||
+      s.year !== undefined ||
+      s.studio !== null ||
+      s.tags !== undefined ||
+      s.tagsAll !== undefined
+    ) {
       throw new AppError(
         400,
         "invalid_query",
-        "performer filter cannot be combined with kind=performer.",
+        `TPDB ${kind} search supports only query, page, and perPage.`,
       );
     }
-    if (s.year !== undefined) {
+    if (s.sort !== undefined || s.direction !== undefined) {
       throw new AppError(
         400,
         "invalid_query",
-        "year filter cannot be combined with kind=performer.",
+        `TPDB ${kind} search supports no sort.`,
       );
     }
     return {
@@ -1048,12 +1235,30 @@ function tpdbSearchQuery(
       perPage: s.perPage,
     };
   }
-  return {
-    provider: "tpdb",
-    kind,
+  const filters = {
     ...(s.q !== null ? { query: s.q } : {}),
     ...(s.year !== undefined ? { year: s.year } : {}),
     ...(s.performer !== null ? { performer: s.performer } : {}),
+    ...(s.studio !== null ? { studio: s.studio } : {}),
+    ...(s.tags !== undefined ? { tags: s.tags } : {}),
+    ...(s.tagsAll !== undefined ? { tagsAll: s.tagsAll } : {}),
+    ...supportedSort("tpdb", kind, s.sort, s.direction),
+  };
+  // Each kind gets exactly its own union variant; the wide literal that used
+  // to sit here is what broke when CatalogKind gained "studio".
+  if (kind === "movie") {
+    return {
+      provider: "tpdb",
+      kind,
+      ...filters,
+      page: s.page,
+      perPage: s.perPage,
+    };
+  }
+  return {
+    provider: "tpdb",
+    kind,
+    ...filters,
     page: s.page,
     perPage: s.perPage,
   };

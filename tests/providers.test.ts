@@ -2,7 +2,8 @@
 // No real network, no real credentials. Covers TPDB/StashDB detail mapping,
 // canonical credit parents, fake-total suppression, real pagination
 // continuation, not-found vs outage, malformed/oversized payload rejection,
-// artwork host/content-type/size enforcement, and not-configured behavior.
+// artwork host/content-type/size enforcement, not-configured behavior, studio
+// and tag discovery, provider-genuine studio/tag filters, and sort mapping.
 
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -17,8 +18,11 @@ import {
   getProviderStatus,
   IMAGE_BYTE_CAP,
   isProviderImageUrl,
+  resolveSort,
   searchCatalog,
+  searchCatalogTags,
 } from "../src/server/providers.ts";
+import type { CatalogSearchQuery } from "../src/server/providers.ts";
 import type { CatalogDetail } from "../src/lib/contracts.ts";
 
 // --- constants and fixture helpers ---
@@ -31,6 +35,15 @@ const SCENE_ID = "91e9610b-77fc-4046-b6d7-fd060f6e46a6";
 const RELATED_SCENE_ID = "9b1663f6-1cd9-449f-a1c9-44b8f33c4280";
 const SITE_PERFORMER_ID = "6263c88d-4bb5-4b41-b4a1-6e31a90308bd";
 const CANON_PERFORMER_ID = "42386b25-d0f1-41dc-a53f-a132b2425acf";
+const TPDB_STUDIO_ID = "1dafafd3-da8f-47f3-aca2-e6bb9f354292";
+const TPDB_NETWORK_ID = "b42c05ae-27e3-4ae2-8b79-eb40ad3b52fe";
+const TPDB_STUDIO_NUMERIC = 3372;
+const TPDB_TAG_A = "ffe45e51-8472-4a2d-a582-fe224da0c60f";
+const TPDB_TAG_B = "9865d865-320d-4bce-b17a-edd2a05bce41";
+const STASH_STUDIO_ID = "915dd307-a440-4578-b83f-699b9706faea";
+const STASH_PARENT_STUDIO_ID = "b62bc449-c3d9-49ff-9a16-8f5b1bfa20b9";
+const STASH_DELETED_STUDIO_ID = "e5a7c221-3ba2-4f4e-9d3a-7f01c2b45d66";
+const STASH_TAG_ID = "beb2cfa5-834a-45b6-9b87-092e19d2b43a";
 const STASH_SCENE_ID = "01a060a7-0644-7afd-8071-25752e1a45b7";
 const STASH_PERFORMER_ID = "13ceabee-8eaa-4fb6-8ade-03ce133a6822";
 const STASH_CROSS_ID = "d4f1a54f-ddc7-4f50-a356-d417802cab1c";
@@ -1198,5 +1211,659 @@ test("catalog references are validated before any upstream call", async () => {
       assertProviderError(err, 400, "invalid_reference");
       return true;
     },
+  );
+});
+
+// --- TPDB studio (sites) search and detail ---
+
+function tpdbSiteRow(): Record<string, unknown> {
+  return {
+    uuid: TPDB_STUDIO_ID,
+    id: TPDB_STUDIO_NUMERIC,
+    parent_id: TPDB_STUDIO_NUMERIC,
+    network_id: TPDB_STUDIO_NUMERIC,
+    name: "Vixen",
+    short_name: "vixen",
+    url: "https://vixen.com",
+    description: "Part of a network.",
+    logo: "https://cdn.theporndb.net/sites/aa/logo.png",
+    favicon: null,
+    poster: "https://cdn.theporndb.net/sites/aa/poster.png",
+    network: { uuid: TPDB_NETWORK_ID, id: 36826, name: "Vixen Media Group" },
+    parent: null,
+  };
+}
+
+test("tpdb studio search and detail map sites rows with provider-supplied parents", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const fixture = await startFixture((req, res) => {
+    if (req.url.startsWith("/sites?")) {
+      replyJson(res, 200, {
+        data: [
+          tpdbSiteRow(),
+          {
+            // Studio-CDN logo only, no parent rows: artwork dropped, no
+            // parent relationship invented.
+            uuid: TPDB_NETWORK_ID,
+            id: 36826,
+            name: "Gamma Studio",
+            logo: "https://images02-openlife.gammacdn.com/logo.png",
+            poster: null,
+            network: null,
+            parent: null,
+          },
+        ],
+        links: { next: null },
+        meta: { total: 10000 }, // cap value must stay suppressed
+      });
+      return;
+    }
+    if (req.url === `/sites/${TPDB_STUDIO_ID}`) {
+      replyJson(res, 200, { data: tpdbSiteRow() });
+      return;
+    }
+    replyJson(res, 404, {});
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    const page = await searchCatalog({
+      provider: "tpdb",
+      kind: "studio",
+      query: "vixen",
+      perPage: 12,
+    });
+    const params = queryParams(fixture, 0);
+    assert.equal(params.get("q"), "vixen");
+    assert.equal(params.get("per_page"), "12");
+    assert.equal(page.kind, "studio");
+    assert.equal(page.total, undefined); // 10000 cap never surfaces as real
+    assert.equal(page.totalCountKnown, false);
+    const item = page.items[0];
+    assert.deepEqual(item?.reference, {
+      provider: "tpdb",
+      kind: "studio",
+      id: TPDB_STUDIO_ID,
+    });
+    assert.equal(item?.title, "Vixen");
+    assert.equal(
+      item?.imageUrl,
+      "https://cdn.theporndb.net/sites/aa/poster.png",
+    );
+    assert.deepEqual(item?.studio, {
+      name: "Vixen Media Group",
+      reference: { provider: "tpdb", kind: "studio", id: TPDB_NETWORK_ID },
+    });
+    assert.equal(item?.sourceUrl, "https://vixen.com");
+    const gamma = page.items[1];
+    assert.equal(gamma?.imageUrl, undefined);
+    assert.equal(gamma?.studio, undefined);
+    assert.equal(JSON.stringify(page).includes("gammacdn"), false);
+
+    const detail = await getCatalogDetail({
+      provider: "tpdb",
+      kind: "studio",
+      id: TPDB_STUDIO_ID,
+    });
+    assert.ok(detail !== null);
+    assert.deepEqual(detail.reference, {
+      provider: "tpdb",
+      kind: "studio",
+      id: TPDB_STUDIO_ID,
+    });
+    assert.equal(detail.description, "Part of a network.");
+    assert.equal(detail.studio?.name, "Vixen Media Group");
+    const missing = await getCatalogDetail({
+      provider: "tpdb",
+      kind: "studio",
+      id: MISSING_ID,
+    });
+    assert.equal(missing, null); // 404 stays authoritative absence
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+// --- TPDB studio filter: uuid -> numeric site_id resolution, capped totals ---
+
+test("tpdb studio-filtered scene queries resolve uuid to numeric site_id and keep capped totals suppressed", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const fixture = await startFixture((req, res) => {
+    if (req.url.startsWith(`/sites/${TPDB_STUDIO_ID}`)) {
+      replyJson(res, 200, {
+        data: { uuid: TPDB_STUDIO_ID, id: TPDB_STUDIO_NUMERIC, name: "Vixen" },
+      });
+      return;
+    }
+    if (req.url.startsWith("/scenes?")) {
+      replyJson(res, 200, {
+        data: [
+          {
+            id: SCENE_ID,
+            title: "Vixen Scene",
+            site: { uuid: TPDB_STUDIO_ID, name: "Vixen" },
+            posters: {},
+            background: {},
+            performers: [],
+            tags: [],
+            scenes: [],
+            movies: [],
+          },
+        ],
+        links: { next: null },
+        meta: { total: 10000 }, // even a studio-filtered query can be capped
+      });
+      return;
+    }
+    replyJson(res, 404, {});
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    const page = await searchCatalog({
+      provider: "tpdb",
+      kind: "scene",
+      studio: TPDB_STUDIO_ID,
+    });
+    const params = queryParams(fixture, 1);
+    assert.equal(params.get("site_id"), String(TPDB_STUDIO_NUMERIC));
+    assert.equal(page.total, undefined);
+    assert.equal(page.totalCountKnown, false);
+    assert.equal(page.items[0]?.reference.id, SCENE_ID);
+    assert.deepEqual(page.items[0]?.studio, {
+      name: "Vixen",
+      reference: { provider: "tpdb", kind: "studio", id: TPDB_STUDIO_ID },
+    });
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+// --- StashDB studio search and findStudio detail ---
+
+test("stashdb studio search and findStudio map studios; absence stays authoritative", async () => {
+  const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const stashStudioRow = {
+    id: STASH_STUDIO_ID,
+    name: "Vixen",
+    deleted: false,
+    urls: [{ url: "https://www.vixen.com/", type: "HOME" }],
+    images: [
+      {
+        url: "https://stashdb.org/images/23b009b5-d781-4940-9877-02a72e4b4c68",
+      },
+    ],
+    parent: { id: STASH_PARENT_STUDIO_ID, name: "Vixen Media Group" },
+  };
+  const fixture = await startFixture((req, res) => {
+    const parsed = JSON.parse(req.body) as {
+      query: string;
+      variables: { t?: string; id?: string };
+    };
+    const vars = parsed.variables ?? {};
+    if (parsed.query.includes("searchStudio")) {
+      assert.equal(vars.t, "vixen");
+      replyJson(res, 200, {
+        data: {
+          searchStudio: [
+            stashStudioRow,
+            // deleted studios never surface
+            {
+              id: MISSING_ID,
+              name: "Ghost Studio",
+              deleted: true,
+              urls: [],
+              images: [],
+              parent: null,
+            },
+          ],
+        },
+      });
+      return;
+    }
+    if (vars.id === MISSING_ID) {
+      replyJson(res, 200, { data: { findStudio: null } });
+      return;
+    }
+    if (vars.id === STASH_DELETED_STUDIO_ID) {
+      replyJson(res, 200, {
+        data: {
+          findStudio: {
+            ...stashStudioRow,
+            id: STASH_DELETED_STUDIO_ID,
+            deleted: true,
+          },
+        },
+      });
+      return;
+    }
+    replyJson(res, 200, { data: { findStudio: stashStudioRow } });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = fixture.origin;
+    const page = await searchCatalog({
+      provider: "stashdb",
+      kind: "studio",
+      query: "vixen",
+    });
+    assert.equal(page.kind, "studio");
+    assert.equal(page.items.length, 1); // deleted search row skipped
+    assert.deepEqual(page.items[0]?.reference, {
+      provider: "stashdb",
+      kind: "studio",
+      id: STASH_STUDIO_ID,
+    });
+    assert.equal(
+      page.items[0]?.imageUrl,
+      "https://stashdb.org/images/23b009b5-d781-4940-9877-02a72e4b4c68",
+    );
+    assert.deepEqual(page.items[0]?.studio, {
+      name: "Vixen Media Group",
+      reference: {
+        provider: "stashdb",
+        kind: "studio",
+        id: STASH_PARENT_STUDIO_ID,
+      },
+    });
+    // searchStudio exposes no count: unknown, never faked
+    assert.equal(page.total, undefined);
+    assert.equal(page.totalCountKnown, false);
+    assert.equal(page.hasMore, false);
+
+    const detail = await getCatalogDetail({
+      provider: "stashdb",
+      kind: "studio",
+      id: STASH_STUDIO_ID,
+    });
+    assert.ok(detail !== null);
+    assert.equal(detail.links[0]?.label, "HOME");
+    assert.equal(
+      await getCatalogDetail({
+        provider: "stashdb",
+        kind: "studio",
+        id: MISSING_ID,
+      }),
+      null,
+    );
+    assert.equal(
+      await getCatalogDetail({
+        provider: "stashdb",
+        kind: "studio",
+        id: STASH_DELETED_STUDIO_ID,
+      }),
+      null,
+    );
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+// --- tag lookup: provider-native ids only ---
+
+test("tag lookup returns provider-native ids without cross-provider mapping", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const tpdbFixture = await startFixture((req, res) => {
+    const params = new URLSearchParams(req.url.split("?")[1] ?? "");
+    assert.equal(params.get("q"), "anal");
+    assert.equal(params.get("per_page"), "50");
+    replyJson(res, 200, {
+      data: [{ id: 70, uuid: TPDB_TAG_A, name: "Anal" }],
+    });
+  });
+  let tpdbTags: { id: string; name: string }[];
+  try {
+    process.env.TPDB_BASE_URL = tpdbFixture.origin;
+    tpdbTags = await searchCatalogTags("tpdb", "anal");
+    assert.deepEqual(tpdbTags, [{ id: TPDB_TAG_A, name: "Anal" }]);
+    await assert.rejects(searchCatalogTags("tpdb", "   "), (err: unknown) => {
+      assertProviderError(err, 400, "invalid_search");
+      return true;
+    });
+  } finally {
+    await tpdbFixture.close();
+    restore();
+  }
+
+  const restore2 = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const stashFixture = await startFixture((req, res) => {
+    const parsed = JSON.parse(req.body) as { variables: { t?: string } };
+    assert.equal(parsed.variables?.t, "anal");
+    replyJson(res, 200, {
+      data: {
+        searchTag: [
+          { id: STASH_TAG_ID, name: "Anal Creampie" },
+          { id: "not-a-uuid", name: "Broken" }, // non-UUID dropped
+        ],
+      },
+    });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = stashFixture.origin;
+    const stashTags = await searchCatalogTags("stashdb", "anal");
+    assert.deepEqual(stashTags, [{ id: STASH_TAG_ID, name: "Anal Creampie" }]);
+    // provider-native ids are kept verbatim, never mapped across providers
+    assert.notEqual(tpdbTags[0]?.id, stashTags[0]?.id);
+  } finally {
+    await stashFixture.close();
+    restore2();
+  }
+});
+
+// --- studio and tag filters produce the right upstream query ---
+
+test("studio and tag filters produce the right upstream query for each provider", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const fixture = await startFixture((req, res) => {
+    if (req.url.startsWith(`/sites/${TPDB_STUDIO_ID}`)) {
+      replyJson(res, 200, {
+        data: { uuid: TPDB_STUDIO_ID, id: TPDB_STUDIO_NUMERIC, name: "Vixen" },
+      });
+      return;
+    }
+    if (req.url.startsWith("/scenes?") || req.url.startsWith("/movies?")) {
+      replyJson(res, 200, {
+        data: [],
+        links: { next: null },
+        meta: { total: 5 },
+      });
+      return;
+    }
+    replyJson(res, 404, {});
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    await searchCatalog({
+      provider: "tpdb",
+      kind: "scene",
+      studio: TPDB_STUDIO_ID,
+      tags: [TPDB_TAG_A, TPDB_TAG_B],
+    });
+    // request 0 resolved the uuid; request 1 is the filtered query
+    const sceneParams = queryParams(fixture, 1);
+    assert.equal(sceneParams.get("site_id"), String(TPDB_STUDIO_NUMERIC));
+    assert.deepEqual(sceneParams.getAll("tags[]"), [TPDB_TAG_A, TPDB_TAG_B]);
+    assert.equal(sceneParams.get("tag_and"), null);
+    assert.equal(sceneParams.get("orderBy"), null);
+
+    await searchCatalog({
+      provider: "tpdb",
+      kind: "movie",
+      studio: String(TPDB_STUDIO_NUMERIC),
+      tagsAll: [TPDB_TAG_A],
+      sort: "recency",
+    });
+    // numeric studio id passes straight through: no /sites lookup in between
+    assert.equal(fixture.requests[2]?.url.startsWith("/movies?"), true);
+    const movieParams = queryParams(fixture, 2);
+    assert.equal(movieParams.get("site_id"), String(TPDB_STUDIO_NUMERIC));
+    assert.deepEqual(movieParams.getAll("tags[]"), [TPDB_TAG_A]);
+    assert.equal(movieParams.get("tag_and"), "1");
+    assert.equal(movieParams.get("orderBy"), "recently_released");
+  } finally {
+    await fixture.close();
+    restore();
+  }
+
+  const restore2 = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const stashFixture = await startFixture((req, res) => {
+    replyJson(res, 200, { data: { queryScenes: { count: 483, scenes: [] } } });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = stashFixture.origin;
+    const page = await searchCatalog({
+      provider: "stashdb",
+      kind: "scene",
+      studio: STASH_STUDIO_ID,
+      tags: [STASH_TAG_ID],
+      sort: "trending",
+    });
+    const body = stashBody(stashFixture, 0);
+    const filter = body.variables.f as {
+      studios?: { value: string[]; modifier: string };
+      tags?: { value: string[]; modifier: string };
+      sort?: string;
+      direction?: string;
+    };
+    assert.deepEqual(filter.studios, {
+      value: [STASH_STUDIO_ID],
+      modifier: "INCLUDES",
+    });
+    assert.deepEqual(filter.tags, {
+      value: [STASH_TAG_ID],
+      modifier: "INCLUDES",
+    });
+    assert.equal(filter.sort, "TRENDING");
+    assert.equal(filter.direction, "DESC");
+    assert.deepEqual(page.sort, {
+      key: "trending",
+      direction: "desc",
+      upstream: "TRENDING",
+    });
+
+    await searchCatalog({
+      provider: "stashdb",
+      kind: "scene",
+      tagsExclude: [STASH_TAG_ID],
+      sort: "popularity",
+      direction: "asc",
+    });
+    const body2 = stashBody(stashFixture, 1);
+    const filter2 = body2.variables.f as {
+      tags?: { value: string[]; modifier: string };
+      sort?: string;
+      direction?: string;
+    };
+    assert.deepEqual(filter2.tags, {
+      value: [STASH_TAG_ID],
+      modifier: "EXCLUDES",
+    });
+    assert.equal(filter2.sort, "POPULARITY");
+    assert.equal(filter2.direction, "ASC");
+  } finally {
+    await stashFixture.close();
+    restore2();
+  }
+});
+
+// --- unsupported combinations are rejected explicitly ---
+
+test("unsupported filter and sort combinations are rejected explicitly", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const fixture = await startFixture((req, res) => {
+    replyJson(res, 200, { data: [], links: { next: null }, meta: {} });
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    // filmography + studio: rejected before any upstream call
+    await assert.rejects(
+      searchCatalog({
+        provider: "tpdb",
+        kind: "scene",
+        performer: CANON_PERFORMER_ID,
+        studio: TPDB_STUDIO_ID,
+      }),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    // TRENDING is refused for TPDB: no popularity or trending order exists
+    await assert.rejects(
+      searchCatalog({ provider: "tpdb", kind: "scene", sort: "trending" }),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.status, 400);
+        assert.equal(err.code, "invalid_search");
+        assert.match(err.message, /trending/);
+        return true;
+      },
+    );
+    await assert.rejects(
+      searchCatalog({ provider: "tpdb", kind: "movie", sort: "popularity" }),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.match(err.message, /popularity/);
+        return true;
+      },
+    );
+    // relevance takes no direction
+    await assert.rejects(
+      searchCatalog({
+        provider: "tpdb",
+        kind: "scene",
+        sort: "relevance",
+        direction: "asc",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.match(err.message, /relevance/);
+        return true;
+      },
+    );
+    // direction without sort is meaningless
+    await assert.rejects(
+      searchCatalog({ provider: "tpdb", kind: "movie", direction: "asc" }),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    // TPDB exposes one tag criterion
+    await assert.rejects(
+      searchCatalog({
+        provider: "tpdb",
+        kind: "scene",
+        tags: [TPDB_TAG_A],
+        tagsAll: [TPDB_TAG_B],
+      }),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    // smuggled field on a variant that has no filters: never silently dropped
+    const smuggled: Record<string, unknown> = {
+      provider: "tpdb",
+      kind: "performer",
+      query: "anna",
+      tags: [TPDB_TAG_A],
+    };
+    await assert.rejects(
+      searchCatalog(smuggled as CatalogSearchQuery),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    // malformed tag filter ids are rejected, not passed upstream
+    await assert.rejects(
+      searchCatalog({ provider: "tpdb", kind: "scene", tags: ["70"] }),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    assert.equal(fixture.requests.length, 0); // nothing reached upstream
+  } finally {
+    await fixture.close();
+    restore();
+  }
+
+  const restore2 = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const stashFixture = await startFixture((req, res) => {
+    replyJson(res, 200, { data: { queryScenes: { count: 1, scenes: [] } } });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = stashFixture.origin;
+    // one tag criterion per query
+    await assert.rejects(
+      searchCatalog({
+        provider: "stashdb",
+        kind: "scene",
+        tags: [STASH_TAG_ID],
+        tagsExclude: [STASH_TAG_ID],
+      }),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    await assert.rejects(
+      searchCatalog({
+        provider: "stashdb",
+        kind: "scene",
+        direction: "asc",
+      }),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    const smuggled: Record<string, unknown> = {
+      provider: "stashdb",
+      kind: "performer",
+      query: "anna",
+      studio: STASH_STUDIO_ID,
+    };
+    await assert.rejects(
+      searchCatalog(smuggled as CatalogSearchQuery),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    const smuggled2: Record<string, unknown> = {
+      provider: "stashdb",
+      kind: "studio",
+      query: "vixen",
+      sort: "trending",
+    };
+    await assert.rejects(
+      searchCatalog(smuggled2 as CatalogSearchQuery),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    assert.equal(stashFixture.requests.length, 0);
+  } finally {
+    await stashFixture.close();
+    restore2();
+  }
+});
+
+// --- sort resolution: only provider-genuine orders ---
+
+test("sort resolution maps exactly to upstream orders and refuses fake ones", () => {
+  assert.deepEqual(resolveSort("tpdb", "scene", "recency"), {
+    key: "recency",
+    direction: "desc",
+    upstream: "recently_released",
+  });
+  assert.deepEqual(resolveSort("tpdb", "movie", "recency", "asc"), {
+    key: "recency",
+    direction: "asc",
+    upstream: "former_released",
+  });
+  assert.equal(
+    resolveSort("tpdb", "scene", "duration", "asc").upstream,
+    "duration_asc",
+  );
+  const relevance = resolveSort("tpdb", "movie", "relevance");
+  assert.equal(relevance.upstream, "most_relevant");
+  assert.equal(relevance.direction, undefined);
+  assert.throws(() => resolveSort("tpdb", "scene", "trending"), AppError);
+  assert.throws(() => resolveSort("tpdb", "scene", "popularity"), AppError);
+  assert.throws(() => resolveSort("stashdb", "scene", "recency"), AppError);
+  assert.throws(() => resolveSort("stashdb", "scene", "relevance"), AppError);
+  assert.deepEqual(resolveSort("stashdb", "scene", "updated", "asc"), {
+    key: "updated",
+    direction: "asc",
+    upstream: "UPDATED_AT",
+  });
+  assert.equal(
+    resolveSort("stashdb", "scene", "trending").upstream,
+    "TRENDING",
   );
 });

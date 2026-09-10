@@ -22,6 +22,7 @@ import {
   getServer,
   listLibraries,
   listLibraryItems,
+  listRecentlyAddedItems,
   listUsers,
   normalizeItemId,
   validateUser,
@@ -2663,4 +2664,160 @@ test("rejected adds fail without already-exists guessing; uncertain adds re-reso
     );
     assert.equal(result.outcome, "uncertain");
   });
+});
+
+// --- M3 Discover: per-user recently added in Jellyfin ---
+// Disjoint block owned by M3Jellyfin. Same local 127.0.0.1 fixtures as the
+// list path; the fixture hands back items in server DateCreated-descending
+// order, exactly what the lab Jellyfin 12.0.0 returns for
+// sortBy=DateCreated&sortOrder=Descending with parentId-only scoping
+// (verified live: filters correctly when ids is absent, DateCreated present
+// when requested in fields).
+
+function datedItem(
+  n: number,
+  name: string,
+  dateCreated: string,
+): Record<string, unknown> {
+  return { ...movieItem(n, name), DateCreated: dateCreated };
+}
+
+test("listRecentlyAddedItems orders by the server's recently-added ordering", async () => {
+  // Server order (DateCreated desc) is Zulu > Mike > Alpha; SortName would
+  // put Alpha first, so name order proves the requested ordering won.
+  const items = [
+    datedItem(0x331, "Zulu", "2026-09-03T10:00:00.000Z"),
+    datedItem(0x332, "Mike", "2026-09-02T10:00:00.000Z"),
+    datedItem(0x333, "Alpha", "2026-09-01T10:00:00.000Z"),
+  ];
+  await withFixture(itemsByParentHandler({ [LIB_A]: items }), async (fx) => {
+    const result = await listRecentlyAddedItems(
+      jellyfinConfig(fx.origin, [LIB_A]),
+      TOKEN,
+      account([LIB_A]),
+      2,
+    );
+    assert.deepEqual(
+      result.map((item) => item.name),
+      ["Zulu", "Mike"],
+    );
+    const itemsCalls = fx.log.filter(
+      (r) => r.method === "GET" && pathOf(r.url) === `/users/${ME_ID}/items`,
+    );
+    assert.equal(itemsCalls.length, 1);
+    const query = queryOf(itemsCalls[0]?.url ?? "");
+    assert.equal(query.get("sortBy"), "DateCreated");
+    assert.equal(query.get("sortOrder"), "Descending");
+    assert.equal(query.get("parentId"), LIB_A);
+    assert.equal(query.get("limit"), "2");
+    assert.equal(query.get("recursive"), "true");
+    assert.equal(query.get("ids"), null);
+  });
+});
+
+test("listRecentlyAddedItems restricts results to granted libraries", async () => {
+  const byParent: Record<string, unknown[]> = {
+    [LIB_A]: [datedItem(0x341, "Old A", "2026-09-01T10:00:00.000Z")],
+    [LIB_B]: [
+      datedItem(0x342, "New B", "2026-09-03T10:00:00.000Z"),
+      datedItem(0x343, "Mid B", "2026-09-02T10:00:00.000Z"),
+    ],
+    [LIB_C]: [datedItem(0x344, "Never C", "2026-09-04T10:00:00.000Z")],
+  };
+  await withFixture(itemsByParentHandler(byParent), async (fx) => {
+    // Configured A/B/C, granted A/B: C items exist upstream but must never
+    // be queried, and A+B merge into one DateCreated-descending order.
+    const result = await listRecentlyAddedItems(
+      jellyfinConfig(fx.origin, [LIB_A, LIB_B, LIB_C]),
+      TOKEN,
+      account([LIB_A, LIB_B]),
+      5,
+    );
+    assert.deepEqual(
+      result.map((item) => item.name),
+      ["New B", "Mid B", "Old A"],
+    );
+    const queriedParents = fx.log
+      .filter((r) => pathOf(r.url) === `/users/${ME_ID}/items`)
+      .map((r) => queryOf(r.url).get("parentId"))
+      .sort();
+    assert.deepEqual(queriedParents, [LIB_A, LIB_B]);
+  });
+});
+
+test("recently-added shelf with empty grants makes zero upstream calls", async () => {
+  await withFixture(
+    (req, res) => sendJson(res, 200, {}),
+    async (fx) => {
+      const result = await listRecentlyAddedItems(
+        jellyfinConfig(fx.origin, [LIB_A]),
+        TOKEN,
+        account([]),
+        10,
+      );
+      assert.deepEqual(result, []);
+      assert.equal(fx.log.length, 0);
+    },
+  );
+});
+
+test("recently-added shelf reports an upstream outage as an error, not an empty shelf", async () => {
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/users/me") return sendJson(res, 200, ME);
+      sendJson(res, 500, {});
+    },
+    async (fx) => {
+      await assert.rejects(
+        listRecentlyAddedItems(
+          jellyfinConfig(fx.origin, [LIB_A]),
+          TOKEN,
+          account([LIB_A]),
+          10,
+        ),
+        appError(502, "upstream_unavailable"),
+      );
+    },
+  );
+});
+
+test("recently-added items carry playability and watch links matching the list path", async () => {
+  const playable = {
+    ...movieItem(0x351, "Feature"),
+    DateCreated: "2026-09-02T10:00:00.000Z",
+    ProductionYear: 2024,
+    Overview: "A lab feature.",
+    RunTimeTicks: 6000000000,
+    ImageTags: { Primary: "primary" },
+    MediaSources: [{ Id: "ms1", SupportsDirectPlay: true }],
+  };
+  const inert = {
+    ...movieItem(0x352, "Placeholder"),
+    DateCreated: "2026-09-03T10:00:00.000Z",
+    LocationType: "Virtual",
+  };
+  await withFixture(
+    itemsByParentHandler({ [LIB_A]: [playable, inert] }),
+    async (fx) => {
+      const config = jellyfinConfig(fx.origin, [LIB_A]);
+      const grants = account([LIB_A]);
+      const shelf = await listRecentlyAddedItems(config, TOKEN, grants, 10);
+      const page = await listLibraryItems(config, TOKEN, grants, {
+        start: 0,
+        limit: 24,
+        search: "",
+      });
+      const byId = (items: { id: string }[]) =>
+        [...items].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      // Identical mapping pipeline: same items, same playability, same links.
+      assert.deepEqual(byId(shelf), byId(page.items));
+      const feature = shelf.find((item) => item.name === "Feature");
+      assert.ok(feature);
+      assert.equal(feature.canPlay, true);
+      assert.equal(
+        feature.watchUrl,
+        `${fx.origin}/jf/web/index.html#!/details?id=${feature.id}&serverId=${SERVER_ID}`,
+      );
+    },
+  );
 });

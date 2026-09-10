@@ -13,8 +13,10 @@ import { join } from "node:path";
 import type {
   Account,
   CatalogDetail,
+  CatalogReference,
   ExternalUser,
   IntegrationConfig,
+  MediaKind,
   MediaReference,
 } from "../src/lib/contracts.ts";
 
@@ -774,6 +776,53 @@ test("catalog records carry an application-owned id distinct from the external U
       ),
     (e: { code: string }) => e.code === "invalid_catalog_detail",
   );
+});
+
+test("studio catalog records persist, while performer and studio references stay unrequestable", () => {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const studioRef: CatalogReference = {
+    provider: "stashdb",
+    kind: "studio",
+    id: "c2f1a4d3-8b67-4c5e-9a01-776655443322",
+  };
+  const record = storage.upsertCatalogRecord({
+    reference: studioRef,
+    title: "Vixen",
+    credits: [],
+    tags: [],
+    related: [],
+    links: [],
+    aliases: [],
+  });
+  assert.equal(record.reference.kind, "studio");
+  assert.deepEqual(storage.getCatalogRecord(record.id)?.reference, studioRef);
+  assert.equal(storage.getCatalogRecordByReference(studioRef)?.title, "Vixen");
+  const [imported] = storage.importAccounts([otherUser()]);
+  assert.ok(imported);
+  const requester = admit(imported.id);
+  // MediaReference narrowing is compile-time only; this mirrors the caller a
+  // non-media reference must be refused by, exercising the runtime guard.
+  const asMedia = (r: CatalogReference): MediaReference => ({
+    provider: r.provider,
+    kind: r.kind as MediaKind,
+    id: r.id,
+  });
+  const performerRef: CatalogReference = {
+    provider: "tpdb",
+    kind: "performer",
+    id: "d4e5f6a7-b8c9-4d0e-9223-887766554433",
+  };
+  for (const ref of [performerRef, studioRef]) {
+    assert.throws(
+      () => storage.createRequest(requester.id, asMedia(ref)),
+      (e: { code: string }) => e.code === "invalid_reference",
+    );
+    assert.throws(
+      () => storage.getAcquisitionByReference(asMedia(ref)),
+      (e: { code: string }) => e.code === "invalid_reference",
+    );
+  }
 });
 
 test("two admitted users share one acquisition per identity; active intent is unique", () => {

@@ -42,6 +42,10 @@ const TPDB_MOVIE2 = "2a2b3c4d-0000-0000-0000-000000000002";
 const TPDB_MOVIE3 = "2a2b3c4d-0000-0000-0000-000000000003";
 const TPDB_MOVIE4 = "2a2b3c4d-0000-0000-0000-000000000004";
 const TPDB_PERFORMER = "2a2b3c4d-0000-0000-0000-00000000000f";
+const TPDB_STUDIO = "2a2b3c4d-0000-0000-0000-0000000000a1";
+const STASH_STUDIO = "3b3c4d5e-0000-0000-0000-0000000000b2";
+const TAG_A = "cc000000-0000-0000-0000-000000000001";
+const TAG_B = "cc000000-0000-0000-0000-000000000002";
 
 interface FxUser {
   id: string;
@@ -337,11 +341,13 @@ async function differentServerHandler(
 let jellyfinServer: Server;
 let whisparrServer: Server;
 let otherServer: Server;
+let otherServerUrl: string;
 let jellyfinUrl: string;
 let whisparrUrl: string;
-let otherServerUrl: string;
 let tpdbServer: Server;
 let tpdbUrl: string;
+let stashdbServer: Server;
+let stashdbUrl: string;
 
 // --- M2 fixtures: TPDB metadata + artwork ---
 
@@ -360,6 +366,16 @@ function tpdbMovieRow(id: string) {
     performers: [],
     tags: [],
     scenes: [],
+  };
+}
+function tpdbSiteRow(id: string) {
+  return {
+    uuid: id,
+    id: 4242,
+    name: "Fixture Studio",
+    url: "https://fixture-studio.example",
+    description: "Fixture studio description",
+    poster: "https://cdn.theporndb.net/fixture-poster.jpg",
   };
 }
 
@@ -394,9 +410,50 @@ async function tpdbHandler(
       links: {},
     });
   }
+  if (p === "/scenes") {
+    return json(res, 200, {
+      data: [tpdbMovieRow(TPDB_MOVIE2)],
+      meta: { total: 10000 },
+      links: {},
+    });
+  }
+  if (p === "/sites") {
+    return json(res, 200, {
+      data: [tpdbSiteRow(TPDB_STUDIO)],
+      meta: { total: 1 },
+      links: {},
+    });
+  }
+  if (p === `/sites/${TPDB_STUDIO}`)
+    return json(res, 200, { data: tpdbSiteRow(TPDB_STUDIO) });
   if (p === `/movies/${TPDB_MOVIE}`)
     return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE) });
   json(res, 404, {});
+}
+
+// --- M3 fixtures: StashDB graphql ---
+
+const stashdbKey = "stash-fixture-key";
+
+async function stashdbHandler(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (String(req.headers.apikey ?? "") !== stashdbKey) {
+    return json(res, 401, {});
+  }
+  const body = await readBody(req);
+  const query = typeof body.query === "string" ? body.query : "";
+  if (query.includes("searchStudio")) {
+    return json(res, 200, {
+      data: {
+        searchStudio: [
+          { id: STASH_STUDIO, name: "Fixture Studio", deleted: false },
+        ],
+      },
+    });
+  }
+  json(res, 200, { data: null });
 }
 
 function listen(
@@ -508,6 +565,7 @@ before(async () => {
   ({ server: whisparrServer, url: whisparrUrl } =
     await listen(whisparrHandler));
   ({ server: tpdbServer, url: tpdbUrl } = await listen(tpdbHandler));
+  ({ server: stashdbServer, url: stashdbUrl } = await listen(stashdbHandler));
   ({ server: otherServer, url: otherServerUrl } = await listen(
     differentServerHandler,
   ));
@@ -548,6 +606,7 @@ after(() => {
     whisparrServer,
     tpdbServer,
     otherServer,
+    stashdbServer,
   ]) {
     server.closeAllConnections?.();
     server.close();
@@ -1807,4 +1866,144 @@ test("availability: distinct verdicts under the caller's own token", async () =>
       cookie: member,
     }),
   );
+});
+
+// --- M3 phase B: studio kind; browse params wired with explicit rejects ---
+test("studio search per provider; studio references refused as media; unsupported combos 400", async () => {
+  // Providers read credentials and base at call time; point StashDB at the
+  // fixture. Runs after the admin/providers test, which pins stashdb as
+  // unconfigured.
+  process.env.STASHDB_API_KEY = stashdbKey;
+  process.env.STASHDB_BASE_URL = stashdbUrl;
+
+  // TPDB studio search (sites): q required, results are studio references.
+  const tpdbStudio = await call(
+    "GET",
+    "/api/catalog/search?provider=tpdb&kind=studio&q=Fixture",
+    { cookie: member },
+  );
+  assert.equal(tpdbStudio.status, 200);
+  const tpdbStudioBody = (await tpdbStudio.json()) as {
+    kind: string;
+    items: { reference: { provider: string; kind: string; id: string } }[];
+  };
+  assert.equal(tpdbStudioBody.kind, "studio");
+  assert.deepEqual(tpdbStudioBody.items[0]?.reference, {
+    provider: "tpdb",
+    kind: "studio",
+    id: TPDB_STUDIO,
+  });
+
+  // StashDB studio search: unpaged, query-only.
+  const stashStudio = await call(
+    "GET",
+    "/api/catalog/search?provider=stashdb&kind=studio&q=Fixture",
+    { cookie: member },
+  );
+  assert.equal(stashStudio.status, 200);
+  const stashStudioBody = (await stashStudio.json()) as {
+    kind: string;
+    page: number;
+    items: { reference: { provider: string; kind: string; id: string } }[];
+  };
+  assert.equal(stashStudioBody.kind, "studio");
+  assert.equal(stashStudioBody.page, 1);
+  assert.deepEqual(stashStudioBody.items[0]?.reference, {
+    provider: "stashdb",
+    kind: "studio",
+    id: STASH_STUDIO,
+  });
+
+  // Studio is browsable on the detail route (TPDB site detail)...
+  const detail = await call("GET", `/api/catalog/tpdb/studio/${TPDB_STUDIO}`, {
+    cookie: member,
+  });
+  assert.equal(detail.status, 200);
+  const detailBody = (await detail.json()) as {
+    detail: { reference: { kind: string; id: string }; title: string };
+  };
+  assert.equal(detailBody.detail.reference.kind, "studio");
+  assert.equal(detailBody.detail.reference.id, TPDB_STUDIO);
+  assert.equal(detailBody.detail.title.length > 0, true);
+
+  // ...but a studio reference is never requestable or availability media.
+  await errorShape(
+    await call("POST", "/api/requests", {
+      cookie: member,
+      body: { media: { provider: "tpdb", kind: "studio", id: TPDB_STUDIO } },
+    }),
+  );
+  await errorShape(
+    await call("GET", `/api/availability/tpdb/studio/${TPDB_STUDIO}`, {
+      cookie: member,
+    }),
+  );
+  await errorShape(
+    await call("POST", "/api/requests", {
+      cookie: member,
+      body: {
+        media: { provider: "stashdb", kind: "studio", id: STASH_STUDIO },
+      },
+    }),
+  );
+
+  // Unsupported provider+kind+parameter combinations: explicit 400
+  // invalid_query, never a silent ignore.
+  const rejected = [
+    `provider=tpdb&kind=scene&sort=trending`,
+    `provider=tpdb&kind=movie&sort=popularity`,
+    `provider=stashdb&kind=scene&sort=relevance`,
+    `provider=tpdb&kind=movie&tagsExclude=${TAG_A}`,
+    `provider=stashdb&kind=scene&tagsAll=${TAG_A}`,
+    `provider=stashdb&kind=studio&q=x&page=2`,
+    `provider=stashdb&kind=studio&q=x&perPage=10`,
+    `provider=stashdb&kind=performer&q=x&sort=title`,
+    `provider=tpdb&kind=studio&q=x&tags=${TAG_A}`,
+    `provider=tpdb&kind=performer&q=x&sort=recency`,
+    `provider=tpdb&kind=movie&sort=bogus`,
+    `provider=tpdb&kind=scene&direction=asc`,
+    `provider=tpdb&kind=scene&sort=recency&direction=sideways`,
+    `provider=tpdb&kind=scene&tags=${TAG_A},${TAG_B}&tagsAll=${TAG_B}`,
+  ] as const;
+  for (const query of rejected) {
+    const res = await call("GET", `/api/catalog/search?${query}`, {
+      cookie: member,
+    });
+    assert.equal(res.status, 400, query);
+    assert.equal(
+      ((await res.json()) as { error: { code: string } }).error.code,
+      "invalid_query",
+      query,
+    );
+  }
+
+  // A supported sort wires through: the page reports the exact applied order.
+  const sorted = await call(
+    "GET",
+    "/api/catalog/search?provider=tpdb&kind=scene&sort=recency&direction=asc",
+    { cookie: member },
+  );
+  assert.equal(sorted.status, 200);
+  assert.deepEqual(
+    (
+      (await sorted.json()) as {
+        sort?: { key: string; direction: string; upstream: string };
+      }
+    ).sort,
+    { key: "recency", direction: "asc", upstream: "former_released" },
+  );
+
+  // Repeatable and comma-separated tag lists both parse into one filter.
+  const tagged = await call(
+    "GET",
+    `/api/catalog/search?provider=tpdb&kind=scene&tags=${TAG_A}&tags=${TAG_B}`,
+    { cookie: member },
+  );
+  assert.equal(tagged.status, 200);
+  const commaed = await call(
+    "GET",
+    `/api/catalog/search?provider=tpdb&kind=scene&tags=${TAG_A},${TAG_B}`,
+    { cookie: member },
+  );
+  assert.equal(commaed.status, 200);
 });

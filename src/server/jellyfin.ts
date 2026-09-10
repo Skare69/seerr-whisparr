@@ -59,6 +59,7 @@ interface BaseItemDto {
   Path?: string;
   ProviderIds?: Record<string, string>;
   SortName?: string;
+  DateCreated?: string;
   ImageTags?: Record<string, string>;
   MediaSources?: MediaSource[];
 }
@@ -384,6 +385,9 @@ async function fetchItems(
     search: string;
     // Extra /Items fields for identity matching (ProviderIds, Path).
     extraFields?: string;
+    // Sort override; unset keeps itemsPath's SortName/Ascending default.
+    sortBy?: string;
+    sortOrder?: string;
   },
 ): Promise<{ items: BaseItemDto[]; total: number }> {
   const params: Record<string, string> = {
@@ -397,6 +401,8 @@ async function fetchItems(
   if (opts.parentId) params.parentId = opts.parentId;
   if (opts.ids) params.ids = opts.ids;
   if (opts.search) params.searchTerm = opts.search;
+  if (opts.sortBy) params.sortBy = opts.sortBy;
+  if (opts.sortOrder) params.sortOrder = opts.sortOrder;
   const res = await requestJson<QueryResult>(
     config.jellyfin.url,
     itemsPath(userId, params),
@@ -418,6 +424,17 @@ function compareItems(a: BaseItemDto, b: BaseItemDto): number {
   if (keyA < keyB) return -1;
   if (keyA > keyB) return 1;
   return 0;
+}
+
+// Recently-added order: server DateCreated descending, id tiebreak for a
+// stable total order. An item without a parseable date sorts oldest.
+function compareByDateCreatedDesc(a: BaseItemDto, b: BaseItemDto): number {
+  const ta = Date.parse(String(a.DateCreated ?? "")) || 0;
+  const tb = Date.parse(String(b.DateCreated ?? "")) || 0;
+  if (tb !== ta) return tb - ta;
+  const ia = String(a.Id ?? "");
+  const ib = String(b.Id ?? "");
+  return ia < ib ? -1 : ia > ib ? 1 : 0;
 }
 
 // ponytail: cross-library pages are a k-way merge of per-library SortName
@@ -577,6 +594,49 @@ export async function listLibraryItems(
     limit,
     search,
   );
+}
+
+// Discover shelf: the account's most recently added library items, ordered by
+// the server's own recently-added ordering (DateCreated descending) — never
+// reinterpreted as trending or popular, which this server does not provide.
+// Runs entirely under the caller's user token so item-level policy applies,
+// scoped to the intersection of configured and granted libraries. Bounded:
+// limit (1..60, capped per library at limit itself), one small page per
+// granted library, no unbounded sweep. Empty grants return empty without any
+// upstream call, and upstream failures propagate as errors — never an empty
+// shelf.
+export async function listRecentlyAddedItems(
+  config: IntegrationConfig,
+  userToken: string,
+  account: Account,
+  limit: number,
+): Promise<LibraryItem[]> {
+  requireJellyfinConfig(config);
+  const n = Number(limit);
+  if (!Number.isInteger(n) || n < 1 || n > 60) {
+    throw new AppError(400, "invalid_query", "Invalid pagination parameters.");
+  }
+  const libraryIds = effectiveLibraries(config, account);
+  if (libraryIds.length === 0) return [];
+  const user = await getCurrentUser(config, userToken);
+  const pages = await Promise.all(
+    libraryIds.map((libraryId) =>
+      fetchItems(config, userToken, user.id, {
+        parentId: libraryId,
+        startIndex: 0,
+        limit: n,
+        search: "",
+        sortBy: "DateCreated",
+        sortOrder: "Descending",
+        extraFields: "DateCreated",
+      }),
+    ),
+  );
+  return pages
+    .flatMap((page) => page.items)
+    .sort(compareByDateCreatedDesc)
+    .slice(0, n)
+    .map((dto) => mapLibraryItem(dto, user, config, undefined));
 }
 
 // Exact membership proof: the item must be visible to the caller's user

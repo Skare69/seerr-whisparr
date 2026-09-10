@@ -25,9 +25,30 @@
 //   normalizes all artwork onto cdn.theporndb.net / thumb.theporndb.net.
 //   Raw `image` fields on TPDB rows point at unbounded studio CDNs and are
 //   deliberately never emitted or proxied.
+// - Verified live 2026-09-11: TPDB /sites rows are {uuid, id (numeric),
+//   name, url, description?, logo/poster/favicon on cdn.theporndb.net,
+//   nested network/parent site rows}; /sites/{id} accepts uuid or numeric
+//   id, but scene/movie `site_id` filters accept only the NUMERIC id (a
+//   uuid 422s). /tags rows are {id (numeric), uuid, name}. TPDB
+//   tags[]/tag_and (and performer) filter params were observed accepting
+//   requests but returning zero rows live on 2026-09-11 — passed through
+//   as-is; the provider owns their results. site_id-filtered listings
+//   reported real totals; title-only q still hits the fake 10000 cap.
+// - StashDB searchStudio(term, limit) and searchTag(term, limit) return
+//   flat [Studio]/[Tag] lists with no count (unpaged, provider-capped);
+//   queryScenes accepts studios/tags criteria with INCLUDES/EXCLUDES plus
+//   sort/direction (TRENDING and POPULARITY verified live). StudioSortEnum
+//   has no trending order, so studio search exposes no sort at all. StashDB
+//   studio records carry explicit provider URLs, but cross-provider linking
+//   stays performer-level only — studios are never merged across providers.
 
 import { AppError, requestJson, requestBytes } from "./http.ts";
-import type { CatalogDetail, CatalogReference } from "../lib/contracts.ts";
+import type {
+  CatalogDetail,
+  CatalogProvider,
+  CatalogReference,
+  MediaKind,
+} from "../lib/contracts.ts";
 
 // --- credentials and bases: read from the environment at call time; values
 // are never logged, echoed, or placed in URLs ---
@@ -356,6 +377,7 @@ function tpdbMediaDetail(
   if (!isUuid(id) || title === undefined) return undefined;
   const site = r.site as Record<string, unknown> | null | undefined;
   const studioName = cleanString(site?.name, MAX.name);
+  const siteUuid = (site as { uuid?: unknown } | null | undefined)?.uuid;
   const description = cleanString(r.description, MAX.description);
   const duration = cleanDuration(r.duration);
   const imageUrl =
@@ -371,7 +393,22 @@ function tpdbMediaDetail(
     ...(isIsoDate(r.date) ? { releaseDate: r.date } : {}),
     ...(duration !== undefined ? { durationSeconds: duration } : {}),
     ...(imageUrl !== undefined ? { imageUrl } : {}),
-    ...(studioName !== undefined ? { studio: { name: studioName } } : {}),
+    ...(studioName !== undefined
+      ? {
+          studio: {
+            name: studioName,
+            ...(isUuid(siteUuid)
+              ? {
+                  reference: {
+                    provider: "tpdb",
+                    kind: "studio",
+                    id: siteUuid,
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
     credits: tpdbCredits(r.performers),
     tags: tpdbTags(r.tags),
     // Movies embed their scenes; scenes embed their movies.
@@ -430,6 +467,54 @@ function tpdbPerformerDetail(row: unknown): CatalogDetail | undefined {
     related: [],
     links,
     aliases,
+  };
+}
+
+/** TPDB site (studio) rows: {uuid, id (numeric), name, url, description?,
+ * logo/poster on cdn.theporndb.net, nested network/parent site rows}. The
+ * uuid is the canonical identity; numeric id only as a fallback. The parent
+ * relationship is mapped only from provider-supplied parent/network rows —
+ * never invented. Favicon is provider-hosted but deliberately not used. */
+function tpdbStudioDetail(row: unknown): CatalogDetail | undefined {
+  if (row === null || typeof row !== "object") return undefined;
+  const r = row as Record<string, unknown>;
+  const id = isUuid(r.uuid)
+    ? r.uuid
+    : typeof r.id === "number" && Number.isInteger(r.id)
+      ? String(r.id)
+      : undefined;
+  const name = cleanString(r.name, MAX.name);
+  if (id === undefined || name === undefined) return undefined;
+  const imageUrl = servableImage(r.poster) ?? servableImage(r.logo);
+  const description = cleanString(r.description, MAX.description);
+  const sourceUrl = httpsUrl(r.url);
+  const parent = r.parent ?? r.network;
+  const parentRow = (parent ?? null) as Record<string, unknown> | null;
+  const parentName = cleanString(parentRow?.name, MAX.name);
+  const parentId = isUuid(parentRow?.uuid)
+    ? parentRow.uuid
+    : typeof parentRow?.id === "number" && Number.isInteger(parentRow.id)
+      ? String(parentRow.id)
+      : undefined;
+  return {
+    reference: { provider: "tpdb", kind: "studio", id },
+    title: name,
+    ...(description !== undefined ? { description } : {}),
+    ...(imageUrl !== undefined ? { imageUrl } : {}),
+    ...(parentName !== undefined && parentId !== undefined
+      ? {
+          studio: {
+            name: parentName,
+            reference: { provider: "tpdb", kind: "studio", id: parentId },
+          },
+        }
+      : {}),
+    credits: [],
+    tags: [],
+    related: [],
+    links: sourceUrl !== undefined ? [{ url: sourceUrl, label: name }] : [],
+    aliases: [],
+    ...(sourceUrl !== undefined ? { sourceUrl } : {}),
   };
 }
 
@@ -494,10 +579,9 @@ function stashSceneDetail(row: unknown): CatalogDetail | undefined {
   const title =
     cleanString(r.title, MAX.title) ?? cleanString(r.code, MAX.title);
   if (!isUuid(id) || title === undefined) return undefined;
-  const studioName = cleanString(
-    (r.studio as Record<string, unknown> | null | undefined)?.name,
-    MAX.name,
-  );
+  const studio = r.studio as Record<string, unknown> | null | undefined;
+  const studioName = cleanString(studio?.name, MAX.name);
+  const studioId = studio?.id;
   const details = cleanString(r.details, MAX.description);
   const duration = cleanDuration(r.duration);
   const links = stashLinks(r.urls);
@@ -507,7 +591,22 @@ function stashSceneDetail(row: unknown): CatalogDetail | undefined {
     ...(details !== undefined ? { description: details } : {}),
     ...(isIsoDate(r.date) ? { releaseDate: r.date } : {}),
     ...(duration !== undefined ? { durationSeconds: duration } : {}),
-    ...(studioName !== undefined ? { studio: { name: studioName } } : {}),
+    ...(studioName !== undefined
+      ? {
+          studio: {
+            name: studioName,
+            ...(isUuid(studioId)
+              ? {
+                  reference: {
+                    provider: "stashdb",
+                    kind: "studio",
+                    id: studioId,
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
     credits: stashCredits(r.performers),
     tags: tpdbTags(r.tags), // StashDB tags share the TPDB {id, name} shape
     related: [],
@@ -537,6 +636,41 @@ function stashPerformerDetail(row: unknown): CatalogDetail | undefined {
     related: [],
     links,
     aliases,
+  };
+}
+
+/** StashDB Studio: {id, name, deleted, urls, images, parent}. Deleted rows
+ * are unusable everywhere (authoritative absence), so they never map; the
+ * parent studio is mapped only when the provider supplies one. */
+function stashStudioDetail(row: unknown): CatalogDetail | undefined {
+  if (row === null || typeof row !== "object") return undefined;
+  const r = row as Record<string, unknown>;
+  const id = r.id;
+  const name = cleanString(r.name, MAX.name);
+  if (!isUuid(id) || name === undefined) return undefined;
+  if (r.deleted === true) return undefined;
+  const parent = r.parent as Record<string, unknown> | null | undefined;
+  const parentName = cleanString(parent?.name, MAX.name);
+  const parentId = parent?.id;
+  const imageUrl = stashImageUrl(r.images);
+  const links = stashLinks(r.urls);
+  return {
+    reference: { provider: "stashdb", kind: "studio", id },
+    title: name,
+    ...(imageUrl !== undefined ? { imageUrl } : {}),
+    ...(parentName !== undefined && isUuid(parentId)
+      ? {
+          studio: {
+            name: parentName,
+            reference: { provider: "stashdb", kind: "studio", id: parentId },
+          },
+        }
+      : {}),
+    credits: [],
+    tags: [],
+    related: [],
+    links,
+    aliases: [],
   };
 }
 
@@ -597,11 +731,127 @@ export async function getProviderStatus(
   }
 }
 
+/** Normalized sort vocabulary. Only orders the providers genuinely implement
+ * appear here; the page surfaces the exact upstream order that was applied. */
+export type CatalogSortKey =
+  | "relevance"
+  | "recency"
+  | "duration"
+  | "title"
+  | "date"
+  | "created"
+  | "updated"
+  | "trending"
+  | "popularity";
+
+export type CatalogSortDirection = "asc" | "desc";
+
+export interface AppliedSort {
+  key: CatalogSortKey;
+  /** Absent only for TPDB relevance, which has no direction upstream. */
+  direction?: CatalogSortDirection;
+  /** The exact upstream order token that was sent. */
+  upstream: string;
+}
+
+/** Resolves a requested sort for a provider+kind to the exact upstream order.
+ * Throws the explicit invalid-query error for any order the provider does not
+ * implement — trending and popularity are StashDB scene-only; TPDB has
+ * neither. TPDB recency maps to release recency (recently_released /
+ * former_released); its created/updated RECORD orders are deliberately not
+ * aliased onto release recency. */
+export function resolveSort(
+  provider: CatalogProvider,
+  kind: MediaKind,
+  sort: CatalogSortKey,
+  direction?: CatalogSortDirection,
+): AppliedSort {
+  if (kind !== "movie" && kind !== "scene") {
+    throw new AppError(
+      400,
+      "invalid_search",
+      "Sorts apply to movie and scene search only.",
+    );
+  }
+  if (provider === "tpdb") {
+    if (sort === "relevance") {
+      if (direction !== undefined) {
+        throw new AppError(
+          400,
+          "invalid_search",
+          "TPDB relevance order takes no direction.",
+        );
+      }
+      return { key: sort, upstream: "most_relevant" };
+    }
+    if (sort === "recency") {
+      const dir = direction ?? "desc";
+      return {
+        key: sort,
+        direction: dir,
+        upstream: dir === "desc" ? "recently_released" : "former_released",
+      };
+    }
+    if (sort === "duration") {
+      const dir = direction ?? "desc";
+      return {
+        key: sort,
+        direction: dir,
+        upstream: dir === "desc" ? "duration_desc" : "duration_asc",
+      };
+    }
+    throw new AppError(
+      400,
+      "invalid_search",
+      `TPDB implements no ${sort} order; only relevance, recency, and duration exist.`,
+    );
+  }
+  if (kind !== "scene") {
+    throw new AppError(
+      400,
+      "invalid_search",
+      "StashDB has no movie entity; sorts apply to scene search only.",
+    );
+  }
+  const stashdbSceneSorts: Record<
+    | "title"
+    | "date"
+    | "duration"
+    | "trending"
+    | "popularity"
+    | "created"
+    | "updated",
+    string
+  > = {
+    title: "TITLE",
+    date: "DATE",
+    duration: "DURATION",
+    trending: "TRENDING",
+    popularity: "POPULARITY",
+    created: "CREATED_AT",
+    updated: "UPDATED_AT",
+  };
+  if (sort === "relevance" || sort === "recency") {
+    throw new AppError(
+      400,
+      "invalid_search",
+      `StashDB implements no ${sort} order for scenes; relevance and recency are TPDB-only.`,
+    );
+  }
+  const upstream = stashdbSceneSorts[sort];
+  return { key: sort, direction: direction ?? "desc", upstream };
+}
+
 /** Paged search query. Filters are explicit per provider+kind; combinations
  * the upstream cannot express are rejected rather than silently ignored.
  * `performer` on tpdb movie/scene is the canonical TPDB performer UUID and
- * switches to the filmography route (no query/year filters there); on a
- * stashdb scene it uses the performers INCLUDES criterion. */
+ * switches to the filmography route (paging only there); on a stashdb scene
+ * it uses the performers INCLUDES criterion. `studio` filters by the
+ * provider's own studio id (TPDB resolves a site UUID to its numeric
+ * site_id; StashDB uses the studios INCLUDES criterion); `tags`/`tagsAll`/
+ * `tagsExclude` stay provider-native tag ids. `sort`/`direction` map through
+ * resolveSort to each provider's real orders — unsupported combinations
+ * throw. Studio and performer searches take no filters. */
 export type CatalogSearchQuery =
   | {
       provider: "tpdb";
@@ -609,6 +859,11 @@ export type CatalogSearchQuery =
       query?: string;
       year?: number;
       performer?: string;
+      studio?: string;
+      tags?: string[];
+      tagsAll?: string[];
+      sort?: CatalogSortKey;
+      direction?: CatalogSortDirection;
       page?: number;
       perPage?: number;
     }
@@ -618,6 +873,11 @@ export type CatalogSearchQuery =
       query?: string;
       year?: number;
       performer?: string;
+      studio?: string;
+      tags?: string[];
+      tagsAll?: string[];
+      sort?: CatalogSortKey;
+      direction?: CatalogSortDirection;
       page?: number;
       perPage?: number;
     }
@@ -629,20 +889,36 @@ export type CatalogSearchQuery =
       perPage?: number;
     }
   | {
+      provider: "tpdb";
+      kind: "studio";
+      query: string;
+      page?: number;
+      perPage?: number;
+    }
+  | {
       provider: "stashdb";
       kind: "scene";
       query?: string;
       performer?: string;
+      studio?: string;
+      tags?: string[];
+      tagsExclude?: string[];
+      sort?: CatalogSortKey;
+      direction?: CatalogSortDirection;
       page?: number;
       perPage?: number;
     }
-  | { provider: "stashdb"; kind: "performer"; query: string };
+  | { provider: "stashdb"; kind: "performer"; query: string }
+  | { provider: "stashdb"; kind: "studio"; query: string };
 
 export interface CatalogSearchPage {
   provider: "tpdb" | "stashdb";
-  kind: "movie" | "scene" | "performer";
+  kind: "movie" | "scene" | "performer" | "studio";
   page: number;
   perPage: number;
+  /** Present only when the query requested a sort: the exact order the
+   * provider applied, so shelves can be labeled truthfully. */
+  sort?: AppliedSort;
   /** True only when the provider offers a real next page. */
   hasMore: boolean;
   /** Present only when the provider's count is genuinely real. TPDB's
@@ -688,6 +964,96 @@ function requireStashPerformerId(v: unknown): string {
   return v;
 }
 
+function requireStashStudioId(v: unknown): string {
+  if (!isUuid(v)) {
+    throw new AppError(
+      400,
+      "invalid_reference",
+      "StashDB scene studio filters require a StashDB studio UUID.",
+    );
+  }
+  return v;
+}
+
+/** Tag filter ids stay provider-native: UUIDs on both providers, deduplicated,
+ * capped. An empty array is a no-op filter, not an unsupported one. */
+function cleanTagIds(
+  v: unknown,
+  provider: "TPDB" | "StashDB",
+): string[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    throw new AppError(
+      400,
+      "invalid_search",
+      `Tag filters must be arrays of ${provider} tag UUIDs.`,
+    );
+  }
+  const ids: string[] = [];
+  for (const entry of v.slice(0, 25)) {
+    const s = cleanString(entry, 64);
+    if (s === undefined || !isUuid(s)) {
+      throw new AppError(
+        400,
+        "invalid_search",
+        `${provider} tag filters require ${provider} tag UUIDs.`,
+      );
+    }
+    if (!ids.includes(s)) ids.push(s);
+  }
+  return ids.length > 0 ? ids : undefined;
+}
+
+/** Runtime guard for variants whose type already omits filter fields: JSON
+ * callers can smuggle fields in, and an unsupported filter must never be
+ * silently dropped. */
+function rejectUnusedFilters(
+  raw: Record<string, unknown>,
+  message: string,
+): void {
+  for (const field of [
+    "studio",
+    "tags",
+    "tagsAll",
+    "tagsExclude",
+    "sort",
+    "direction",
+  ]) {
+    if (raw[field] !== undefined) {
+      throw new AppError(400, "invalid_search", message);
+    }
+  }
+}
+
+/** TPDB filters scenes/movies by NUMERIC site_id (verified live 2026-09-11:
+ * a uuid is rejected upstream), while site identity everywhere else is the
+ * uuid. A uuid filter value is resolved once through /sites/{uuid}; a numeric
+ * string passes straight through. */
+async function resolveTpdbStudioFilter(
+  v: unknown,
+): Promise<string | undefined> {
+  const s = cleanString(v, 64);
+  if (s === undefined) return undefined;
+  if (/^\d+$/.test(s)) return s;
+  if (isUuid(s)) {
+    const body = await tpdbGet<{ data?: { id?: unknown } }>(`/sites/${s}`);
+    const row = (body?.data ?? null) as { id?: unknown } | null;
+    if (typeof row?.id === "number" && Number.isInteger(row.id)) {
+      return String(row.id);
+    }
+    throw new AppError(
+      502,
+      "upstream_bad_response",
+      "TPDB returned an unusable site record.",
+    );
+  }
+  throw new AppError(
+    400,
+    "invalid_reference",
+    "TPDB studio filters require a TPDB site UUID or numeric site id.",
+  );
+}
+
 interface TpdbListBody {
   data?: unknown;
   links?: { next?: unknown };
@@ -695,7 +1061,7 @@ interface TpdbListBody {
 }
 
 function parseTpdbPage(
-  kind: "movie" | "scene" | "performer",
+  kind: "movie" | "scene" | "performer" | "studio",
   body: TpdbListBody,
   map: (row: unknown) => CatalogDetail | undefined,
   page: number,
@@ -736,10 +1102,17 @@ function parseTpdbPage(
   };
 }
 
-function tpdbQuery(base: Record<string, string | number | undefined>): string {
+function tpdbQuery(
+  base: Record<string, string | number | string[] | undefined>,
+): string {
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(base)) {
-    if (v !== undefined && v !== "") params.set(k, String(v));
+    if (v === undefined || v === "") continue;
+    if (Array.isArray(v)) {
+      for (const item of v) params.append(`${k}[]`, item);
+      continue;
+    }
+    params.set(k, String(v));
   }
   const qs = params.toString();
   return qs === "" ? "" : `?${qs}`;
@@ -750,11 +1123,16 @@ function tpdbQuery(base: Record<string, string | number | undefined>): string {
 export async function searchCatalog(
   query: CatalogSearchQuery,
 ): Promise<CatalogSearchPage> {
-  // StashDB performer search is the one genuinely unpaged shape:
-  // searchPerformers takes no page arguments and caps at ~10 rows. It is
-  // dispatched before the paging defaults so every remaining query variant
-  // genuinely accepts page/perPage.
+  // StashDB performer and studio searches are the genuinely unpaged shapes:
+  // searchPerformers/searchStudio take no page arguments and cap rows. They
+  // are dispatched before the paging defaults so every remaining query
+  // variant genuinely accepts page/perPage.
+  const raw = query as Record<string, unknown>;
   if (query.provider === "stashdb" && query.kind === "performer") {
+    rejectUnusedFilters(
+      raw,
+      "StashDB performer search supports only a query term.",
+    );
     const q = cleanQueryTerm(query.query);
     if (q === undefined) {
       throw new AppError(
@@ -802,6 +1180,52 @@ export async function searchCatalog(
     };
   }
 
+  if (query.provider === "stashdb" && query.kind === "studio") {
+    rejectUnusedFilters(
+      raw,
+      "StashDB studio search supports only a query term.",
+    );
+    const q = cleanQueryTerm(query.query);
+    if (q === undefined) {
+      throw new AppError(
+        400,
+        "invalid_search",
+        "StashDB studio search requires a query term.",
+      );
+    }
+    const res = await stashQuery(
+      "query($t: String!) { searchStudio(term: $t, limit: 25) { id name deleted parent { id name } images { url } urls { url type } } }",
+      { t: q },
+      "searchStudio",
+    );
+    if (!Array.isArray(res)) {
+      throw new AppError(
+        502,
+        "upstream_bad_response",
+        "StashDB returned an unusable studio search.",
+      );
+    }
+    const items = dedupeBy(
+      res
+        .slice(0, 50)
+        .map(stashStudioDetail)
+        .filter((d): d is CatalogDetail => d !== undefined),
+      (d) => d.reference.id,
+    );
+    return {
+      provider: "stashdb",
+      kind: "studio",
+      page: 1,
+      perPage: items.length,
+      // ponytail: searchStudio exposes neither paging nor a count — the
+      // provider caps the result (limit above); anything beyond it is
+      // genuinely unreachable through this API.
+      hasMore: false,
+      totalCountKnown: false,
+      items,
+    };
+  }
+
   const page =
     typeof query.page === "number" &&
     Number.isInteger(query.page) &&
@@ -818,6 +1242,10 @@ export async function searchCatalog(
 
   if (query.provider === "tpdb") {
     if (query.kind === "performer") {
+      rejectUnusedFilters(
+        raw,
+        "TPDB performer search supports only query, page, and perPage.",
+      );
       const q = cleanQueryTerm(query.query);
       if (q === undefined) {
         throw new AppError(
@@ -837,6 +1265,24 @@ export async function searchCatalog(
         perPage,
       );
     }
+    if (query.kind === "studio") {
+      rejectUnusedFilters(
+        raw,
+        "TPDB studio search supports only query, page, and perPage.",
+      );
+      const q = cleanQueryTerm(query.query);
+      if (q === undefined) {
+        throw new AppError(
+          400,
+          "invalid_search",
+          "TPDB studio search requires a query term.",
+        );
+      }
+      const body = await tpdbGet<TpdbListBody>(
+        `/sites${tpdbQuery({ q, page, per_page: perPage })}`,
+      );
+      return parseTpdbPage("studio", body, tpdbStudioDetail, page, perPage);
+    }
     if (query.performer !== undefined) {
       // Filmography traversal via the canonical performer. The route supports
       // paging only; query/year filters are rejected, not ignored.
@@ -847,9 +1293,13 @@ export async function searchCatalog(
         throw new AppError(
           400,
           "invalid_search",
-          "TPDB filmography paging cannot be combined with query or year filters.",
+          "TPDB filmography paging cannot be combined with query, year, studio, tag, or sort filters.",
         );
       }
+      rejectUnusedFilters(
+        raw,
+        "TPDB filmography paging cannot be combined with studio, tag, or sort filters.",
+      );
       const id = requireTpdbPerformerId(query.performer);
       const body = await tpdbGet<TpdbListBody>(
         `/performers/${id}/${query.kind}s${tpdbQuery({ page, per_page: perPage })}`,
@@ -862,22 +1312,48 @@ export async function searchCatalog(
         perPage,
       );
     }
+    if (query.direction !== undefined && query.sort === undefined) {
+      throw new AppError(
+        400,
+        "invalid_search",
+        "direction requires an explicit sort.",
+      );
+    }
+    const sort =
+      query.sort !== undefined
+        ? resolveSort("tpdb", query.kind, query.sort, query.direction)
+        : undefined;
+    const includeTags = cleanTagIds(query.tags, "TPDB");
+    const allTags = cleanTagIds(query.tagsAll, "TPDB");
+    if (includeTags !== undefined && allTags !== undefined) {
+      throw new AppError(
+        400,
+        "invalid_search",
+        "Choose either tags (any-of) or tagsAll (all-of); TPDB exposes one tag criterion per query.",
+      );
+    }
+    const studioFilter = await resolveTpdbStudioFilter(query.studio);
     const path = tpdbQuery({
       q: cleanQueryTerm(query.query),
       year: cleanYear(query.year),
+      tags: includeTags ?? allTags,
+      site_id: studioFilter,
+      tag_and: allTags !== undefined ? 1 : undefined,
+      orderBy: sort?.upstream,
       page,
       per_page: perPage,
     });
     const body = await tpdbGet<TpdbListBody>(
       query.kind === "movie" ? `/movies${path}` : `/scenes${path}`,
     );
-    return parseTpdbPage(
+    const result = parseTpdbPage(
       query.kind,
       body,
       (row) => tpdbMediaDetail(query.kind, row),
       page,
       perPage,
     );
+    return sort !== undefined ? { ...result, sort } : result;
   }
 
   const input: Record<string, unknown> = { page, per_page: perPage };
@@ -888,6 +1364,39 @@ export async function searchCatalog(
       value: [requireStashPerformerId(query.performer)],
       modifier: "INCLUDES",
     };
+  }
+  if (query.studio !== undefined) {
+    input.studios = {
+      value: [requireStashStudioId(query.studio)],
+      modifier: "INCLUDES",
+    };
+  }
+  const includeTags = cleanTagIds(query.tags, "StashDB");
+  const excludeTags = cleanTagIds(query.tagsExclude, "StashDB");
+  if (includeTags !== undefined && excludeTags !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_search",
+      "StashDB exposes one tag criterion per query; combine include and exclude lists client-side.",
+    );
+  }
+  if (includeTags !== undefined) {
+    input.tags = { value: includeTags, modifier: "INCLUDES" };
+  }
+  if (excludeTags !== undefined) {
+    input.tags = { value: excludeTags, modifier: "EXCLUDES" };
+  }
+  let sort: AppliedSort | undefined;
+  if (query.sort !== undefined) {
+    sort = resolveSort("stashdb", "scene", query.sort, query.direction);
+    input.sort = sort.upstream;
+    input.direction = sort.direction === "asc" ? "ASC" : "DESC";
+  } else if (query.direction !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_search",
+      "direction requires an explicit sort.",
+    );
   }
   const res = (await stashQuery(
     "query($f: SceneQueryInput!) { queryScenes(input: $f) { count scenes { id title code details date duration urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted images { url } } } } } }",
@@ -911,7 +1420,7 @@ export async function searchCatalog(
   const rawCount: unknown = res.count;
   const totalReal =
     typeof rawCount === "number" && Number.isInteger(rawCount) && rawCount >= 1;
-  return {
+  const result: CatalogSearchPage = {
     provider: "stashdb",
     kind: "scene",
     page,
@@ -923,6 +1432,7 @@ export async function searchCatalog(
     totalCountKnown: totalReal,
     items,
   };
+  return sort !== undefined ? { ...result, sort } : result;
 }
 
 /** Full provider detail for one catalog entity. Returns null only for an
@@ -958,7 +1468,9 @@ export async function getCatalogDetail(
         ? `/movies/${id}`
         : kind === "scene"
           ? `/scenes/${id}`
-          : `/performers/${id}`;
+          : kind === "studio"
+            ? `/sites/${id}`
+            : `/performers/${id}`;
     let body: { data?: unknown };
     try {
       body = await tpdbGet<{ data?: unknown }>(path);
@@ -971,7 +1483,9 @@ export async function getCatalogDetail(
         ? tpdbPerformerDetail(body?.data)
         : kind === "movie"
           ? tpdbMediaDetail("movie", body?.data)
-          : tpdbMediaDetail("scene", body?.data);
+          : kind === "scene"
+            ? tpdbMediaDetail("scene", body?.data)
+            : tpdbStudioDetail(body?.data);
     // A record whose id differs from the requested one is unusable for this
     // reference even when individually well-formed.
     if (detail === undefined || detail.reference.id !== id) {
@@ -1021,7 +1535,83 @@ export async function getCatalogDetail(
     }
     return detail;
   }
+  if (kind === "studio") {
+    const row = await stashQuery(
+      "query($id: ID!) { findStudio(id: $id) { id name deleted urls { url type } images { url } parent { id name } } }",
+      { id },
+      "findStudio",
+    );
+    if (
+      typeof row === "object" &&
+      row !== null &&
+      "deleted" in row &&
+      row.deleted === true
+    ) {
+      return null; // deleted studios are authoritatively gone
+    }
+    if (row === null) return null;
+    const detail = stashStudioDetail(row);
+    if (detail === undefined) {
+      throw new AppError(
+        502,
+        "upstream_bad_response",
+        "StashDB returned an unusable studio record.",
+      );
+    }
+    return detail;
+  }
   throw new AppError(400, "invalid_reference", "Unknown catalog kind.");
+}
+
+/** Tag lookup for filter pickers: provider-native {id, name} pairs for a
+ * search term. TPDB /tags and StashDB searchTag; ids are never mapped across
+ * providers. First page/limit only — enough to build a filter list. */
+export async function searchCatalogTags(
+  provider: CatalogProvider,
+  term: string,
+): Promise<{ id: string; name: string }[]> {
+  const q = cleanQueryTerm(term);
+  if (q === undefined) {
+    throw new AppError(
+      400,
+      "invalid_search",
+      "Tag lookup requires a search term.",
+    );
+  }
+  if (provider === "tpdb") {
+    const body = await tpdbGet<TpdbListBody>(
+      `/tags${tpdbQuery({ q, per_page: MAX.tags })}`,
+    );
+    if (!Array.isArray(body?.data)) {
+      throw new AppError(
+        502,
+        "upstream_bad_response",
+        "TPDB returned an unusable tag listing.",
+      );
+    }
+    return tpdbTags(body.data);
+  }
+  const res = await stashQuery(
+    "query($t: String!) { searchTag(term: $t, limit: 50) { id name } }",
+    { t: q },
+    "searchTag",
+  );
+  if (!Array.isArray(res)) {
+    throw new AppError(
+      502,
+      "upstream_bad_response",
+      "StashDB returned an unusable tag search.",
+    );
+  }
+  const out: { id: string; name: string }[] = [];
+  for (const row of res.slice(0, MAX.tags)) {
+    if (row === null || typeof row !== "object") continue;
+    const name = "name" in row ? cleanString(row.name, 120) : undefined;
+    if ("id" in row && isUuid(row.id) && name !== undefined) {
+      out.push({ id: row.id, name });
+    }
+  }
+  return dedupeBy(out, (t) => t.id);
 }
 
 // --- cross-provider performer identity ---

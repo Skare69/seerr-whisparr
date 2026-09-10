@@ -34,7 +34,7 @@ import { AppError } from "./http.ts";
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 // ponytail: fixed 7-day session TTL; make it an env knob only if an operator asks.
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BUSY_TIMEOUT_MS = 5000;
@@ -44,7 +44,12 @@ const ROLES: readonly Role[] = ["admin", "moderator", "requester"];
 const RECHECK_DELAY_MS = 60_000;
 const PROVIDERS: readonly CatalogProvider[] = ["tpdb", "stashdb"];
 const MEDIA_KINDS: readonly MediaKind[] = ["movie", "scene"];
-const CATALOG_KINDS: readonly CatalogKind[] = ["movie", "scene", "performer"];
+const CATALOG_KINDS: readonly CatalogKind[] = [
+  "movie",
+  "scene",
+  "performer",
+  "studio",
+];
 const OBSERVED_STATES = ["monitoring", "downloading", "imported"] as const;
 const SCHEDULABLE_STATES = [
   "unsent",
@@ -238,6 +243,26 @@ const MIGRATIONS: Record<number, string> = {
     ALTER TABLE acquisitions ADD COLUMN whisparr_id INTEGER;
     ALTER TABLE acquisitions ADD COLUMN whisparr_path TEXT;
     ALTER TABLE acquisitions ADD COLUMN whisparr_title TEXT;
+  `,
+  4: `
+    -- SQLite cannot alter a CHECK constraint: rebuild the table with the
+    -- studio kind admitted, preserving every row and the unique identity index.
+    CREATE TABLE catalog_identities_new (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene', 'performer', 'studio')),
+      external_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO catalog_identities_new
+      SELECT id, provider, kind, external_id, title, created_at, updated_at
+      FROM catalog_identities;
+    DROP TABLE catalog_identities;
+    ALTER TABLE catalog_identities_new RENAME TO catalog_identities;
+    CREATE UNIQUE INDEX catalog_identities_ref
+      ON catalog_identities (provider, kind, external_id);
   `,
 };
 
