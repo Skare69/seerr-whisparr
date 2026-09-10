@@ -16,7 +16,7 @@ bun run setup    # writes .env.local with fresh secrets; never overwrites existi
 bun run dev      # http://127.0.0.1:5577
 ```
 
-Production: `bun run build`, then `bun run start`. Checks: `bun run check` (TypeScript strict), `bun run test` (node:test). Operations: `bun run backup` writes a consistent SQLite snapshot to a fresh destination. Containers: `docker compose up --build`; the image build and container smoke path are exercised in CI.
+Production: `docker compose up --build`. The image runs the Next standalone server (`node server.js`), which is the supported path for this build's `output: "standalone"`; the image build, readiness, non-root and restart checks run in CI. `bun run build` then `bun run start` is a local preview only and Next prints a warning that `next start` is not the standalone entry point. Checks: `bun run check` (TypeScript strict), `bun run test` (node:test). Operations: `bun run backup <destination>` writes a consistent SQLite snapshot to a fresh destination; restore by copying it into a new data directory as `velvarr.sqlite` with the same `VELVARR_SECRET_KEY`.
 
 ## Repository layout
 
