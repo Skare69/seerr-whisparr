@@ -9,7 +9,12 @@ import type { AddressInfo } from "node:net";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { AppError, requestJson, validateBaseUrl } from "../src/server/http.ts";
+import {
+  AppError,
+  requestBytes,
+  requestJson,
+  validateBaseUrl,
+} from "../src/server/http.ts";
 import {
   authenticate,
   getLibraryImage,
@@ -144,6 +149,7 @@ function account(libraryIds: string[]): Account {
     enabled: true,
     libraryIds,
     isOwner: false,
+    autoApprove: false,
   };
 }
 
@@ -438,6 +444,144 @@ test("requestJson distinguishes auth, forbidden, missing, outage, and timeout", 
       for (const recorded of fx.log) {
         assert.ok(!recorded.url.includes("evil.example"));
       }
+    },
+  );
+});
+
+test("provider transports use Bearer for TPDB and ApiKey for StashDB", async () => {
+  await withFixture(
+    (req, res) => {
+      sendJson(res, 200, {
+        auth: req.headers.authorization ?? null,
+        apiKey: req.headers.apikey ?? null,
+      });
+    },
+    async (fx) => {
+      const tpdb = await requestJson<{
+        auth: string | null;
+        apiKey: string | null;
+      }>(fx.origin, "/tpdb", TOKEN, { service: "tpdb" });
+      assert.equal(tpdb.auth, `Bearer ${TOKEN}`);
+      assert.equal(tpdb.apiKey, null);
+      const stashdb = await requestJson<{
+        auth: string | null;
+        apiKey: string | null;
+      }>(fx.origin, "/stashdb", TOKEN, { service: "stashdb" });
+      assert.equal(stashdb.auth, null);
+      assert.equal(stashdb.apiKey, TOKEN);
+    },
+  );
+});
+
+test("credential-free provider artwork sends no credential header", async () => {
+  await withFixture(
+    (req, res) => sendBytes(res, 200, PNG_BYTES, "image/png"),
+    async (fx) => {
+      for (const service of ["tpdb", "stashdb"] as const) {
+        fx.log.length = 0;
+        const out = await requestBytes(fx.origin, "/poster.jpg", "", {
+          service,
+        });
+        assert.equal(out.contentType, "image/png");
+        assert.ok(Buffer.from(out.bytes).equals(PNG_BYTES));
+        assert.equal(fx.log.length, 1);
+        assert.equal(fx.log[0]?.headers.authorization, undefined);
+        assert.equal(fx.log[0]?.headers.apikey, undefined);
+      }
+    },
+  );
+});
+
+test("proven provider rejection carries upstreamStatus; timeout and resets do not", async () => {
+  await withFixture(
+    (req, res) => {
+      const path = pathOf(req.url ?? "");
+      if (path === "/tpdb401") return sendJson(res, 401, { detail: "bad key" });
+      if (path === "/bad400") return sendJson(res, 400, { error: "nope" });
+      if (path === "/reset") return void res.socket?.destroy();
+      if (path === "/hang") return; // never responds; the client aborts
+      sendJson(res, 200, { ok: true });
+    },
+    async (fx) => {
+      // A metadata provider credential failure is a proven upstream 401,
+      // never session expiry: distinct code, and the upstream body is not
+      // echoed into the sanitized message.
+      await assert.rejects(
+        requestJson(fx.origin, "/tpdb401", TOKEN, { service: "tpdb" }),
+        (err: unknown) =>
+          err instanceof AppError &&
+          err.status === 401 &&
+          err.code === "upstream_auth" &&
+          err.upstreamStatus === 401 &&
+          err.message.includes("TPDB") &&
+          !err.message.includes("bad key"),
+      );
+      // Whisparr HTTP 400 is a proven rejection, never re-labeled success.
+      await assert.rejects(
+        requestJson(fx.origin, "/bad400", WH_KEY, { service: "whisparr" }),
+        (err: unknown) =>
+          err instanceof AppError &&
+          err.status === 502 &&
+          err.code === "upstream_unavailable" &&
+          err.upstreamStatus === 400,
+      );
+      // Connection reset: genuine uncertainty — same code, no proven status.
+      await assert.rejects(
+        requestJson(fx.origin, "/reset", TOKEN),
+        (err: unknown) =>
+          err instanceof AppError &&
+          err.status === 502 &&
+          err.code === "upstream_unavailable" &&
+          err.upstreamStatus === undefined,
+      );
+      await assert.rejects(
+        requestJson(fx.origin, "/hang", TOKEN, { timeoutMs: 100 }),
+        (err: unknown) =>
+          err instanceof AppError &&
+          err.status === 504 &&
+          err.code === "upstream_timeout" &&
+          err.upstreamStatus === undefined,
+      );
+    },
+  );
+});
+
+test("provider redirects are never followed to credential-capturing targets", async () => {
+  await withFixture(
+    (req, res) => {
+      if (pathOf(req.url ?? "") === "/bounce") {
+        return void res.writeHead(302, { location: `/steal?t=${TOKEN}` }).end();
+      }
+      sendJson(res, 200, { ok: true });
+    },
+    async (fx) => {
+      await assert.rejects(
+        requestJson(fx.origin, "/bounce", TOKEN, { service: "tpdb" }),
+        appError(502, "upstream_unavailable"),
+      );
+      // Exactly one request was made: /steal was never contacted, so the
+      // bearer token can never leak through a redirect.
+      assert.equal(fx.log.length, 1);
+      assert.equal(pathOf(fx.log[0]?.url ?? ""), "/bounce");
+    },
+  );
+});
+
+test("overall deadline fires while a stalled response body streams", async () => {
+  await withFixture(
+    (req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"ok":');
+      // Never end(): the body stalls after headers; the deadline must fire.
+    },
+    async (fx) => {
+      const started = Date.now();
+      await assert.rejects(
+        requestJson(fx.origin, "/stall", TOKEN, { timeoutMs: 150 }),
+        appError(504, "upstream_timeout"),
+      );
+      // Far below the 15s default: proves the deadline covers body reads.
+      assert.ok(Date.now() - started < 5_000);
     },
   );
 });

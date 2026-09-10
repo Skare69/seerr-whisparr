@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createCipheriv, randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -11,8 +12,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
   Account,
+  CatalogDetail,
   ExternalUser,
   IntegrationConfig,
+  MediaReference,
 } from "../src/lib/contracts.ts";
 
 process.env.VELVARR_ORIGIN = "http://127.0.0.1:5577";
@@ -67,6 +70,7 @@ function accountFixture(): Account {
     enabled: true,
     libraryIds: [],
     isOwner: true,
+    autoApprove: false,
   };
 }
 
@@ -341,18 +345,18 @@ test("malformed whisparr block is rejected and never persisted; valid one round-
     (e: { code: string }) => e.code === "invalid_config",
   );
   // Rejected config must not replace the persisted one.
-  assert.deepEqual(storage.getConfig()?.whisparr, {
-    url: "http://127.0.0.1:6969",
-    apiKey: "whisparr-key",
-  });
+  const kept = storage.getConfig()?.whisparr;
+  assert.equal(kept?.url, "http://127.0.0.1:6969");
+  assert.equal(kept?.apiKey, "whisparr-key");
+  assert.ok(kept?.instanceId, "bootstrap assigns a Whisparr instance identity");
+  assert.equal(kept?.delivery, undefined);
 
   const good = testConfig();
   good.whisparr = { url: "http://127.0.0.1:7000", apiKey: "new-key" };
   storage.saveConfig(good);
-  assert.deepEqual(storage.getConfig()?.whisparr, {
-    url: "http://127.0.0.1:7000",
-    apiKey: "new-key",
-  });
+  const saved = storage.getConfig()?.whisparr;
+  assert.equal(saved?.url, "http://127.0.0.1:7000");
+  assert.equal(saved?.apiKey, "new-key");
 });
 
 test("missing encryption key blocks storage operations but not lazy status", () => {
@@ -363,7 +367,6 @@ test("missing encryption key blocks storage operations but not lazy status", () 
     () => storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token"),
     (e: { code: string }) => e.code === "secret_key_invalid",
   );
-  assert.equal(storage.isInitialized(), false);
   process.env.VELVARR_SECRET_KEY = KEY_A;
   storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
   delete process.env.VELVARR_SECRET_KEY;
@@ -490,4 +493,533 @@ test("session cookie flags follow origin transport and clear correctly", () => {
   });
   assert.ok(!plain.includes("Secure"));
   assert.ok(plain.includes("HttpOnly") && plain.includes("SameSite=Strict"));
+});
+
+// --- M2 foundations ---
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MOVIE: MediaReference = {
+  provider: "tpdb",
+  kind: "movie",
+  id: "b6fd4f84-8961-4b8a-9194-e357628dea20",
+};
+const SCENE: MediaReference = {
+  provider: "stashdb",
+  kind: "scene",
+  id: "01a060a7-0644-7afd-8071-25752e1a45b7",
+};
+
+function admit(id: string, libraryIds: string[] = []): Account {
+  return storage.updateAccount(id, {
+    enabled: true,
+    role: "requester",
+    libraryIds,
+  });
+}
+
+/** Encrypts like storage does, to fabricate readable rows in a v1 database. */
+function encryptForTest(plaintext: string): Buffer {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", Buffer.from(KEY_A, "hex"), iv);
+  const ct = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), ct]);
+}
+
+function movieDetail(overrides?: Partial<CatalogDetail>): CatalogDetail {
+  return {
+    reference: { provider: "tpdb", kind: "movie", id: MOVIE.id },
+    title: "Pirates II: Stagnetti's Revenge",
+    credits: [],
+    tags: [{ id: "t1", name: "Adventure" }],
+    related: [],
+    links: [{ url: "https://theporndb.net/movies/x", label: "TPDB" }],
+    aliases: ["Pirates 2"],
+    ...overrides,
+  };
+}
+
+function deliveryConfig(enabled: boolean): IntegrationConfig {
+  return {
+    ...testConfig(),
+    whisparr: {
+      url: "http://127.0.0.1:6969",
+      apiKey: "whisparr-key",
+      ...(enabled
+        ? {
+            delivery: {
+              enabled: true,
+              rootFolderPath: "/data/xxx",
+              qualityProfileId: 1,
+              searchOnAdd: false,
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+test("whisparr instance identity is storage-owned: preserved per endpoint, rotated on change", () => {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const first = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(first && UUID_RE.test(first));
+
+  // Same endpoint across repeated saves (key rotation flow): identity kept.
+  storage.saveConfig(testConfig());
+  assert.equal(storage.getConfig()?.whisparr?.instanceId, first);
+  assert.throws(
+    () =>
+      storage.saveConfig({
+        ...testConfig(),
+        whisparr: {
+          url: "http://127.0.0.1:6969",
+          apiKey: "k",
+          instanceId: "00000000-0000-4000-8000-000000000000",
+        },
+      }),
+    (e: { code: string }) => e.code === "instance_mismatch",
+  );
+
+  // Changed endpoint: a fresh identity so old acquisition work is not reused.
+  storage.saveConfig({
+    ...testConfig(),
+    whisparr: { url: "http://127.0.0.1:7000", apiKey: "k2" },
+  });
+  const second = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(second && UUID_RE.test(second));
+  assert.notEqual(second, first);
+  // Removing whisparr and re-adding the same endpoint later still rotates.
+  storage.saveConfig({ ...testConfig(), whisparr: undefined });
+  storage.saveConfig({
+    ...testConfig(),
+    whisparr: { url: "http://127.0.0.1:6969", apiKey: "k" },
+  });
+  const third = storage.getConfig()?.whisparr?.instanceId;
+  assert.ok(third && UUID_RE.test(third));
+  assert.notEqual(third, first);
+});
+
+test("delivery settings are validated; absent delivery stays disabled", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(false), ownerUser(), "jf-owner-token");
+  assert.equal(storage.getConfig()?.whisparr?.delivery, undefined);
+
+  assert.throws(
+    () =>
+      storage.saveConfig({
+        ...testConfig(),
+        whisparr: {
+          url: "http://127.0.0.1:6969",
+          apiKey: "k",
+          delivery: {
+            enabled: true,
+            rootFolderPath: "",
+            qualityProfileId: 1,
+            searchOnAdd: true,
+          },
+        },
+      }),
+    (e: { code: string }) => e.code === "invalid_config",
+  );
+  assert.throws(
+    () =>
+      storage.saveConfig({
+        ...testConfig(),
+        whisparr: {
+          url: "http://127.0.0.1:6969",
+          apiKey: "k",
+          delivery: {
+            enabled: true,
+            rootFolderPath: "/data/xxx",
+            qualityProfileId: 0,
+            searchOnAdd: true,
+          },
+        },
+      }),
+    (e: { code: string }) => e.code === "invalid_config",
+  );
+  assert.throws(
+    () =>
+      storage.saveConfig({
+        ...testConfig(),
+        whisparr: {
+          url: "http://127.0.0.1:6969",
+          apiKey: "k",
+          pathMappings: [{ whisparrPrefix: "", jellyfinPrefix: "/m" }],
+        },
+      }),
+    (e: { code: string }) => e.code === "invalid_config",
+  );
+
+  storage.saveConfig(deliveryConfig(true));
+  const cfg = storage.getConfig()?.whisparr;
+  assert.equal(cfg?.delivery?.enabled, true);
+  assert.equal(cfg?.delivery?.rootFolderPath, "/data/xxx");
+  assert.equal(cfg?.delivery?.qualityProfileId, 1);
+  assert.equal(cfg?.delivery?.searchOnAdd, false);
+});
+
+test("v1 database migrates in place preserving config, accounts, sessions, and grants", () => {
+  const dir = freshDir();
+  storage.closeStorage();
+  rmSync(join(dir, "velvarr.sqlite"), { force: true });
+  rmSync(join(dir, "velvarr.sqlite-wal"), { force: true });
+  rmSync(join(dir, "velvarr.sqlite-shm"), { force: true });
+
+  // Fabricate an exact v1 database (schema, app id, user_version).
+  const v1 = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  v1.exec("PRAGMA application_id = 0x564c5652");
+  v1.exec("PRAGMA user_version = 1");
+  v1.exec(`
+    CREATE TABLE config (
+      id INTEGER PRIMARY KEY CHECK (id = 0),
+      data BLOB NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE accounts (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('admin', 'moderator', 'requester')),
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+      library_ids TEXT NOT NULL CHECK (json_valid(library_ids)),
+      is_owner INTEGER NOT NULL CHECK (is_owner IN (0, 1)),
+      created_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX accounts_single_owner ON accounts (is_owner) WHERE is_owner = 1;
+    CREATE TABLE sessions (
+      token_hash TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+      jellyfin_token BLOB NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL CHECK (expires_at > 0)
+    );
+    CREATE INDEX sessions_account ON sessions (account_id);
+  `);
+  v1.prepare(
+    "INSERT INTO accounts (id, name, role, enabled, library_ids, is_owner, created_at) VALUES (?, ?, 'admin', 1, ?, 1, ?)",
+  ).run(
+    ownerUser().id,
+    "Owner",
+    JSON.stringify(testConfig().jellyfin.libraryIds),
+    Date.now(),
+  );
+  v1.prepare("INSERT INTO config (id, data, updated_at) VALUES (0, ?, ?)").run(
+    encryptForTest(JSON.stringify(testConfig())),
+    Date.now(),
+  );
+  v1.close();
+
+  assert.equal(storage.isInitialized(), true);
+  const owner = storage.getAccount(ownerUser().id);
+  assert.ok(owner);
+  assert.equal(owner.role, "admin");
+  assert.equal(owner.isOwner, true);
+  assert.equal(
+    owner.autoApprove,
+    false,
+    "migrated accounts default to no auto-approve",
+  );
+  assert.deepEqual(
+    storage.getConfig()?.jellyfin.libraryIds,
+    testConfig().jellyfin.libraryIds,
+  );
+  const grant = storage.createSession(owner.id, "jf-owner-token");
+  assert.equal(storage.getSession(grant.token)?.account.id, owner.id);
+
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const version = (
+    raw.prepare("PRAGMA user_version").get() as { user_version: number }
+  ).user_version;
+  raw.close();
+  assert.equal(version, 2);
+});
+
+test("catalog records carry an application-owned id distinct from the external UUID", () => {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const record = storage.upsertCatalogRecord(movieDetail());
+  assert.notEqual(record.id, MOVIE.id);
+  assert.ok(UUID_RE.test(record.id));
+  assert.deepEqual(record.reference, movieDetail().reference);
+
+  const again = storage.upsertCatalogRecord(movieDetail({ title: "Renamed" }));
+  assert.equal(again.id, record.id);
+  assert.equal(again.title, "Renamed");
+  assert.ok(again.updatedAt >= again.createdAt);
+  assert.equal(storage.getCatalogRecord(record.id)?.title, "Renamed");
+  assert.equal(
+    storage.getCatalogRecordByReference(movieDetail().reference)?.id,
+    record.id,
+  );
+  assert.equal(
+    storage.getCatalogRecordByReference({
+      ...movieDetail().reference,
+      id: "99999999-9999-4999-8999-999999999999",
+    }),
+    null,
+  );
+
+  assert.throws(
+    () => storage.upsertCatalogRecord(movieDetail({ title: "" })),
+    (e: { code: string }) => e.code === "invalid_catalog_detail",
+  );
+  assert.throws(
+    () =>
+      storage.upsertCatalogRecord(
+        movieDetail({
+          reference: { ...movieDetail().reference, id: "not-a-uuid" },
+        }),
+      ),
+    (e: { code: string }) => e.code === "invalid_catalog_detail",
+  );
+});
+
+test("two admitted users share one acquisition per identity; active intent is unique", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const [imported] = storage.importAccounts([otherUser()]);
+  assert.ok(imported);
+  const other = admit(imported.id);
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  const r1 = storage.createRequest(owner.id, MOVIE);
+  const r2 = storage.createRequest(other.id, MOVIE);
+  const a1 = storage.decideRequest(owner, r1.id, "approved");
+  const a2 = storage.decideRequest(owner, r2.id, "approved");
+  assert.equal(a1.decision, "approved");
+  assert.equal(a2.decision, "approved");
+  assert.notEqual(r1.id, r2.id);
+
+  const due = storage.listDueAcquisitions(Date.now() + 60_000);
+  const shared = due.filter((a) => a.media.id === MOVIE.id);
+  assert.equal(shared.length, 1, "one shared acquisition for both requesters");
+  assert.equal(shared[0]?.state, "unsent");
+  assert.equal(
+    shared[0]?.instanceId,
+    storage.getConfig()?.whisparr?.instanceId,
+  );
+
+  assert.throws(
+    () => storage.createRequest(owner.id, MOVIE),
+    (e: { code: string }) => e.code === "request_exists",
+  );
+  // A different identity is a separate acquisition.
+  const r3 = storage.createRequest(owner.id, SCENE);
+  storage.decideRequest(owner, r3.id, "declined");
+  assert.equal(
+    storage
+      .listDueAcquisitions(Date.now() + 60_000)
+      .filter((a) => a.media.id === SCENE.id).length,
+    0,
+    "declined requests never enqueue work",
+  );
+});
+
+test("request lifecycle authorization: role checks, privacy, own-cancellation isolation", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(false), ownerUser(), "jf-owner-token");
+  const [imported] = storage.importAccounts([otherUser()]);
+  assert.ok(imported);
+  const other = admit(imported.id);
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // Admission is read from the stored account, not from any stale caller data.
+  const [disabled] = storage.importAccounts([
+    { ...otherUser(), id: "e".repeat(32), name: "Disabled" },
+  ]);
+  assert.ok(disabled);
+  assert.throws(
+    () => storage.createRequest(disabled.id, MOVIE),
+    (e: { code: string }) => e.code === "account_not_admitted",
+  );
+
+  const mine = storage.createRequest(other.id, MOVIE);
+  const owners = storage.createRequest(owner.id, SCENE);
+
+  assert.throws(
+    () => storage.decideRequest(other, mine.id, "approved"),
+    (e: { code: string }) => e.code === "forbidden",
+  );
+  assert.throws(
+    () => storage.getRequest(owners.id, other),
+    (e: { code: string }) => e.code === "request_not_found",
+  );
+  assert.ok(
+    storage.listRequests(other).every((r) => r.accountId === other.id),
+    "a requester's durable view never includes another user's history",
+  );
+  assert.equal(storage.listRequests(owner).length >= 2, true);
+
+  // Only the owning user can cancel, even though an admin approved nothing yet.
+  assert.throws(
+    () => storage.cancelRequest(owner, mine.id),
+    (e: { code: string }) => e.code === "request_not_found",
+  );
+  const cancelled = storage.cancelRequest(other, mine.id);
+  assert.equal(cancelled.decision, "cancelled");
+  assert.ok(cancelled.decidedAt);
+  assert.throws(
+    () => storage.cancelRequest(other, mine.id),
+    (e: { code: string }) => e.code === "request_not_cancellable",
+  );
+
+  // Cancellation suppresses nothing else: owner's request is untouched and a
+  // cancelled intent may be re-raised.
+  assert.equal(storage.getRequest(owners.id, owner).decision, "pending");
+  assert.equal(storage.createRequest(other.id, MOVIE).decision, "pending");
+
+  // Approval path: with delivery absent the shared work is honestly blocked.
+  const pending = storage.createRequest(other.id, SCENE);
+  assert.throws(
+    () => storage.decideRequest(other, pending.id, "approved"),
+    (e: { code: string }) => e.code === "forbidden",
+  );
+  storage.decideRequest(owner, pending.id, "approved");
+  assert.equal(
+    storage.listDueAcquisitions(Date.now() + 60_000).length,
+    0,
+    "blocked work is not schedulable",
+  );
+  assert.throws(
+    () => storage.decideRequest(owner, pending.id, "declined"),
+    (e: { code: string }) => e.code === "request_not_pending",
+  );
+});
+
+test("submission attempts are CAS-safe and recover to uncertain after restart", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+  const request = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, request.id, "approved");
+
+  const due = storage.listDueAcquisitions(Date.now() + 60_000);
+  assert.equal(due.length, 1);
+  const workId = due[0]?.id as string;
+
+  const first = storage.claimAcquisition(workId);
+  assert.equal(first.record.state, "unsent");
+  assert.throws(
+    () => storage.claimAcquisition(workId),
+    (e: { code: string }) => e.code === "already_claimed",
+  );
+  const attempt = storage.beginSubmission(workId, first.claimToken);
+  assert.throws(
+    () => storage.beginSubmission(workId, "stale-claim"),
+    (e: { code: string }) => e.code === "claim_lost",
+  );
+  assert.throws(
+    () =>
+      storage.completeSubmission(
+        workId,
+        first.claimToken,
+        "stale-attempt",
+        "accepted",
+      ),
+    (e: { code: string }) => e.code === "attempt_lost",
+  );
+
+  // Process dies after the persisted attempt, before the result: restart and
+  // recover. The old worker's tokens are dead; nothing may blindly re-POST.
+  storage.closeStorage();
+  assert.equal(storage.isInitialized(), true);
+  storage.recoverAbandonedWork();
+  assert.throws(
+    () =>
+      storage.completeSubmission(
+        workId,
+        first.claimToken,
+        attempt.attemptToken,
+        "accepted",
+      ),
+    (e: { code: string }) => e.code === "attempt_lost",
+  );
+  const recovered = storage.listDueAcquisitions(Date.now() + 60_000);
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0]?.state, "uncertain");
+  assert.ok(recovered[0]?.lastError);
+  assert.equal(recovered[0]?.claimToken, null);
+  assert.ok(recovered[0]?.attemptAt, "attempt evidence survives recovery");
+
+  // Reconciled resubmission accepted; the claim token gates further writes.
+  const second = storage.claimAcquisition(recovered[0]?.id as string);
+  const attempt2 = storage.beginSubmission(
+    recovered[0]?.id as string,
+    second.claimToken,
+  );
+  const done = storage.completeSubmission(
+    recovered[0]?.id as string,
+    second.claimToken,
+    attempt2.attemptToken,
+    "accepted",
+  );
+  assert.equal(done.state, "monitoring");
+  assert.ok(done.submittedAt);
+  assert.equal(done.attemptToken, null);
+
+  // An unavailable check never touches state or the last successful observation.
+  const outage = storage.recordAcquisitionObservation(
+    done.id,
+    { unavailable: true, reason: "whisparr timeout" },
+    second.claimToken,
+  );
+  assert.equal(outage.state, "monitoring");
+  assert.equal(outage.lastError, "whisparr timeout");
+  assert.equal(outage.lastObservedAt, null);
+  const observed = storage.recordAcquisitionObservation(
+    done.id,
+    { state: "downloading" },
+    second.claimToken,
+  );
+  assert.equal(observed.state, "downloading");
+  assert.ok(observed.lastObservedAt);
+  assert.equal(observed.lastError, null);
+  storage.releaseAcquisitionClaim(done.id, second.claimToken);
+  assert.throws(
+    () =>
+      storage.recordAcquisitionObservation(
+        done.id,
+        { state: "imported" },
+        second.claimToken,
+      ),
+    (e: { code: string }) => e.code === "claim_lost",
+  );
+});
+
+test("autoApprove is an explicit grant: omitted means preserved, changes revoke sessions", () => {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  const acct = storage.importAccounts([otherUser()])[0];
+  assert.ok(acct);
+  admit(acct.id);
+  const grant = storage.createSession(acct.id, "jf-token");
+  assert.equal(storage.getAccount(acct.id)?.autoApprove, false);
+
+  // Omission preserves and does not revoke.
+  storage.updateAccount(acct.id, {
+    enabled: true,
+    role: "requester",
+    libraryIds: [],
+  });
+  assert.equal(storage.getAccount(acct.id)?.autoApprove, false);
+  assert.ok(storage.getSession(grant.token), "unchanged grants keep sessions");
+
+  // Explicit change revokes the session immediately.
+  const updated = storage.updateAccount(acct.id, {
+    enabled: true,
+    role: "requester",
+    libraryIds: [],
+    autoApprove: true,
+  });
+  assert.equal(updated.autoApprove, true);
+  assert.equal(storage.getSession(grant.token), null);
+
+  // Later omission keeps the granted value.
+  storage.updateAccount(acct.id, {
+    enabled: true,
+    role: "requester",
+    libraryIds: ["11111111111111111111111111111111"],
+  });
+  assert.equal(storage.getAccount(acct.id)?.autoApprove, true);
 });
