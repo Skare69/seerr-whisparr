@@ -172,6 +172,9 @@ Evidence: [lookup controllers][whisparr-search], [movie ID lookup][whisparr-look
 - **Acquisition:** shared durable work for one resolved item on the configured Whisparr server; several requests may attach to it.
 - **Whisparr item:** the external monitored/imported item, which may predate every Velvarr request.
 - **Playable item:** an exactly matched Jellyfin item that the current user is allowed to access and play; not a global property of a download.
+- **Removal request:** one user's intent to have an entry taken away, with its own reason, approval level, and decision. Not an inverted acquisition.
+- **Removal execution:** the shared destructive work for one resolved identity: unmonitor, drop from Whisparr, exclude, delete files, delete the Jellyfin item. File deletion has no undo.
+- **Import exclusion:** a Whisparr-side block that stops list-driven re-adds of a removed identity; it is a reason a later request cannot proceed, not a silent failure.
 
 ### Storage rules
 
@@ -288,7 +291,7 @@ A UI may show Pending -> Approved -> Monitoring -> Downloading -> Awaiting Jelly
 
 ## Delivery milestones and acceptance gates
 
-The revised dependency is **M1 alongside M0; then M2 -> M3 -> M4 -> M5 -> M6**. M0 gates provider-backed behavior and the full release, not a provider-independent runnable app. Every implementation checkpoint must leave something runnable and honestly labeled; none narrows the complete product scope.
+The revised dependency is **M1 alongside M0; then M2 -> M3 -> M4 -> M5 -> M6**, with **M7 (removal requests) after the release**. M0 gates provider-backed behavior and the full release, not a provider-independent runnable app. Every implementation checkpoint must leave something runnable and honestly labeled; none narrows the complete product scope.
 
 ### M0: real provider and delivery proofs, in parallel
 
@@ -373,9 +376,41 @@ Gate: all requested product surfaces work together with both acquisition/playbac
 
 Deploy beside the existing Seerr/Whisparr/Jellyfin stack using a separate volume/image/port. Changing the adult entry point is deliberate; neither the family Seerr database nor the old deployment is silently replaced. Product name/domain purchase is not a prerequisite for local testing.
 
+### M7 (post-release): removal requests
+
+Requested 2026-09-10, scheduled after the M6 release: let a user ask for an entry to be **removed**, which Seerr has no equivalent of. This is a separate intent kind, not an inverted acquisition, and it is the only destructive path in the product.
+
+The escalation ladder below is deliberate. A requester asks; an **approver chooses the level**, and nothing above the first level happens implicitly.
+
+| Level | External call | Effect | Reversible |
+| ----- | ------------- | ------ | ---------- |
+| Unmonitor | Whisparr `PUT /api/v3/movie/{id}` with `monitored: false` | Stops future grabs, keeps item and files | Yes |
+| Drop from Whisparr | `DELETE /api/v3/movie/{id}` (defaults `deleteFiles=false`) | Removes the tracked item, leaves files on disk | Re-addable |
+| Exclude | same call with `addImportExclusion=true` | Also blocks list-driven re-adds | Yes, by clearing the exclusion |
+| Delete files | same call with `deleteFiles=true` | Deletes the media files | **No** |
+| Delete the Jellyfin item | `DELETE /Items/{itemId}` | Removes the library entry and its file location | **No** |
+
+Source-inspected: Whisparr's `DeleteMovie(int id, bool deleteFiles = false, bool addImportExclusion = false)` ([movie controller][whisparr-delete]) — one endpoint covers both kinds because Eros stores scenes and movies in the same movie entity. Jellyfin's `DeleteItem` ([library controller][jellyfin-delete]) is `[Authorize]` for any authenticated identity, enforces `item.CanDelete(user)` from the per-user `EnableContentDeletion` / `EnableContentDeletionFromFolders` policy, and always passes `DeleteFileLocation = true`: there is no metadata-only delete.
+
+**The API-key hazard decides the design.** In that same handler an API-key identity resolves to a null user and skips the `CanDelete` check entirely, so Velvarr's integration administrator key could delete media the requesting user is forbidden to touch. Therefore Jellyfin deletion runs under the **requester's own user token** so Jellyfin enforces its own policy; the administrator key is never used to delete. A user without `EnableContentDeletion` gets an explicit denial, not an admin-key fallback.
+
+Design rules:
+
+- Removal is off unless an operator opts in (an explicit environment flag) **and** the approver holds a removal grant. Absent either, the action is visibly unavailable, not hidden.
+- Reuse the three-fact model: a per-user removal request decision, one shared removal execution per resolved identity and server, and the resulting availability change. A denied removal does not erase another user's acquisition request.
+- The requester supplies a reason and never chooses `deleteFiles`. Confirmation names the exact library, item identity, and file count/size that will disappear, and states that file deletion has no undo.
+- Persist the attempt before the call, exactly as acquisition does. A timeout leaves the execution **uncertain**: re-resolve by identity and compare the item's added timestamp before any retry, so a retry cannot delete a freshly re-added item. Whisparr or Jellyfin returning 404 means already gone, which is success, not failure.
+- An approved removal cancels pending acquisitions for the same identity. A later re-request is a new request, and an existing import exclusion must be surfaced as "an administrator excluded this" rather than a silent add failure.
+- After removal, availability returns to not available once Jellyfin rescans; never invent `Missing` or `Failed`. File deletion invalidates the playable mapping and the watch link immediately.
+- Keep an audit row per execution: requester, approver, chosen level, external identities, timestamps, and outcome. Catalog identity and audit history survive; only external media is removed.
+
+Acceptance gate, on authorized real fixtures only: request → approve at `Drop from Whisparr` → Whisparr item gone with the file intact; then a separately approved `Delete files` removal on a throwaway file → item gone, file gone, Jellyfin entry gone after rescan, watch link withdrawn; a user without Jellyfin deletion permission is refused with the administrator key unused; an excluded title explains itself on re-request; an injected timeout leaves the execution uncertain and reconciles without a second delete.
+
+Prerequisites: operator opt-in flag, a per-account removal grant, one Jellyfin test account with `EnableContentDeletion` for one test library, and an explicitly nominated throwaway item. Not started; no removal code exists.
+
 ## Explicit non-goals
 
-No internal video player/transcoder, direct indexer/download-client orchestration, local Stash media-manager requirement, invented TV/season mappings, wholesale provider mirroring, automated fuzzy identity merges, recommendation/ML system, or Seerr-wide feature-parity checklist. Jellyfin, Whisparr, and metadata providers continue doing their existing jobs.
+No internal video player/transcoder, direct indexer/download-client orchestration, local Stash media-manager requirement, invented TV/season mappings, wholesale provider mirroring, automated fuzzy identity merges, recommendation/ML system, or Seerr-wide feature-parity checklist. Jellyfin, Whisparr, and metadata providers continue doing their existing jobs. Removal (M7) stays a per-entry, approver-chosen action: no bulk library cleanup tool, no disk-space dashboard, no automatic retention or expiry policy, and no Whisparr blocklist management.
 
 ## Decisions and remaining prerequisites
 
@@ -398,6 +433,7 @@ Schema-level evidence supports starting this sequence. Coverage, crosswalk accur
 - StashDB implementation: https://github.com/stashapp/stash-box/tree/b4b8aef21372e3843240e3260c5123443239f2fb ; [scene filters][stash-scenes] and [query schema][stash-schema].
 - [TMDB API Terms of Use, section 1.C][tmdb-terms], page states updated October 20, 2023.
 - Jellyfin [user documentation][jellyfin-users]; source baseline https://github.com/jellyfin/jellyfin/tree/cf09de60e4e5844ad181d7ef9019151c54969d44 ; `Jellyfin.Api/Controllers/UserController.cs`, `ItemsController.cs`, `MediaInfoController.cs`, and `MediaBrowser.Model/Users/UserPolicy.cs`. This pins inspected source, not the user's installed release.
+- Whisparr and Jellyfin deletion contracts for M7: [movie delete][whisparr-delete] and [library item delete][jellyfin-delete], plus `EnableContentDeletion` / `EnableContentDeletionFromFolders` in `MediaBrowser.Model/Users/UserPolicy.cs` at the same pinned revisions.
 
 This plan distinguishes public source/specification evidence, historical connectivity checks, proposed design, and future installation-specific acceptance. It does not claim that a live authenticated provider discovery flow, end-user authorization suite, successful Whisparr import, or actual playback was exercised during this reassessment.
 
@@ -406,6 +442,8 @@ This plan distinguishes public source/specification evidence, historical connect
 [stash-scenes]: https://github.com/stashapp/stash-box/blob/b4b8aef21372e3843240e3260c5123443239f2fb/graphql/schema/types/scene.graphql
 [tmdb-terms]: https://www.themoviedb.org/api-terms-of-use
 [whisparr-search]: https://github.com/Whisparr/Whisparr/blob/cc3fb2abcf60f7c0048eb0294015d291b82bde08/src/Whisparr.Api.V3/Search/SearchController.cs
+[whisparr-delete]: https://github.com/Whisparr/Whisparr/blob/cc3fb2abcf60f7c0048eb0294015d291b82bde08/src/Whisparr.Api.V3/Movies/MovieController.cs
+[jellyfin-delete]: https://github.com/jellyfin/jellyfin/blob/cf09de60e4e5844ad181d7ef9019151c54969d44/Jellyfin.Api/Controllers/LibraryController.cs
 [whisparr-lookup]: https://github.com/Whisparr/Whisparr/blob/cc3fb2abcf60f7c0048eb0294015d291b82bde08/src/Whisparr.Api.V3/Movies/MovieLookupController.cs
 [whisparr-add]: https://github.com/Whisparr/Whisparr/blob/cc3fb2abcf60f7c0048eb0294015d291b82bde08/src/NzbDrone.Core/Movies/AddMovieService.cs
 [whisparr-skyhook]: https://github.com/Whisparr/Whisparr/blob/cc3fb2abcf60f7c0048eb0294015d291b82bde08/src/NzbDrone.Core/MetadataSource/SkyHook/SkyHookProxy.cs
