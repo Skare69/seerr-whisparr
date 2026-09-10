@@ -2,7 +2,7 @@
 
 Standalone adult-media discovery and request app for a homelab stack: browse movies, scenes, and performers; request them through **Whisparr** (Eros); check availability in **Jellyfin**. Metadata comes from TPDB and StashDB.
 
-**Status: planning.** Implementation has not started — the first milestone (M0, provider contract proofs) is blocked on TPDB/StashDB API credentials. See [docs/plans/2026-09-09-whisparr-discovery.md](docs/plans/2026-09-09-whisparr-discovery.md).
+**Status: standalone development in progress on `feat/velvarr-implementation`.** Internal planning documents are maintained locally and are not published in the current repository tree.
 
 ## Repository layout
 
