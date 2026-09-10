@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/velvarr-implementation]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish branch-tagged image to GHCR (opt-in only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: Frozen install, check, tests, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run test
+      - run: bun run build
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+
+  container:
+    name: Container smoke (build, readiness, restart)
+    runs-on: ubuntu-latest
+    needs: gates
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate compose file
+        run: docker compose config -q
+      - name: Build image
+        run: docker build -t velvarr:ci .
+      - name: Run container with throwaway runtime secrets
+        run: |
+          docker run -d --name velvarr-smoke \
+            -p 127.0.0.1:5577:5577 \
+            -e "VELVARR_SECRET_KEY=$(openssl rand -hex 32)" \
+            -e "VELVARR_SETUP_SECRET=$(openssl rand -hex 32)" \
+            -v velvarr-smoke-data:/data \
+            velvarr:ci
+      - name: Readiness check
+        run: |
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5577/api/health | grep -q '"ok":true'; then ready=1; break; fi
+            sleep 2
+          done
+          if [ "$ready" != 1 ]; then
+            docker logs --tail 100 velvarr-smoke
+            exit 1
+          fi
+      - name: Assert non-root runtime
+        run: docker exec velvarr-smoke node -e "if (process.getuid() === 0) { console.error('container must not run as root'); process.exit(1) }"
+      - name: Restart and re-check readiness on persistent data
+        run: |
+          docker restart velvarr-smoke
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5577/api/health | grep -q '"ok":true'; then ready=1; break; fi
+            sleep 2
+          done
+          if [ "$ready" != 1 ]; then
+            docker logs --tail 100 velvarr-smoke
+            exit 1
+          fi
+          docker rm -f velvarr-smoke
+          docker volume rm velvarr-smoke-data
+
+  publish:
+    name: Opt-in branch-tagged GHCR publication
+    runs-on: ubuntu-latest
+    needs: [gates, container]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: type=ref,event=branch
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

@@ -1,0 +1,13 @@
+# Credentials and runtime data, including leftovers from the Seerr checkout.
+.env*
+/config/
+/data/
+/cache/
+
+# Generated files.
+/node_modules/
+/.next/
+/dist/
+next-env.d.ts
+*.tsbuildinfo
+report.xml

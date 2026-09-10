@@ -1,9 +1,17 @@
-# Implementation plan: standalone discovery and requests for Whisparr
+# Velvarr: standalone discovery and request implementation plan
 
-Planned: 2026-09-09. Implementation approved: 2026-09-10, on a new branch. Status: `next` created; M0 awaiting provider credentials.
+Planned: 2026-09-09. Product scope approved: 2026-09-10. Reassessed: 2026-09-10. The revised delivery sequence below was this review's recommendation; M1 has since been implemented and locally verified, with live-server and container proofs still open (see the M1 status section below).
 
-Working title: **Whisparr Discovery**. Final product/repository name remains open.
-Reuse `Skare69/seerr-whisparr` and its history. Implementation is isolated on `next`; the existing integration is preserved on `legacy/seerr-whisparr` and `main`. Final naming/cutover follows the release gates. No deployment, repository rename, or application rewrite has occurred.
+Product/repository: **Velvarr**, `Skare69/velvarr`. `main` is a fresh standalone root; `legacy/seerr-whisparr` retains a squashed Seerr integration snapshot; `next` was deleted. Update (2026-09-10): the standalone Velvarr application now exists — package manifest, Dockerfile, and Compose file included — and milestone M1 is implemented and verified locally (see [M1](#m1-first-useful-locally-runnable-checkpoint) below); only a published application image remains future work.
+
+## Reassessment: what changes and what does not
+
+- **Keep the product scope. Change the dependency order.** Missing metadata keys block provider proofs and provider-backed features, not a useful server with protected setup, Jellyfin login, real accessible library items, and read-only Whisparr status.
+- **Prove one movie and one scene through the whole system before building a broad catalog UI.** Successful metadata search is not successful acquisition or playback.
+- **Do not inherit a vanished foundation.** Familiar TypeScript/Next.js tooling is a deliberate choice, not an already-installed application. A Seerr adaptation is possible; avoiding its TMDB/movie/TV coupling is a maintenance decision, not a claim of technical impossibility.
+- **Separate user intent, shared acquisition, and user-specific playback.** Logout, cancellation, a download finishing, and losing library access are different transitions.
+- **Fix credential handling before asking for keys.** The reset removed `.gitignore` while local Seerr config/database files remained. This review restores exclusions for `.env*`, `config/`, `data/`, and `cache/`; container-context exclusions are required before the first Docker build. Ignoring a file does not load it or encrypt it.
+- **No more repository resets to make sidebar statistics look clean.** Keep the current root and reference snapshot; concentrate on runnable behavior.
 
 ## Recommendation
 
@@ -121,15 +129,15 @@ Seerr-level polish is an acceptance criterion, not a later cosmetic phase.
 
 Target combination to validate: **TPDB for movie discovery, movie/scene membership, and performer filmographies; StashDB for Whisparr-aligned scenes, performers, studios, and tags.** Use TPDB scene records for relationships/additional coverage, but require a verified Whisparr-compatible identity before requesting them. Whisparr remains the authority for whether a discovered record can actually be submitted.
 
-Do not select a provider merely because it has a search endpoint. Before committing provider defaults, prove movie/scene discovery, performer traversal, pagination/filtering, credentials/usage terms, and the exact Whisparr import identity. Provider-specific findings and limitations are recorded below.
+Public schemas are sufficient to start the provider-independent application and a provider-scoped identity model. Before enabling provider-backed discovery or submissions, prove account access/terms, representative catalog coverage, performer traversal, pagination/filtering, and exact Whisparr import identity. These are feature/release gates, not a reason to block setup, authentication, or direct Jellyfin library reads.
 
 ### Verified provider capabilities and limits
 
-| Provider | Source-inspected capability | Product decision / outstanding proof |
-|---|---|---|
-| **TPDB** | `/movies`, `/scenes`, performer-to-movies/scenes endpoints; paged search, tags, studios, release dates, duration input; a movie's `scenes[]` and a scene's `movies[]` | Primary movie source and movie/scene relationships. Bearer token required. Account-tier access, coverage, rate limits, exact filter serialization, and Whisparr import compatibility need credentialed checks. |
-| **StashDB** | `queryScenes` with performer/studio/tag criteria and paging; performer-scoped scene queries; published date/duration/popularity/trending sort keys | Primary scene graph. READ-capable API key required for direct discovery. Hosted account policy, limits, and meaningful ranking data must be checked. |
-| **TMDB** | Technically provides movies, credits, genres, and adult-inclusive queries | No default integration. [API terms, section 1.C][tmdb-terms] restrict applications involving pornographic content. Treat written provider permission covering this application as a prerequisite, including any proposed "mainstream-only enrichment" within it. |
+| Provider    | Source-inspected capability                                                                                                                                           | Product decision / outstanding proof                                                                                                                                                                                                                             |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **TPDB**    | `/movies`, `/scenes`, performer-to-movies/scenes endpoints; paged search, tags, studios, release dates, duration input; a movie's `scenes[]` and a scene's `movies[]` | Primary movie source and movie/scene relationships. Bearer token required. Account-tier access, coverage, rate limits, exact filter serialization, and Whisparr import compatibility need credentialed checks.                                                   |
+| **StashDB** | `queryScenes` with performer/studio/tag criteria and paging; performer-scoped scene queries; published date/duration/popularity/trending sort keys                    | Primary scene graph. READ-capable API key required for direct discovery. Hosted account policy, limits, and meaningful ranking data must be checked.                                                                                                             |
+| **TMDB**    | Technically provides movies, credits, genres, and adult-inclusive queries                                                                                             | No default integration. [API terms, section 1.C][tmdb-terms] restrict applications involving pornographic content. Treat written provider permission covering this application as a prerequisite, including any proposed "mainstream-only enrichment" within it. |
 
 Evidence: [TPDB OpenAPI v3.24.747][tpdb-spec] and [StashDB's stash-box schema][stash-schema], inspected during planning. An API declaration proves an operation exists, not that the intended account can use it or that its catalog has the desired coverage.
 
@@ -144,10 +152,12 @@ Source baseline: Whisparr **Eros**, commit `cc3fb2ab`; confirm the deployed buil
 
 - External text/ID lookups exist for scenes, movies, performers, and studios. However, there is no equivalent of a paged, globally filterable Seerr discovery catalog. `/movie/listByPerformerForeignId` lists already-known local items, not a performer's worldwide filmography.
 - Direct provider APIs therefore supply browsing and filters. Whisparr's `/tag` contains local management tags, not the metadata tag taxonomy. Its internal hosted metadata endpoints are not a supported public discovery contract for this app.
-- Resolve a TPDB feature with `GET /api/v3/movie/lookup/tpdb?tpdbId=...`; resolve a StashDB scene through `GET /api/v3/lookup/scene?term=stash:<uuid>`. Preserve the returned resource's identity and verify the expected item kind before `POST /api/v3/movie`, which accepts both movies and scenes.
-- Whisparr's mapper emits a numeric-string `foreignId` for TMDB movies, `tpdbId:<id>` for TPDB movies, and a StashDB UUID for scenes. These are external delivery identifiers, not application primary keys. Preserve `tpdbId` and other relevant resource fields too; never guess a prefix from a title or submit just a TMDB ID.
-- Text movie search follows Whisparr's configured movie metadata source. Dedicated ID lookup and add-time metadata resolution have their own paths; a successful lookup alone does not establish a valid add or prove that changing the global source fixes it. Test the exact resource against the intended TPDB configuration without silently changing the existing server.
+- Resolve a TPDB feature with `GET /api/v3/movie/lookup/tpdb?tpdbId=...`; resolve a StashDB scene through `GET /api/v3/lookup/scene?term=stash:<uuid>`. Verify source identity and item kind, then construct a server-owned, validated `POST /api/v3/movie` payload. Do not blindly spread the lookup response or trust a browser-supplied resource.
+- **Add-time identity precedence is a real risk.** In the pinned `AddMovieService.GetMetadata`, a numeric `foreignId` or positive `tmdbId` takes precedence over `tpdbId`. For a TPDB movie, retain the verified nonnumeric foreign ID and explicit `tpdbId`, but omit/zero `tmdbId`. For a StashDB scene, retain the verified StashDB UUID and omit movie-routing `tmdbId`/`tpdbId`. Keep cross-IDs separately as catalog references; include the required validated profile/root/monitoring fields for delivery.
+- The mapper emits `tpdbId:<id>` while one fallback tests lowercase `tpdbid:`. Do not rely on that prefix-only fallback or fix it by guessing another identity: carry the explicit `tpdbId` field and assert the stored source, foreign ID, and kind after a controlled add.
+- Text movie search follows Whisparr's configured metadata source; the inspected dedicated ID paths/add-time cascade are separate. Test the actual deployed build and returned/stored identities. Do not silently change the existing server's global source, and do not claim that a successful lookup proves a successful add.
 - Reading a performer page must not add/monitor that performer or run refresh commands that can bulk-add their catalog. Requesting a selected item is the only acquisition action in this browsing flow.
+- Whisparr can expose StashDB/TPDB performer cross-IDs, but its cast/studio mapping may lack an entity when the StashDB link is absent. TPDB-only performers/studios remain legitimate catalog entities. Hosted performer/studio works endpoints are possible ID-link evidence, not a supported paged discovery replacement; do not make the app depend on those undocumented endpoints.
 
 Evidence: [lookup controllers][whisparr-search], [movie ID lookup][whisparr-lookup], [add-time metadata resolution][whisparr-add], [foreign-ID mapping][whisparr-skyhook], and [performer external-ID fields][whisparr-performer]. Returned cross-IDs can bridge the graph, but their population and accuracy remain M0 fixtures, not an assumed universal crosswalk.
 
@@ -158,170 +168,223 @@ Evidence: [lookup controllers][whisparr-search], [movie ID lookup][whisparr-look
 - **Performer:** a credited person, with names and provider-scoped identities.
 - **Studio:** a production label/site, with a parent relationship only where supplied.
 - **Tag:** a provider's descriptive topic. A TMDB genre and a StashDB tag are not automatically the same taxonomy.
-- **Request:** a user's intent to acquire a movie or scene.
-- **Whisparr item:** the exact external item submitted/monitored by a particular server.
-- **Playable item:** a matched Jellyfin item that the current user is allowed to access.
+- **Request:** one user's intent to acquire a movie or scene, with its own approval/decline/cancellation decision.
+- **Acquisition:** shared durable work for one resolved item on the configured Whisparr server; several requests may attach to it.
+- **Whisparr item:** the external monitored/imported item, which may predate every Velvarr request.
+- **Playable item:** an exactly matched Jellyfin item that the current user is allowed to access and play; not a global property of a download.
 
 ### Storage rules
 
 Use an application-owned ID for each catalog entity. A shared `MediaItem` with kind `movie` or `scene` serves one request flow; keep separate Performer, Studio, credits, tags, and verified scene-in-movie relationships. The old proposal for parallel SceneRequest tables was containment within Seerr, not the best design for a new app.
 
 - Preserve external references as **provider + entity kind + external ID**, not one universal ID string. Enforce uniqueness in the database.
-- TMDB IDs, TPDB IDs, StashDB UUIDs, Whisparr foreign IDs, and Jellyfin item IDs remain distinct values.
-- Keep provider provenance and explicit/manual identity links. Do not run fuzzy-title matching as an automatic merge or download decision.
-- Preserve the supported Whisparr lookup resource/identity through submission, including `foreignId` and media kind. Do not build another mostly-Radarr payload and hope.
-- Keep Whisparr mappings and Jellyfin mappings separate from catalog identity.
-- Mark an otherwise discoverable item as not currently requestable if no supported Whisparr resolution exists. A provider outage is an unavailable check, not proof that a title does not exist.
-- Cache details/relationships as they are used; do not require downloading entire catalogs before the application can work.
+- TMDB IDs, TPDB IDs, StashDB UUIDs, Whisparr foreign IDs, and Jellyfin item IDs remain distinct values. Scope local-server references by server identity, not only the current hostname.
+- Keep provider provenance and explicit/manual identity links. Never merge people or acquire media from fuzzy names/titles. Support linked, StashDB-only, and TPDB-only performers without manufacturing a complete filmography.
+- Preserve the chosen delivery identity, not every competing routing field from a lookup result. Use the source-specific payload rule above and verify the stored Whisparr item; never build another mostly-Radarr payload and hope.
+- Keep Whisparr mappings and Jellyfin mappings separate from catalog identity. Requests point to stable catalog records and attach to shared acquisitions; they do not each own a separate download.
+- Distinguish an unsupported/unresolvable identity from an unavailable check. A verified deletion/not-found result blocks that reference; a timeout/5xx leaves the outcome unknown and retains the last successful observation. Neither deletes catalog history, user requests, or a separately valid playable mapping. Another reference may still resolve the same entity.
+- Cache details/relationships lazily, with bounded size/age and provider permission. Evict cached payloads, not identity rows or reviewed links still referenced by requests/mappings. No full catalog mirror or eager Whisparr lookup for every discovery card.
 
 ## Filters and search semantics
 
 Desired controls, exposed only where the selected provider supports them:
 
-| Control | Expected surface | Rule |
-|---|---|---|
-| Performer(s) | Movies and scenes | Use provider IDs/credits; never rely on display-name equality |
-| Studio/site | Movies and scenes | Parent-studio inclusion must be explicit |
-| Genre | Movies | Preserve the source taxonomy |
-| Include/exclude tags | Primarily scenes; movies if supported | Define ANY/ALL/exclude semantics instead of translating loosely |
-| Release date/year | Both | Distinguish release date from provider-record creation time |
-| Duration | Both where supplied | Missing values remain unknown |
-| Available / requested / missing | Both | Application/Jellyfin state, not provider metadata |
-| Sort | Both | Only real provider sort keys or complete local result sets |
+| Control                         | Expected surface                      | Rule                                                            |
+| ------------------------------- | ------------------------------------- | --------------------------------------------------------------- |
+| Performer(s)                    | Movies and scenes                     | Use provider IDs/credits; never rely on display-name equality   |
+| Studio/site                     | Movies and scenes                     | Parent-studio inclusion must be explicit                        |
+| Genre                           | Movies                                | Preserve the source taxonomy                                    |
+| Include/exclude tags            | Primarily scenes; movies if supported | Define ANY/ALL/exclude semantics instead of translating loosely |
+| Release date/year               | Both                                  | Distinguish release date from provider-record creation time     |
+| Duration                        | Both where supplied                   | Missing values remain unknown                                   |
+| Available / requested / missing | Both                                  | Application/Jellyfin state, not provider metadata               |
+| Sort                            | Both                                  | Only real provider sort keys or complete local result sets      |
 
 Concrete limits from the inspected schemas:
 
 - StashDB supports tag ANY/ALL/exclusion criteria, but has no scene duration-range criterion; it can sort by duration.
-- TPDB exposes tag ANY/ALL inclusion, not a documented exclusion parameter on `/movies` or `/scenes`. It exposes a duration input; a duration-operation parameter exists in shared components but is not referenced by the inspected `/movies` operation. Do not promise a min/max slider until actual semantics are proven.
+- TPDB's inspected `/movies` and `/scenes` operations share tags/performers/site/date/paging filters, including ANY/ALL inclusion switches. Neither references a tag-exclusion parameter. Both reference a duration input but not the shared duration-operation component. Account behavior and serialization still need real checks; do not promise exclusion or a min/max slider from an unused schema component.
 - Neither shared genres nor one cross-provider popularity score exists. Use provider-native tags/categories where genres are absent. Unsupported controls remain visibly unavailable; do not invent mappings.
 
 A multi-provider search must not promise globally ranked, globally filtered results if it only fetched a page from each source. Start with provider-backed shelves and explicit source sections/tabs, combining only verified duplicates. Available/requested views can query the complete locally tracked collection. Applying local-state filters to remote discovery requires bounded page scanning with an explicit continuation and scope; an empty scanned page is not proof of an empty catalog. Unsupported filters are unavailable with an explanation, never silently ignored.
 
 Tags/genres can drive browse pages and related-content rails. Personal recommendations and follow-a-performer automation are later additions, not prerequisites for actor-driven discovery.
 
-## Jellyfin: users, access, availability, playback
+## Jellyfin: bootstrap, users, access, availability, playback
 
-### Import and login
+### Setup and admission
 
-- Setup connects a configured Jellyfin server and imports user identities by stable Jellyfin user ID, not username/email.
-- Importing a user does **not** grant access to this app. Administrator selects allowed accounts and grants requester/moderator/admin rights explicitly. Do not automatically admit every household account or mirror Jellyfin administrators into app administrators.
-- Authenticate against Jellyfin; never persist a user's password. Use server-side sessions and keep integration secrets/tokens out of browser storage and logs.
-- Check application grants on every protected request so app revocation takes effect immediately. Revalidate the Jellyfin identity/token during session validation and before privileged actions; removed/disabled accounts lose access, and an unavailable authorization check cannot authorize a new request.
-- Restrict privileged library enumeration to configured libraries. Before exposing an item's availability or watch link, check access through the current user's Jellyfin context, including item-level parental/tag restrictions and playback policy, not only folder membership. Never turn an administrator's visibility into a user's visibility.
-- Authenticate catalog/image routes, sanitize provider descriptions, validate upstream responses and image URLs, and scope caches by authorization where results differ by user. Provider/API keys stay server-side; arbitrary user-supplied URLs must not become an open image proxy.
+- An operator-supplied one-time setup secret authorizes initial configuration and explicit selection of a Jellyfin-authenticated owner. Atomically create that owner and close bootstrap permanently across restarts. Never grant the first visitor/login ownership or reopen setup merely because an administrator loses access. Recovery is an explicit operator action.
+- Key imported identities by configured Jellyfin server plus stable user ID, not username/email. Import grants nothing; the owner selects allowed accounts/libraries and requester/moderator/admin rights. Importing another Jellyfin administrator does not admit them automatically.
+- Velvarr admission authorizes adult catalog discovery. Jellyfin restrictions independently govern library/playback visibility; admitting an account is not an age-rating filter for the external provider catalog. No automatic family-wide access.
+- Authenticate with `POST /Users/AuthenticateByName`; never retain passwords. Bind the returned **user token**, not the integration administrator key, to an opaque server-side session. Protect stored tokens and private configuration with restricted storage and a deployment secret; back up that secret with the recovery procedure, not in public artifacts.
+
+### Authorization and transport
+
+- Check current Velvarr grants on every protected request. Validate the actual Jellyfin user token/identity during session validation and before user-triggered privileged actions/watch checks. Proven revocation/disabled/deleted identity invalidates access; a timeout blocks authorization-dependent operations without deleting grants, requests, or mappings. Never fall back to administrator visibility or report an outage as an empty library.
+- Logout invalidates the local session immediately, but does not cancel durable approved work. The delivery worker uses integration credentials and persisted approval, not a user's browser session. Before an unsent dispatch, recheck requester admission/account eligibility; revoked access blocks that user's pending intent without undoing another eligible request or deleting external media.
+- Use HttpOnly/SameSite session cookies, Secure cookies for HTTPS, origin/CSRF protection for mutations, bounded login attempts, and freshly authorized administration for integration changes. Keep tokens/passwords out of URLs, browser storage, public `NEXT_PUBLIC_*` variables, responses, and logs.
+- First local checkpoint binds to loopback by default. Production remote login requires HTTPS; any trusted private HTTP upstream exception must be explicit, not described as encrypted end-to-end. Do not disable certificate validation globally for a self-signed homelab certificate.
+- Server-side Jellyfin calls originate from Velvarr's network, not the browser's. Therefore a user token alone does not preserve Jellyfin's remote-access restriction. Before remote exposure, define trusted proxy/client-network handling and conservatively enforce `EnableRemoteAccess`; never trust arbitrary forwarded headers. A remotely denied user must not gain access through Velvarr's LAN address. See the pinned [Jellyfin authorization handler][jellyfin-authorization].
+
+### Protected data and artwork
+
+- Restrict administrator library inventory to configured libraries. Before delivering library metadata, availability, artwork, or a watch link, use the current user's Jellyfin context and item-level parental/tag/playback policy. Folder membership and an administrator's successful GET are insufficient.
+- Admission and applicable item authorization run **before cache-hit delivery**, not just before downloading bytes from the provider. Keep protected pages/API/image responses private/no-store and out of public static/CDN caches. A warmed image URL must still reject anonymous, ungranted, library-denied, and revoked users.
+- Serve artwork through authenticated same-origin routes keyed by known records. Validate upstream data, descriptions, image type/size, and permitted image origins/redirects; never accept an arbitrary proxy URL from a user. Use provider-sized artwork and native lazy loading first. The default Next.js image optimizer does not forward authentication headers: use an unoptimized image path rather than weakening auth to make it work ([Next.js image documentation][next-image]).
+- Shared provider bytes may be cached server-side where terms allow; user-filtered library results remain scoped. Logout/revocation prevents subsequent delivery, not erasure of images already downloaded by a browser.
 
 ### Availability and watching
 
-- Whisparr downloaded/imported state does not imply that Jellyfin has scanned the file or that the requesting user can play it.
-- Match by exact external identifiers when plugins supply them. Otherwise correlate Whisparr's exact file path with Jellyfin items through explicit, configurable container path mappings. Title-only matches go to administrator review, never automatic Available.
-- Provider-ID/plugin coverage and path mapping on the actual installation are release gates, especially for scenes.
-- Show Open in Jellyfin only for a matched accessible item with playback permitted; exclude virtual/placeholders. Use Jellyfin's web detail link, such as `/web/index.html#!/details?id=<itemId>&serverId=<serverId>`, with no credentials embedded. Jellyfin owns login, playback, transcoding, clients, and watched state.
-- Handle imported-but-not-yet-scanned items, missing files, rescans, and multiple files/editions without inventing success.
+- Whisparr monitoring/import does not mean Jellyfin has scanned the file or that a particular user may play it. Store last successful external observation separately from current check health; an outage changes neither item identity nor established facts to Missing/Failed/Available.
+- Prefer exact provider-ID matches when actual plugin data supplies them. Otherwise correlate exact Whisparr/Jellyfin file paths using explicit container-path mappings. Match path components, not loose substring replacements; ambiguous/title-only matches require administrator review.
+- Match existing local-library items directly for the first checkpoint without calling them TPDB movies or StashDB scenes. Provider-aware movie/scene matching is a later proven relationship, not something to infer from Jellyfin's generic Movie item type.
+- Configure separate trusted internal Jellyfin API and browser-reachable web base URLs, preserving reverse-proxy prefixes and server identity. Never forward integration credentials across an unexpected origin/redirect.
+- Show Open in Jellyfin only for an exactly matched, accessible, non-placeholder item with playback permitted. Build a credential-free link such as `/web/index.html#!/details?id=<itemId>&serverId=<serverId>` against the external web base. This is **not SSO**: the browser has its own Jellyfin session. Jellyfin owns playback, transcoding, clients, and watched state.
+- Handle delayed scans, missing files, rescans, multiple files/editions, and item-level playback denial explicitly. Poll existing state; do not repeatedly launch library scans. Owning one scene does not satisfy its movie, nor does a movie imply independently playable scene files.
 
-Source-inspected starting points are `GET /Users` for administrator-driven import, `POST /Users/AuthenticateByName` for login, and library item enumeration with `ProviderIds`, `Path`, and media-source fields. Current source does not provide a universal provider-ID equality query that solves scene matching for us. Validate these against the installed Jellyfin version; retain exact mappings and recheck them after rescans. See [Jellyfin user policy documentation][jellyfin-users] and the pinned controller references below.
+Source-inspected starting points are administrator `GET /Users`, user `POST /Users/AuthenticateByName`, user-token validation, and item enumeration with `ProviderIds`, `Path`, and media-source fields. None is universal proof of scene matching or playback on the installed server. See [Jellyfin user policy documentation][jellyfin-users] and pinned controller references.
 
 ## Request lifecycle and reliability
 
-Track **request decision**, **Whisparr acquisition**, and **Jellyfin availability** separately. A useful display progression is:
+Keep three independent facts:
 
-Requested -> Awaiting approval -> Approved -> Submitted/monitoring -> Downloading -> Downloaded, awaiting Jellyfin -> Available in Jellyfin.
+| Fact             | Owner and examples                                                                                   |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
+| Request decision | One user's pending / approved / declined / cancelled intent                                          |
+| Acquisition      | Shared resolved item: unsent / submitting / uncertain / monitoring / downloading / imported / failed |
+| Playback access  | Exact Jellyfin mapping and the current user's allowed / denied / unavailable check                   |
 
-Declined/cancelled requests and acquisition failures are explicit outcomes. A title being monitored with no release found is not a failed download.
+A UI may show Pending -> Approved -> Monitoring -> Downloading -> Awaiting Jellyfin -> Open in Jellyfin, but this is a presentation derived from those facts, not one irreversible database status. Monitoring with no release is not a failure; one user's denial does not erase another user's valid request.
 
-Submission rechecks authorization, identity, Whisparr configuration, and existing monitored/library items. Database uniqueness and transactional claims prevent concurrent approvals creating duplicate work. If a submission times out after Whisparr might have accepted it, reconcile by its exact identity before retrying. Do not interpret every HTTP 400 as an already-existing item.
-
-Cancelling a request removes that user's acquisition intent; it must not delete a shared Whisparr/Jellyfin item or another requester's files. Any destructive library operation remains in Whisparr/Jellyfin, outside this app's request cancellation.
-
-Synchronize state with bounded background polling using Whisparr's APIs and Jellyfin scans. Start with one application process and persistent database state; no Redis/message broker is needed merely to implement this workflow. Existing external items can be adopted instead of re-requested. New app requests attach to existing acquisitions without claiming ownership of another user's private request history.
-
-Notifications are private by default; request titles/artwork must not accidentally go to a family-wide webhook. A single optional configured notifier can follow the working request loop; a notification-provider matrix is not core scope.
+- Validate the browser's media reference server-side. Approval rechecks authorization, chosen source/kind, configuration, and existing external items. Adopt existing items rather than acquire a duplicate; shared acquisition status must not reveal another requester's private history.
+- Database uniqueness constrains active per-user intent and shared acquisition by server plus resolved identity/kind. Claim durable work transactionally; perform network I/O outside the transaction.
+- Persist an attempt **before** the Whisparr POST. SQLite and remote HTTP are not one atomic transaction. On timeout/crash, keep an uncertain result and reconcile by exact identity before another POST. Recover unfinished claims on startup; if absence cannot be established, keep it blocked/uncertain rather than promising exactly-once delivery. A generic HTTP 400 is not an already-existing item.
+- Cancellation removes only that user's intent. The last withdrawal may suppress work not dispatched yet; accepted or uncertain external submission may continue. Never delete shared Whisparr/Jellyfin items or files as a cancellation side effect.
+- Use bounded, restartable background reconciliation with persisted attempts, next checks, and last observations. No Redis/message broker or public webhook receiver is required. Provider/Whisparr/Jellyfin outages remain distinct, actionable conditions.
+- A single optional **private Discord webhook** can follow the working loop. Default to no titles/artwork in notifications until explicitly enabled on the intended private destination. No notification-provider matrix, and notification failure must not roll back a valid request/acquisition.
 
 ## Implementation approach
 
-Use the familiar, already-present TypeScript/React/Next.js, Tailwind, and accessible Headless UI foundation. SQLite plus the existing TypeORM toolchain is adequate for this deployment. Review and retain useful generic UI/Jellyfin plumbing under MIT; create a fresh domain model and focused routes. Do not switch to Prisma/Redis/Rust merely because Omnibus uses them.
+**One self-hosted application, not a microservice rewrite.**
 
-Keep a small number of deep modules: catalog/provider reads and identities; requests/Whisparr delivery; Jellyfin access/availability; user-facing UI. Catalog reads return normalized entities, source/page scope, supported filters, and explicit partial errors. Requests consume resolved media IDs, not provider payloads supplied by the browser. Jellyfin returns per-user access and exact item mappings, not an unqualified global Available flag. The two genuinely different metadata sources justify concrete adapters and a small normalized interface, not a configurable universal plugin platform.
+- Retain the familiar TypeScript/React/Next.js and Tailwind direction; use accessible Headless UI primitives when needed. Create a small new application and dependency manifest, not a copied Seerr tree. Reuse only reviewed generic MIT code with notices. No Express/custom-server layer just because Seerr used one.
+- Use SQLite with prepared statements, database constraints, and versioned transactional SQL migrations; never production auto-synchronization. Proposed minimum dependency is Node 24 LTS's bundled `node:sqlite`, with exact runtime pinned and exercised in the first Windows/Linux/container checkpoint. Its current Node 24 documentation labels it **release candidate**, not fully stable. Resolve a real runtime/support failure in M1 rather than adding TypeORM/Prisma by inheritance ([Node SQLite documentation][node-sqlite]).
+- `ponytail:` one long-lived Node process and one writable local SQLite volume; short synchronous queries suit the homelab scope. Multiple replicas or sustained blocking database work require a different concurrency/deployment decision, not an unsupported flag.
+- Keep private modules for catalog/provider reads and identities; request decisions/Whisparr delivery; Jellyfin access/matching; and account/session policy. UI calls those modules server-side. Two concrete provider implementations justify a small common result shape (items, source, continuation, supported filters, explicit errors), not a universal provider plugin framework.
+- Initialize storage and the reconciliation loop from a verified Node server-start hook, never from an API request or page render. Next.js documents `instrumentation.register` per server instance with Node-runtime gating; prove behavior in the actual dev and production builds, prevent overlapping loops, and recover persisted work after restart ([startup hook][next-startup]). Timers are scheduling, not durable job state; no serverless/Edge deployment claim.
+- Start with one Whisparr Eros and one Jellyfin instance, a **fresh Velvarr data directory**, and no Seerr database migration. Keep server identities on mappings. Integration URLs, root-folder/profile choices, path mappings, network trust, and timeouts are real deployment inputs.
+- Introduce Dockerfile, Compose, lockfile, and `.dockerignore` together in the first runnable checkpoint. Runtime credentials must not be build arguments, copied assets, or image layers. Bind the local port to loopback initially; validate persistent storage across restart.
+- Back up a consistent SQLite snapshot using the backup API or `VACUUM INTO`/a stopped application, plus required protected settings/key material. Copying only a live WAL-mode main database file is not a recovery plan. Restore to a fresh volume and reconcile external work before retrying it ([SQLite backup documentation][sqlite-backup]).
 
-Initial deployment: one Whisparr Eros instance and one Jellyfin instance, one application container, one separate persistent data volume. Keep actual server IDs on delivery/library mappings. Broader multi-server routing is outside the current brief, not an excuse to hardcode library paths, credentials, or timeouts.
+## Repository and deployment state
 
-## Repository reuse and rename
-
-1. Preserve current working integration at a legacy branch/tag. Observed planning base: `e9583980`. Keep its commit history and deployment image/digest recoverable.
-2. Develop the independent app on a `next` branch in this same repository. Fresh application schema and fresh data directory; no mutation of the current Seerr database or shared config volume.
-3. Choose the final product name, then rename the GitHub repository with `gh repo rename` and update `origin`. GitHub redirects repository/git URLs, but workflows, badges, package metadata, image publishing, and deployment references still need an explicit audit. Replace inherited upstream release automation before publishing standalone images.
-4. Keep `upstream` pointing at `seerr-team/seerr` as a reference, as previously requested. It is no longer a routine merge source for a separate product. Cherry-pick only reviewed, relevant fixes.
-5. Publish the independent app under its own image identity. Do not silently replace the image deployed as the family's current Seerr or reuse its database volume. Preserve a rollback image/config backup before cutover.
-6. Promote the standalone branch to the default only after release gates pass. Preserve the legacy branch/tag rather than maintaining both applications in the new runtime.
-
-Use a discreet, factual repository description. No public rename or rebranding is performed until the proposed direction/name is discussed.
+- Rename is complete: `Skare69/velvarr`; `origin` points there. `main` is the standalone root. The former `next` branch no longer exists.
+- `legacy/seerr-whisparr` preserves the Seerr integration **tree with squashed history**, not the original complete commit chain. Do not describe it as a verified deployment rollback or assert an old image is still available.
+- Keep `upstream` pointing to `seerr-team/seerr` for reference, not routine merging. New implementation work uses ordinary feature branches from `main`; no more orphan resets or force-pushes are part of this plan.
+- GitHub documents default-branch contribution-graph semantics and delayed statistics after rewrites. The earlier claim that all such statistics necessarily span branches was wrong; UI counters do not justify rewriting history ([GitHub contributor documentation][github-contributors]).
+- Preserve local legacy configuration/database files without reading, importing, deleting, or committing their secrets. `.gitignore` was restored and checked in this review; protect the future Docker context before any image build.
+- Use a separate Velvarr image/data volume. The first public application image is a future milestone, not something this repository currently provides. Before a deployment cutover, record and verify the old deployment image/config recovery path; never silently replace the family's Seerr container.
 
 ## Delivery milestones and acceptance gates
 
-### M0: prove the provider and playback contracts
+The revised dependency is **M1 alongside M0; then M2 -> M3 -> M4 -> M5 -> M6**. M0 gates provider-backed behavior and the full release, not a provider-independent runnable app. Every implementation checkpoint must leave something runnable and honestly labeled; none narrows the complete product scope.
 
-Use the actual target Whisparr build and administrator-provided provider/Jellyfin credentials. Prove a TPDB feature without requiring TMDB, a StashDB scene, and a performer linked across both providers with movie/scene traversal. Exercise usable paging/filters, TPDB movie/scene membership, and a Jellyfin-matched playable item. Include missing cross-IDs, duplicate names/aliases, absent artwork, provider outage, and conflicting records.
+### M0: real provider and delivery proofs, in parallel
 
-Confirm TPDB account-tier access/terms and StashDB hosted access/limits. Test the real TPDB feature and StashDB scene import resources; a generic connection test is insufficient. TMDB adds no prerequisite to this release: investigate it only if permission for this application is obtained. If TPDB movie coverage or import compatibility fails, return with that evidence and alternatives rather than silently shipping a scene-only product.
+Use the actual target build and authorized credentials to check account terms/tier, caching/household-use permission, coverage, rate limits, movie/scene relationships, cross-provider identities, pagination, and filters. Begin read-only. Do not rely on inaccessible internal hosted endpoints as an API contract or use TMDB through a proxy to bypass its application restrictions.
 
-Gate: record which providers/relationships are supported, which require explicit links, and which identities can be imported. A failed mapping changes the design here, not after the whole UI has shipped. Mutating import checks use explicitly selected test items/config with search disabled where possible; discovery traffic alone must not start downloads.
+Before controlled additions, agree on exact test items and a safe target/configuration. Disabling immediate search alone is not proof that monitoring/RSS cannot acquire something. No production setting changes, monitoring, adds, downloads, or library mutations are authorized by this plan review.
 
-#### M0 execution record
+| Required real case                                        | Observable result                                                                          |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| TPDB-only feature                                         | Correct Movie lookup and supported TPDB add/stored identity; no invented TMDB ID           |
+| TPDB feature with a TMDB cross-ID                         | Delivery still resolves/stores TPDB identity, not the higher-precedence TMDB path          |
+| StashDB scene, including auxiliary cross-IDs when present | Correct Scene/UUID stored; competing movie-routing fields cannot redirect the add          |
+| Linked, StashDB-only, and TPDB-only performers            | Correct source filmographies; missing cross-links are explained, not silently empty/merged |
+| Movie/scene membership                                    | Source-backed links; a scene does not satisfy whole-movie availability                     |
+| Two filtered pages and a final partial page               | Real provider serialization/continuation/count scope; unsupported filters unavailable      |
+| Authoritative deletion versus timeout/outage              | Unresolvable reference versus unknown check; no fabricated empty success or lost history   |
 
-- Branches created: `next` for implementation; `legacy/seerr-whisparr` preserves the existing integration. `main`, repository identity, and `upstream` remain unchanged.
-- Read-only checks on 2026-09-10: the target Whisparr responds to authenticated `/api/v3/system/status` and reports version `3.4.0.1387`. Its import-list configuration contains no lists from which existing provider credentials could be reused.
-- Target Jellyfin reports version `12.0.0`. Its existing integration key successfully authenticates `/Users` with standard `Authorization: MediaBrowser ... Token="..."`. The legacy `X-Emby-Token` header returned 401 with that same key; use the standard header during implementation.
-- Direct TPDB `/movies?per_page=1` returns HTTP 401 without a token; a StashDB `queryScenes` GraphQL query returns `not authorized`. No TPDB/StashDB credential is configured in this checkout's environment or local configuration.
-- The restricted SSH account cannot read the existing Stash configuration. That restriction was respected; no permissions or authentication settings were changed.
-- **Blocker:** provide a TPDB API token and a READ-capable StashDB API key. The already-ignored `.env.local` is the proposed local handoff: `TPDB_API_TOKEN` and `STASHDB_API_KEY`. Alternatively, identify an authorized existing credential file. Do not commit credentials or paste them into the plan.
-- Movie/scene discovery coverage, provider links, filter behavior, and controlled imports are still unproven. No add, monitor, download, or library mutation was performed. M1-M6 remain dependent on the M0 evidence gate; they are not completed or replaced with scaffolding.
+**Stop condition:** if TPDB access/terms, needed catalog coverage, or Whisparr movie compatibility fails, record evidence and decide a compatible provider/build/configuration with the user. Do not call a scene-only result complete. A successful local-library checkpoint can remain useful while this is resolved.
 
-### M1: preserve the repo and establish the independent app
+#### Evidence ledger as of this review
 
-Legacy checkpoint, `next` branch, fresh storage, explicit account grants, Jellyfin login/import, and application shell with new navigation/branding.
+- **Historical connectivity:** authenticated Whisparr `/api/v3/system/status` reported `3.4.0.1387`; its import lists provided no reusable provider credentials. Jellyfin reported `12.0.0`; the administrator integration key enumerated `/Users` with standard `Authorization: MediaBrowser ... Token="..."`, while the legacy `X-Emby-Token` attempt returned 401.
+- **Not proven by that:** end-user login, disabled/revoked-user behavior, per-item library restrictions, plugin ID coverage, exact movie/scene matching, Whisparr add/acquisition, or actual playback. A detail-page link or status 200 is not playback proof.
+- **Historical provider blocker:** unauthenticated TPDB `/movies` returned 401 and StashDB `queryScenes` returned `not authorized`. The restricted SSH account could not read Stash configuration; that restriction was respected.
+- **Still needed for M0:** `TPDB_API_TOKEN` and a READ-capable `STASHDB_API_KEY` through an ignored local file or other authorized secret handoff, plus selected test items/accounts and any required mutation approval. Do not paste keys into chat or the plan.
+- **Executed in this reassessment:** inspected current files and public contracts; confirmed the add-time identity precedence; reproduced absent Git ignore protection, restored it, and checked credential/runtime paths are ignored. No new private-instance probe or application implementation was performed.
+- **Verified in the M1 implementation run (2026-09-10, local only):** the application, package manifest, Dockerfile, Compose file, and CI workflow exist; gates are green locally (TypeScript strict via `tsc --noEmit`, 58 node:test cases across storage/security, integration clients, and API routes, plus `next build`); and a browser-driven end-to-end run covered setup inspect, explicit library selection, owner bootstrap, a paged and searchable real library grid, authorized artwork responses (private/no-store), a detail view with credential-free Jellyfin link, a truthful playback-unavailable item, admin import (accounts imported disabled and grantless), Whisparr/TPDB/StashDB not-configured states, logout, restart persistence, and re-login, at 1366x768 and 390px. That run used a **throwaway local HTTP Jellyfin fixture, not the real homelab Jellyfin**; a fixture proves application wiring, not the installed server's behavior.
+- **Still blocked on the operator:** real Jellyfin base URL, administrator API key, owner credentials, and permitted library selection for the live M1 proof; `TPDB_API_TOKEN` and a READ-capable `STASHDB_API_KEY` plus usage permission, selected real fixtures, and an explicit safe mutation target for M0; and a Linux/container runner — this workstation has no Docker, Podman, or WSL distro, so the compose build and container smoke path are unexecuted locally and run only in CI.
 
-Gate: original Seerr remains untouched and operational; an ungranted imported user cannot access catalog APIs or images; an allowed user can log in. Initial real-data movie/scene cards establish the visual baseline early.
+### M1: first useful locally runnable checkpoint
 
-### M2: implement provider-aligned catalog identities
+No TPDB/StashDB keys required. With operator-provided Jellyfin/Whisparr configuration:
 
-Concrete provider reads, provenance, movie/scene/performer/studio/tag relationships, bounded caching, Whisparr resolution, exact external mappings, and administrator handling for unresolved links.
+- Reproducible install/start and Docker/Compose build/start from a clean checkout; fresh persistent data and protected bootstrap.
+- Explicit owner selection, Jellyfin login/import, account grants, logout, and immediate local revocation.
+- Paged **real, user-accessible Jellyfin library items**, protected artwork, and a checked link to the browser-reachable Jellyfin web UI. Label the source as the local library; do not infer provider movie/scene identities.
+- Administrator-only read-only Whisparr connectivity/configuration status, not a substitute Whisparr dashboard or downloader.
+- Unconfigured provider features say **Not configured**; unavailable checks say **Unavailable**. No fake discovery fixtures, empty-success fallbacks, or acquisition calls.
 
-Gate: movie and scene records can exist without TMDB IDs; duplicate names do not merge; mapped identities round-trip to the right external item; source failures never manufacture empty success.
+**Status: implemented and locally verified (2026-09-10); live-server proof and container smoke remain.** The acceptance commands exist: `bun install`, `bun run setup`, `bun run dev`/`build`/`start`, `bun run check`, `bun run test`, `bun run backup`, and `docker compose up --build`. Gates are green locally (TypeScript strict, 58 node:test cases, `next build`), and actual browser verification on desktop and 390px mobile plus a restart preserving setup/grants has been performed — against a throwaway local HTTP Jellyfin fixture, not the installed server; see the [M0 evidence ledger](#evidence-ledger-as-of-this-review) above for the verified and blocked lists.
 
-### M3: deliver discovery, details, performer traversal, and filters
+Live probing found and fixed one real routing bug: the catch-all API route trusted `context.params`, which Next strips of the static `/api` prefix, so every endpoint returned 404 on a real server while direct-handler tests passed; dispatch now derives segments from the request URL. Still outstanding: live proof against the installed Jellyfin (operator base URL, administrator API key, owner credentials, permitted library selection) and the compose build/container smoke path (no Docker, Podman, or WSL on this workstation; CI only). It is an early connected application, not the complete discovery release.
 
-Discover shelves, Movies/Scenes browsing, global search, performer pages with both media tabs, studio/tag routes, details, mobile interaction, and provider-aware filtering/pagination.
+### M2: prove one complete movie and scene journey
 
-Gate: from a performer, browse and filter both supported movies and scenes, open details, and return with filters/scroll intact. New releases, library additions, and rankings are accurately labeled. All specified loading/empty/error/accessibility states receive visual verification.
+Depends on M1 and the relevant M0 proofs. Implement provider-scoped catalog identities, selected real details/credits, request/approve/decline, shared acquisition, exact payload selection, Whisparr reconciliation, and exact Jellyfin matching for both kinds. Establish the three real card/detail treatments here, not after backend completion.
 
-### M4: implement request and approval end to end
+Gate: selected authorized movie **and** scene travel from provider detail through durable request/Whisparr acquisition to playback under the intended Jellyfin user. Existing library items are useful read-only fixtures but do not substitute for proving a controlled new add. Missing performer cross-links and acquisition uncertainty remain explicit.
 
-Single movie/scene request flow, permissions, approval/decline, Whisparr lookup/add with exact identity, duplicate prevention, retry/reconciliation, queue progress, and useful errors.
+### M3: expand into the full discovery product
 
-Gate: both a movie and a scene travel from discovery to Whisparr; concurrent requests and ambiguous timeouts do not create duplicate imports; restart preserves request state.
+Deliver Discover shelves, Movies/Scenes browse and detail pages, global Movies/Scenes/Performers/Studios search, performer Scenes/Movies tabs, studio/tag navigation, and supported filters/paging. Keep URL state and scroll restoration; label new release, metadata creation, popularity, and local-library scopes truthfully.
 
-### M5: finish Jellyfin availability and watch handoff
+Gate: browse -> performer -> filter both supported catalogs -> request -> return without losing context, using real provider data. Both catalogs and every specified loading/empty/error/accessibility state are covered. The app is not complete at search-only, movie-only, or scene-only breadth.
 
-Library mapping, path translation where necessary, per-user visibility, post-import scan reconciliation, missing-file handling, and Open in Jellyfin.
+### M4: harden availability, privacy, and request recovery
 
-Gate: the same requested movie and scene become playable in Jellyfin for an authorized user; users denied that library get no playable link; a downloaded-but-unscanned item remains distinct from Available.
+Finish general library/path matching, per-item visibility/playback checks, scan lag, stale observations, rescans/missing files, shared-request cancellation, and restart recovery. Use the same real movie/scene journeys as M2, not unrelated happy-path samples.
 
-### M6: release and cutover
+| Hazard                                                                 | Required behavior                                                                                              |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Ungranted user or concurrent bootstrap claim                           | No protected data or unauthorized owner grant                                                                  |
+| Another admitted user warms a restricted image/detail cache            | Anonymous/library-denied/revoked users still cannot fetch those bytes                                          |
+| Jellyfin outage, invalid user token, disabled account                  | Explicit distinct denial/unavailable behavior; no admin fallback or state deletion                             |
+| Remote client denied by Jellyfin policy                                | Velvarr's LAN connection cannot bypass the restriction                                                         |
+| Foreign-origin grant/approve/settings request                          | Rejected before any external mutation                                                                          |
+| Two users approve the same target                                      | One shared acquisition; private request history stays private                                                  |
+| Process dies after Whisparr accepts but before local acknowledgement   | Restart/restore reconciles exact identity without blindly posting again                                        |
+| Logout, grant revocation, and cancellation                             | Logout preserves durable approval; revocation gates unsent intent; one cancellation cannot delete shared media |
+| Monitoring/no release; imported/unscanned; scanned but playback denied | Three truthful outcomes, not Available                                                                         |
+| File removed or paths/editions changed                                 | Revalidate exact mapping; no title-only or parent/child availability inference                                 |
 
-Run the end-to-end acceptance journeys and keep small regression checks for actual authorization, identity, filter, and submission hazards. Verify backup/restore, production container startup, configuration documentation, licensing/attribution, neutral public screenshots, and new image publishing. Complete the GitHub rename/link audit and deploy beside the original Seerr before making it the adult catalog's entry point.
+### M5: production packaging and operational proof
 
-Gate: all requested product surfaces work together; legacy app rollback is documented; no outstanding metadata assumptions are hidden behind mocked success. The initial release is not complete at a search-only or movie-only milestone.
+Keep narrow regression checks for demonstrated identity/authorization/recovery hazards, using the standard test runner rather than an extra testing platform. Verify migration failure/rollback, consistent backup/restore to a fresh volume, runtime-only secrets, bounded polling/cache behavior, graceful restart, and readable errors without sensitive logs.
+
+Set up Velvarr-specific CI and publish its own container image only after the local production build works. Preserve MIT notices for reviewed reuse; do not copy GPL implementation by accident. Use neutral public screenshots. Add the optional private Discord notifier after request delivery is reliable.
+
+### M6: complete release and deliberate cutover
+
+Gate: all requested product surfaces work together with both acquisition/playback journeys, tested user restrictions, known provider/filter limits, and a verified recovery procedure. No mock-backed success or unresolved movie-support assumption is hidden in the release.
+
+Deploy beside the existing Seerr/Whisparr/Jellyfin stack using a separate volume/image/port. Changing the adult entry point is deliberate; neither the family Seerr database nor the old deployment is silently replaced. Product name/domain purchase is not a prerequisite for local testing.
 
 ## Explicit non-goals
 
 No internal video player/transcoder, direct indexer/download-client orchestration, local Stash media-manager requirement, invented TV/season mappings, wholesale provider mirroring, automated fuzzy identity merges, recommendation/ML system, or Seerr-wide feature-parity checklist. Jellyfin, Whisparr, and metadata providers continue doing their existing jobs.
 
-## Discussion decisions
+## Decisions and remaining prerequisites
 
-1. Final neutral product/repo name before the GitHub rename.
-2. Accept TPDB + StashDB as the proposed baseline, subject to M0 account/coverage/import proof. TMDB remains excluded unless permission covering this application is obtained; it is not the fallback for an unsuccessful TPDB experiment.
-3. Which Jellyfin users and libraries to allow. Default: imported users are not admitted until selected; no family-wide auto-access.
+- **Settled:** Velvarr; standalone product; both Movies and Scenes with performer-led discovery; Whisparr acquisition; Jellyfin watching; explicit account grants; one initial instance of each integration.
+- **Recommended revision:** deliver M1 alongside M0, then the two complete vertical journeys before broad catalog expansion. Do not delay all server work for provider credentials, and do not build an empty mock server as a substitute.
+- **Concrete inputs still required:** provider credentials/usage permission; selected Jellyfin owner, permitted users/libraries and restricted test account; selected real movie/scene records; verified path/provider-ID data; authorization before any mutation probe.
+- **Default scope:** private homelab deployment, no TMDB integration without permission, no automatic performer monitoring, no public registration. Technical defaults can proceed without another naming/framework brainstorming phase.
 
-The architectural recommendation is firm enough to discuss now. Credential-gated coverage, provider crosswalks, and playable scene matching remain experiments, not promises.
+Schema-level evidence supports starting this sequence. Coverage, crosswalk accuracy, installed-server behavior, and actual playable matching remain measured gates, not promises.
 
 ## Sources and evidence scope
 
@@ -336,7 +399,7 @@ The architectural recommendation is firm enough to discuss now. Credential-gated
 - [TMDB API Terms of Use, section 1.C][tmdb-terms], page states updated October 20, 2023.
 - Jellyfin [user documentation][jellyfin-users]; source baseline https://github.com/jellyfin/jellyfin/tree/cf09de60e4e5844ad181d7ef9019151c54969d44 ; `Jellyfin.Api/Controllers/UserController.cs`, `ItemsController.cs`, `MediaInfoController.cs`, and `MediaBrowser.Model/Users/UserPolicy.cs`. This pins inspected source, not the user's installed release.
 
-This plan separates source-inspected capabilities from proposed design and installation-specific acceptance gates. It does not claim a live authenticated TPDB/StashDB/Jellyfin integration or a successful Whisparr import was exercised during planning.
+This plan distinguishes public source/specification evidence, historical connectivity checks, proposed design, and future installation-specific acceptance. It does not claim that a live authenticated provider discovery flow, end-user authorization suite, successful Whisparr import, or actual playback was exercised during this reassessment.
 
 [tpdb-spec]: https://api.theporndb.net/specs?openapi.json
 [stash-schema]: https://github.com/stashapp/stash-box/blob/b4b8aef21372e3843240e3260c5123443239f2fb/graphql/schema/schema.graphql
@@ -348,3 +411,9 @@ This plan separates source-inspected capabilities from proposed design and insta
 [whisparr-skyhook]: https://github.com/Whisparr/Whisparr/blob/cc3fb2abcf60f7c0048eb0294015d291b82bde08/src/NzbDrone.Core/MetadataSource/SkyHook/SkyHookProxy.cs
 [whisparr-performer]: https://github.com/Whisparr/Whisparr/blob/cc3fb2abcf60f7c0048eb0294015d291b82bde08/src/Whisparr.Api.V3/Performers/PerformerResource.cs
 [jellyfin-users]: https://jellyfin.org/docs/general/server/users/
+[jellyfin-authorization]: https://github.com/jellyfin/jellyfin/blob/cf09de60e4e5844ad181d7ef9019151c54969d44/Jellyfin.Api/Auth/DefaultAuthorizationPolicy/DefaultAuthorizationHandler.cs
+[next-image]: https://nextjs.org/docs/app/api-reference/components/image
+[node-sqlite]: https://nodejs.org/docs/latest-v24.x/api/sqlite.html
+[next-startup]: https://nextjs.org/docs/app/guides/instrumentation
+[sqlite-backup]: https://www.sqlite.org/backup.html
+[github-contributors]: https://docs.github.com/en/repositories/viewing-activity-and-data-for-your-repository/viewing-a-projects-contributors

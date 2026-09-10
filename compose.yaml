@@ -1,0 +1,17 @@
+services:
+  velvarr:
+    build: .
+    image: velvarr:local
+    restart: unless-stopped
+    ports:
+      # Loopback only: the app is never exposed to the network by default.
+      - "127.0.0.1:5577:5577"
+    env_file:
+      # Runtime-only credentials, produced once by `npm run setup`; never baked into the image.
+      - path: .env.local
+        required: false
+    volumes:
+      - velvarr-data:/data
+
+volumes:
+  velvarr-data:

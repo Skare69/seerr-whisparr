@@ -1,0 +1,18 @@
+# Allowlist: nothing enters the build context unless re-included here.
+# Secrets, VCS history, and all legacy/runtime state can never leak into an image layer.
+*
+!package.json
+!bun.lock
+!tsconfig.json
+!next.config.ts
+!postcss.config.mjs
+!src
+
+# Defense in depth (already excluded by the allowlist above).
+.git
+.env*
+config
+cache
+data
+node_modules
+.next
