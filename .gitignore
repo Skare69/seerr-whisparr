@@ -4,6 +4,9 @@
 /data/
 /cache/
 
+# Local-only project documentation.
+/docs/
+
 # Generated files.
 /node_modules/
 /.next/
