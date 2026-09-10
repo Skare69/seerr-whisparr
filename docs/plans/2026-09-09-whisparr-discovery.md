@@ -412,6 +412,8 @@ Prerequisites: operator opt-in flag, a per-account removal grant, one Jellyfin t
 
 No internal video player/transcoder, direct indexer/download-client orchestration, local Stash media-manager requirement, invented TV/season mappings, wholesale provider mirroring, automated fuzzy identity merges, recommendation/ML system, or Seerr-wide feature-parity checklist. Jellyfin, Whisparr, and metadata providers continue doing their existing jobs. Removal (M7) stays a per-entry, approver-chosen action: no bulk library cleanup tool, no disk-space dashboard, no automatic retention or expiry policy, and no Whisparr blocklist management.
 
+No local Velvarr passwords/accounts: authentication, library permission and playback authority stay with the media server, because every authenticated read and the M7 removal run under the requesting user's own upstream token. Supporting a non-Jellyfin deployment means a second media-server provider behind the same four contracts, not a parallel identity system. See [ADR 0001](../adr/0001-no-local-accounts.md).
+
 ## Decisions and remaining prerequisites
 
 - **Settled:** Velvarr; standalone product; both Movies and Scenes with performer-led discovery; Whisparr acquisition; Jellyfin watching; explicit account grants; one initial instance of each integration.
