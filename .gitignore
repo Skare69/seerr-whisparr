@@ -15,9 +15,8 @@ lcov.info
 # production
 /build
 
-# ignore REST API documentation
-docs/api/*
-!docs/api/_category_.json
+# Local-only project documentation.
+/docs/
 
 # misc
 .DS_Store
