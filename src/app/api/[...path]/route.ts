@@ -1,23 +1,35 @@
 import type {
   Account,
+  CatalogKind,
+  CatalogProvider,
+  CatalogReference,
   ExternalUser,
   IntegrationConfig,
   Library,
+  MediaKind,
+  MediaReference,
   ProviderStatus,
   Role,
+  WhisparrPathMapping,
 } from "../../../lib/contracts.ts";
 import {
   bootstrap,
+  cancelRequest,
+  createRequest,
   createSession,
+  decideRequest,
+  getAcquisitionByReference,
   getAccount,
   getConfig,
   getSession,
   importAccounts,
   isInitialized,
   listAccounts,
+  listRequests,
   revokeSession,
   saveConfig,
   updateAccount,
+  upsertCatalogRecord,
 } from "../../../server/storage.ts";
 import {
   consumeLoginAttempt,
@@ -34,8 +46,18 @@ import {
   listLibraries,
   listLibraryItems,
   listUsers,
+  resolvePlaybackAccess,
   validateUser,
 } from "../../../server/jellyfin.ts";
+import {
+  crossProviderLink,
+  fetchProviderArtwork,
+  getCatalogDetail,
+  getProviderStatus,
+  isProviderImageUrl,
+  searchCatalog,
+  type CatalogSearchQuery,
+} from "../../../server/providers.ts";
 import { getWhisparrStatus } from "../../../server/whisparr.ts";
 
 export const dynamic = "force-dynamic";
@@ -163,6 +185,17 @@ function requireId(raw: string): string {
   if (!JELLYFIN_ID.test(raw))
     throw new AppError(400, "invalid_id", "Invalid identifier.");
   return raw;
+}
+
+function optionalBool(
+  body: Record<string, unknown>,
+  key: string,
+): boolean | undefined {
+  const value = body[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean")
+    throw new AppError(400, "invalid_field", `Invalid ${key}.`);
+  return value;
 }
 
 function queryInt(
@@ -436,13 +469,30 @@ async function logout(request: Request): Promise<Response> {
 
 async function me(request: Request): Promise<Response> {
   const ctx = await requireSession(request);
+  const [tpdb, stashdb] = await Promise.all([
+    providerPresence("tpdb"),
+    providerPresence("stashdb"),
+  ]);
   return json({
     account: ctx.account,
-    providers: {
-      tpdb: process.env.TPDB_API_TOKEN ? "not_verified" : "not_configured",
-      stashdb: process.env.STASHDB_API_KEY ? "not_verified" : "not_configured",
-    } satisfies ProviderStatus,
+    providers: { tpdb, stashdb } satisfies ProviderStatus,
   });
+}
+
+// Coarse per-user signal: does a provider integration exist at all. Real
+// verification (verified flag + account) lives on the admin providers route;
+// here an outage must never claim a configured provider vanished, and an
+// unconfigured provider must never pretend otherwise.
+async function providerPresence(
+  provider: "tpdb" | "stashdb",
+): Promise<ProviderStatus["tpdb"]> {
+  try {
+    return (await getProviderStatus(provider)).configured
+      ? "not_verified"
+      : "not_configured";
+  } catch {
+    return "not_verified";
+  }
 }
 
 async function libraries(request: Request): Promise<Response> {
@@ -537,6 +587,8 @@ function integrationsShape(config: IntegrationConfig) {
       ? {
           url: config.whisparr.url,
           apiKeyConfigured: config.whisparr.apiKey.length > 0,
+          delivery: config.whisparr.delivery ?? null,
+          pathMappings: config.whisparr.pathMappings ?? [],
         }
       : null,
   };
@@ -573,6 +625,7 @@ async function adminUpdateUser(
   const enabled = fieldBool(body, "enabled");
   const role = fieldRole(body, "role");
   const libraryIds = fieldIds(body, "libraryIds");
+  const autoApprove = optionalBool(body, "autoApprove");
   const configured = new Set(ctx.config.jellyfin.libraryIds);
   if (libraryIds.some((libraryId) => !configured.has(libraryId))) {
     throw new AppError(400, "invalid_field", "Unknown library selected.");
@@ -584,7 +637,12 @@ async function adminUpdateUser(
       "The owner account cannot be disabled or demoted.",
     );
   }
-  const account = updateAccount(target.id, { enabled, role, libraryIds });
+  const account = updateAccount(target.id, {
+    enabled,
+    role,
+    libraryIds,
+    ...(autoApprove !== undefined ? { autoApprove } : {}),
+  });
   return json({ account });
 }
 
@@ -666,6 +724,101 @@ async function adminUpdateIntegrations(
       whisparr = { url: validateBaseUrl(whisparrUrl), apiKey: key };
     }
   }
+  // Delivery and pathMappings: validated here, stored only with a Whisparr
+  // connection; omitted keys preserve what is already configured.
+  let delivery = whisparr?.delivery;
+  let pathMappings = whisparr?.pathMappings;
+  const nextDelivery = body.delivery;
+  if (nextDelivery !== undefined) {
+    if (
+      nextDelivery === null ||
+      typeof nextDelivery !== "object" ||
+      Array.isArray(nextDelivery)
+    ) {
+      throw new AppError(
+        400,
+        "invalid_field",
+        "Invalid Whisparr delivery settings.",
+      );
+    }
+    const d = nextDelivery as Record<string, unknown>;
+    if (
+      typeof d.enabled !== "boolean" ||
+      typeof d.rootFolderPath !== "string" ||
+      d.rootFolderPath.length > 1024 ||
+      typeof d.qualityProfileId !== "number" ||
+      !Number.isInteger(d.qualityProfileId) ||
+      d.qualityProfileId < 1 ||
+      typeof d.searchOnAdd !== "boolean" ||
+      (d.enabled && d.rootFolderPath === "")
+    ) {
+      throw new AppError(
+        400,
+        "invalid_field",
+        "Invalid Whisparr delivery settings.",
+      );
+    }
+    delivery = {
+      enabled: d.enabled,
+      rootFolderPath: d.rootFolderPath,
+      qualityProfileId: d.qualityProfileId,
+      searchOnAdd: d.searchOnAdd,
+    };
+  }
+  const nextMappings = body.pathMappings;
+  if (nextMappings !== undefined) {
+    if (!Array.isArray(nextMappings) || nextMappings.length > 50) {
+      throw new AppError(
+        400,
+        "invalid_field",
+        "Invalid Whisparr path mappings.",
+      );
+    }
+    const mapped: WhisparrPathMapping[] = [];
+    for (const entry of nextMappings) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new AppError(
+          400,
+          "invalid_field",
+          "Invalid Whisparr path mappings.",
+        );
+      }
+      const e = entry as Record<string, unknown>;
+      if (
+        typeof e.whisparrPrefix !== "string" ||
+        e.whisparrPrefix === "" ||
+        e.whisparrPrefix.length > 1024 ||
+        typeof e.jellyfinPrefix !== "string" ||
+        e.jellyfinPrefix === "" ||
+        e.jellyfinPrefix.length > 1024
+      ) {
+        throw new AppError(
+          400,
+          "invalid_field",
+          "Invalid Whisparr path mappings.",
+        );
+      }
+      mapped.push({
+        whisparrPrefix: e.whisparrPrefix,
+        jellyfinPrefix: e.jellyfinPrefix,
+      });
+    }
+    pathMappings = mapped;
+  }
+  if ((nextDelivery !== undefined || nextMappings !== undefined) && !whisparr) {
+    throw new AppError(
+      400,
+      "invalid_field",
+      "Whisparr must be configured to set delivery settings.",
+    );
+  }
+  if (whisparr) {
+    whisparr = {
+      ...whisparr,
+      ...(delivery ? { delivery } : {}),
+      ...(pathMappings ? { pathMappings } : {}),
+    };
+  }
   const config: IntegrationConfig = {
     jellyfin,
     ...(whisparr ? { whisparr } : {}),
@@ -676,6 +829,426 @@ async function adminUpdateIntegrations(
 
 async function adminWhisparr(ctx: AuthContext): Promise<Response> {
   return json(await getWhisparrStatus(ctx.config));
+}
+
+// --- catalog, requests, availability ---
+
+const PROVIDER_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function parseCatalogProvider(raw: string | null): CatalogProvider {
+  if (raw === "tpdb" || raw === "stashdb") return raw;
+  throw new AppError(400, "invalid_reference", "Unknown catalog provider.");
+}
+
+function parseCatalogKind(
+  provider: "stashdb",
+  raw: string,
+): "scene" | "performer";
+function parseCatalogKind(provider: "tpdb", raw: string): CatalogKind;
+function parseCatalogKind(provider: CatalogProvider, raw: string): CatalogKind;
+function parseCatalogKind(provider: CatalogProvider, raw: string): CatalogKind {
+  if (provider === "tpdb") {
+    if (raw === "movie" || raw === "scene" || raw === "performer") return raw;
+    throw new AppError(400, "invalid_reference", "Unknown catalog kind.");
+  }
+  if (raw === "scene" || raw === "performer") return raw;
+  throw new AppError(
+    400,
+    "invalid_reference",
+    "StashDB hosts scenes and performers only.",
+  );
+}
+
+// External provider identity for catalog routes, validated before any
+// upstream call. Ids are canonical provider UUIDs, never the application's
+// own catalog record id.
+function parseCatalogReference(
+  providerRaw: string,
+  kindRaw: string,
+  idRaw: string,
+): CatalogReference {
+  const provider = parseCatalogProvider(providerRaw);
+  const kind = parseCatalogKind(provider, kindRaw);
+  if (!PROVIDER_UUID.test(idRaw)) {
+    throw new AppError(
+      400,
+      "invalid_reference",
+      "Provider catalog ids must be UUIDs.",
+    );
+  }
+  return { provider, kind, id: idRaw.toLowerCase() };
+}
+
+// CatalogReference is requestable media only when its kind is movie/scene;
+// a performer is catalog-only and must never reach createRequest,
+// getAcquisitionByReference, or the availability hints. Runtime check,
+// never a cast.
+function isMediaReference(
+  reference: CatalogReference,
+): reference is MediaReference {
+  return reference.kind === "movie" || reference.kind === "scene";
+}
+
+function parseMediaReference(
+  providerRaw: string,
+  kindRaw: string,
+  idRaw: string,
+): MediaReference {
+  const reference = parseCatalogReference(providerRaw, kindRaw, idRaw);
+  if (!isMediaReference(reference)) {
+    throw new AppError(
+      400,
+      "invalid_reference",
+      "Performers are not requestable media.",
+    );
+  }
+  return reference;
+}
+
+function sameMedia(a: MediaReference, b: MediaReference): boolean {
+  return (
+    a.provider === b.provider &&
+    a.kind === b.kind &&
+    a.id.toLowerCase() === b.id.toLowerCase()
+  );
+}
+
+// Shared provider-independent scalar validation for catalog search. The
+// per-provider builders below explicitly reject filter combinations their
+// provider cannot express — never silently ignored downstream.
+interface CatalogSearchParams {
+  q: string | null;
+  year: number | undefined;
+  performer: string | null;
+  page: number;
+  perPage: number;
+}
+
+function catalogSearchParams(
+  url: URL,
+  params: URLSearchParams,
+): CatalogSearchParams {
+  const q = params.get("q");
+  if (q !== null && (q.length === 0 || q.length > 200))
+    throw new AppError(400, "invalid_query", "Invalid q.");
+  const yearRaw = params.get("year");
+  if (
+    yearRaw !== null &&
+    (!/^\d{4}$/.test(yearRaw) ||
+      Number(yearRaw) < 1870 ||
+      Number(yearRaw) > 2100)
+  ) {
+    throw new AppError(400, "invalid_query", "Invalid year.");
+  }
+  const performer = params.get("performer");
+  if (performer !== null && (performer === "" || performer.length > 128))
+    throw new AppError(400, "invalid_query", "Invalid performer.");
+  return {
+    q,
+    year: yearRaw !== null ? Number(yearRaw) : undefined,
+    performer,
+    page: params.has("page") ? queryInt(url, "page", 1, 1, 10000) : 1,
+    perPage: params.has("perPage") ? queryInt(url, "perPage", 24, 1, 100) : 24,
+  };
+}
+
+// Builds the providers CatalogSearchQuery union from the query string. One
+// builder per provider so each provider+kind pair constructs exactly its
+// own valid union variant.
+function catalogSearchQuery(url: URL): CatalogSearchQuery {
+  const params = url.searchParams;
+  const provider = parseCatalogProvider(params.get("provider"));
+  const kindRaw = params.get("kind");
+  if (kindRaw === null)
+    throw new AppError(400, "invalid_query", "kind is required.");
+  if (provider === "stashdb") {
+    // The overload types stashdb kinds as "scene" | "performer": StashDB
+    // has no movie entity, and parseCatalogKind already rejects movie
+    // here with an explicit 400.
+    return stashdbSearchQuery(params, parseCatalogKind(provider, kindRaw), url);
+  }
+  return tpdbSearchQuery(params, parseCatalogKind(provider, kindRaw), url);
+}
+
+// StashDB: unpaged performer search (query only) and scene search with
+// optional query/performer filters; year is not supported.
+function stashdbSearchQuery(
+  params: URLSearchParams,
+  kind: "scene" | "performer",
+  url: URL,
+): CatalogSearchQuery {
+  const s = catalogSearchParams(url, params);
+  if (kind === "performer") {
+    if (s.q === null)
+      throw new AppError(400, "invalid_query", "Performer search requires q.");
+    if (s.performer !== null) {
+      throw new AppError(
+        400,
+        "invalid_query",
+        "performer filter cannot be combined with kind=performer.",
+      );
+    }
+    if (params.has("page") || params.has("perPage")) {
+      throw new AppError(
+        400,
+        "invalid_query",
+        "StashDB performer search is not paged.",
+      );
+    }
+    return { provider: "stashdb", kind, query: s.q };
+  }
+  if (s.year !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      "StashDB scene search does not support year.",
+    );
+  }
+  return {
+    provider: "stashdb",
+    kind,
+    ...(s.q !== null ? { query: s.q } : {}),
+    ...(s.performer !== null ? { performer: s.performer } : {}),
+    page: s.page,
+    perPage: s.perPage,
+  };
+}
+
+// TPDB hosts all three kinds; performer search requires q and takes no
+// other filters.
+function tpdbSearchQuery(
+  params: URLSearchParams,
+  kind: CatalogKind,
+  url: URL,
+): CatalogSearchQuery {
+  const s = catalogSearchParams(url, params);
+  if (kind === "performer") {
+    if (s.q === null)
+      throw new AppError(400, "invalid_query", "Performer search requires q.");
+    if (s.performer !== null) {
+      throw new AppError(
+        400,
+        "invalid_query",
+        "performer filter cannot be combined with kind=performer.",
+      );
+    }
+    if (s.year !== undefined) {
+      throw new AppError(
+        400,
+        "invalid_query",
+        "year filter cannot be combined with kind=performer.",
+      );
+    }
+    return {
+      provider: "tpdb",
+      kind,
+      query: s.q,
+      page: s.page,
+      perPage: s.perPage,
+    };
+  }
+  return {
+    provider: "tpdb",
+    kind,
+    ...(s.q !== null ? { query: s.q } : {}),
+    ...(s.year !== undefined ? { year: s.year } : {}),
+    ...(s.performer !== null ? { performer: s.performer } : {}),
+    page: s.page,
+    perPage: s.perPage,
+  };
+}
+
+async function catalogSearch(request: Request): Promise<Response> {
+  await requireSession(request);
+  // Pass-through page: total/totalCountKnown report exactly what the
+  // provider attests (a capped TPDB total surfaces as totalCountKnown:
+  // false), and an outage propagates as an error, never an empty page.
+  return json(await searchCatalog(catalogSearchQuery(new URL(request.url))));
+}
+
+async function catalogDetail(
+  request: Request,
+  providerRaw: string,
+  kindRaw: string,
+  idRaw: string,
+): Promise<Response> {
+  const ctx = await requireSession(request);
+  const reference = parseCatalogReference(providerRaw, kindRaw, idRaw);
+  const detail = await getCatalogDetail(reference);
+  if (!detail) {
+    throw new AppError(
+      404,
+      "catalog_not_found",
+      "This item is not in the provider catalog.",
+    );
+  }
+  const record = upsertCatalogRecord(detail);
+  const media: MediaReference | null = isMediaReference(reference)
+    ? reference
+    : null;
+  // Only the caller's own intent and the shared (user-anonymous) acquisition
+  // state; never another user's request history.
+  const mine = media
+    ? (listRequests(ctx.account).find(
+        (r) => r.accountId === ctx.account.id && sameMedia(r.media, media),
+      ) ?? null)
+    : null;
+  const acquisition = media ? getAcquisitionByReference(media) : null;
+  return json({
+    detail,
+    link: crossProviderLink(detail),
+    catalogRecord: record,
+    myRequest: mine && {
+      id: mine.id,
+      decision: mine.decision,
+      createdAt: mine.createdAt,
+      decidedAt: mine.decidedAt,
+    },
+    acquisition: acquisition && {
+      state: acquisition.state,
+      lastError: acquisition.lastError,
+      updatedAt: acquisition.updatedAt,
+    },
+  });
+}
+
+// Artwork proxy: provider-hosted URLs only, byte-capped pass-through,
+// private/no-store, nothing persisted, and no Velvarr or provider
+// credentials ever reach the image host (fetchProviderArtwork sends none).
+async function catalogImage(request: Request): Promise<Response> {
+  await requireSession(request);
+  const target = new URL(request.url).searchParams.get("url");
+  if (target === null || target === "") {
+    throw new AppError(400, "invalid_query", "url is required.");
+  }
+  const check = isProviderImageUrl(target);
+  if (!check.ok) {
+    throw new AppError(
+      400,
+      "invalid_artwork_url",
+      `Rejected artwork URL: ${check.reason}.`,
+    );
+  }
+  const { bytes, contentType } = await fetchProviderArtwork(target);
+  return new Response(bytes as unknown as BodyInit, {
+    status: 200,
+    headers: {
+      "content-type": contentType,
+      "cache-control": "private, no-store",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
+// Creates one user's request intent from a server-validated MediaReference.
+// A browser-supplied resolved payload is never trusted. With the autoApprove
+// grant the request is decided approved immediately so shared acquisition
+// work is enqueued; otherwise it stays pending for a moderator. No Whisparr
+// call happens anywhere on this path.
+async function createRequestRoute(request: Request): Promise<Response> {
+  guardMutation(request);
+  const ctx = await requireSession(request);
+  const media = (await readJson(request)).media;
+  if (media === null || typeof media !== "object" || Array.isArray(media)) {
+    throw new AppError(400, "invalid_field", "Invalid media reference.");
+  }
+  const m = media as Record<string, unknown>;
+  if (
+    (m.provider !== "tpdb" && m.provider !== "stashdb") ||
+    (m.kind !== "movie" && m.kind !== "scene") ||
+    typeof m.id !== "string" ||
+    !PROVIDER_UUID.test(m.id)
+  ) {
+    throw new AppError(400, "invalid_field", "Invalid media reference.");
+  }
+  const record = createRequest(ctx.account.id, {
+    provider: m.provider,
+    kind: m.kind,
+    id: m.id.toLowerCase(),
+  });
+  if (ctx.account.autoApprove) {
+    return json(
+      {
+        request: decideRequest(ctx.account, record.id, "approved"),
+        autoApproved: true,
+      },
+      201,
+    );
+  }
+  return json({ request: record }, 201);
+}
+
+async function listRequestsRoute(request: Request): Promise<Response> {
+  const ctx = await requireSession(request);
+  // Storage role-filters: a requester sees only their own history.
+  return json({ requests: listRequests(ctx.account) });
+}
+
+async function decideRequestRoute(
+  request: Request,
+  id: string,
+): Promise<Response> {
+  guardMutation(request);
+  const ctx = await requireSession(request);
+  const decision = (await readJson(request)).decision;
+  const requestId = requireId(id);
+  if (decision === "approved" || decision === "declined") {
+    return json({
+      request: decideRequest(ctx.account, requestId, decision),
+    });
+  }
+  if (decision === "cancelled") {
+    return json({ request: cancelRequest(ctx.account, requestId) });
+  }
+  throw new AppError(
+    400,
+    "invalid_field",
+    "decision must be approved, declined, or cancelled.",
+  );
+}
+
+// Per-user playback verdict for one external identity. Runs under THIS
+// caller's Jellyfin token; hints are the validated reference plus the
+// shared acquisition's persisted Whisparr facts when present. This is a
+// read route: no Whisparr call ever happens here.
+async function availability(
+  request: Request,
+  providerRaw: string,
+  kindRaw: string,
+  idRaw: string,
+): Promise<Response> {
+  const ctx = await requireSession(request);
+  const media = parseMediaReference(providerRaw, kindRaw, idRaw);
+  const acquisition = getAcquisitionByReference(media);
+  const verdict = await resolvePlaybackAccess(
+    ctx.config,
+    ctx.token,
+    ctx.account,
+    {
+      provider: media.provider,
+      kind: media.kind,
+      id: media.id,
+      ...(acquisition?.whisparrPath
+        ? { whisparrPath: acquisition.whisparrPath }
+        : {}),
+      ...(acquisition?.whisparrTitle
+        ? { title: acquisition.whisparrTitle }
+        : {}),
+    },
+  );
+  return json(verdict);
+}
+
+// Real provider verification for the admin UI: configured:false stays
+// honest, and an outage or auth failure throws rather than masquerading as
+// an empty or unverified catalog.
+async function adminProviders(ctx: AuthContext): Promise<Response> {
+  const [tpdb, stashdb] = await Promise.all([
+    getProviderStatus("tpdb"),
+    getProviderStatus("stashdb"),
+  ]);
+  return json({ providers: [tpdb, stashdb] });
 }
 
 // --- dispatch ---
@@ -703,6 +1276,16 @@ async function routeRequest(
       return libraryItem(request, segments[2]!);
     if (root === "images" && segments.length === 3)
       return libraryImage(request, segments[2]!);
+    if (root === "catalog" && a === "search" && segments.length === 3)
+      return catalogSearch(request);
+    if (root === "catalog" && a === "image" && segments.length === 3)
+      return catalogImage(request);
+    if (root === "catalog" && segments.length === 5)
+      return catalogDetail(request, a!, b!, segments[4]!);
+    if (root === "requests" && segments.length === 2)
+      return listRequestsRoute(request);
+    if (root === "availability" && segments.length === 5)
+      return availability(request, a!, b!, segments[4]!);
     if (root === "admin" && a === "users" && segments.length === 3)
       return adminUsers(await requireAdmin(request));
     if (root === "admin" && a === "integrations" && segments.length === 3) {
@@ -710,6 +1293,8 @@ async function routeRequest(
     }
     if (root === "admin" && a === "whisparr" && segments.length === 3)
       return adminWhisparr(await requireAdmin(request));
+    if (root === "admin" && a === "providers" && segments.length === 3)
+      return adminProviders(await requireAdmin(request));
   } else if (method === "POST") {
     if (root === "setup" && a === "inspect" && segments.length === 3)
       return setupInspect(request);
@@ -725,6 +1310,8 @@ async function routeRequest(
       const ctx = await requireAdmin(request);
       return adminImport(request, ctx);
     }
+    if (root === "requests" && segments.length === 2)
+      return createRequestRoute(request);
   } else if (method === "PATCH") {
     if (root === "admin" && a === "users" && segments.length === 4) {
       return adminUpdateUser(
@@ -733,6 +1320,8 @@ async function routeRequest(
         segments[3]!,
       );
     }
+    if (root === "requests" && segments.length === 3)
+      return decideRequestRoute(request, segments[2]!);
     if (root === "admin" && a === "integrations" && segments.length === 3) {
       return adminUpdateIntegrations(request, await requireAdmin(request));
     }

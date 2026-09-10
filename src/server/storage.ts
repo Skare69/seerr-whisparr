@@ -34,7 +34,7 @@ import { AppError } from "./http.ts";
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 // ponytail: fixed 7-day session TTL; make it an env knob only if an operator asks.
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BUSY_TIMEOUT_MS = 5000;
@@ -104,6 +104,9 @@ type AcquisitionRow = {
   last_observed_at: number | null;
   last_error_at: number | null;
   last_error: string | null;
+  whisparr_id: number | null;
+  whisparr_path: string | null;
+  whisparr_title: string | null;
   created_at: number;
   updated_at: number;
 };
@@ -141,6 +144,7 @@ type Statements = {
   completeSubmissionAccepted: StatementSync;
   completeSubmissionUncertain: StatementSync;
   completeSubmissionFailed: StatementSync;
+  requeueBlocked: StatementSync;
   recordObservation: StatementSync;
   recordObservationError: StatementSync;
   releaseClaim: StatementSync;
@@ -229,6 +233,11 @@ const MIGRATIONS: Record<number, string> = {
     CREATE UNIQUE INDEX acquisitions_identity
       ON acquisitions (instance_id, provider, kind, external_id);
     CREATE INDEX acquisitions_due ON acquisitions (due_at);
+  `,
+  3: `
+    ALTER TABLE acquisitions ADD COLUMN whisparr_id INTEGER;
+    ALTER TABLE acquisitions ADD COLUMN whisparr_path TEXT;
+    ALTER TABLE acquisitions ADD COLUMN whisparr_title TEXT;
   `,
 };
 
@@ -407,8 +416,16 @@ function S(): Statements {
       completeSubmissionFailed: d.prepare(
         "UPDATE acquisitions SET state = 'failed', attempt_token = NULL, due_at = ?, last_error = ?, last_error_at = ?, updated_at = ? WHERE id = ? AND claim_token = ? AND attempt_token = ?",
       ),
+      requeueBlocked: d.prepare(
+        "UPDATE acquisitions SET state = 'unsent', due_at = ?, updated_at = ? WHERE state = 'blocked' AND claim_token IS NULL",
+      ),
       recordObservation: d.prepare(
-        "UPDATE acquisitions SET state = ?, last_observed_at = ?, due_at = ?, last_error = NULL, last_error_at = NULL, updated_at = ? WHERE id = ? AND (? IS NULL OR claim_token = ?)",
+        `UPDATE acquisitions SET state = ?, last_observed_at = ?, due_at = ?,
+           whisparr_id = COALESCE(?, whisparr_id),
+           whisparr_path = COALESCE(?, whisparr_path),
+           whisparr_title = COALESCE(?, whisparr_title),
+           last_error = NULL, last_error_at = NULL, updated_at = ?
+         WHERE id = ? AND (? IS NULL OR claim_token = ?)`,
       ),
       recordObservationError: d.prepare(
         "UPDATE acquisitions SET last_error = ?, last_error_at = ?, due_at = ?, updated_at = ? WHERE id = ? AND (? IS NULL OR claim_token = ?)",
@@ -734,6 +751,15 @@ export function saveConfig(config: IntegrationConfig): void {
         );
       }
     }
+    // Enabling delivery must revive work that was approved while it was off:
+    // 'blocked' is deliberately not schedulable, so nothing else would ever
+    // pick these rows up again.
+    if (
+      config.whisparr?.delivery?.enabled === true &&
+      current?.whisparr?.delivery?.enabled !== true
+    ) {
+      S().requeueBlocked.run(Date.now(), Date.now());
+    }
     const resolved = resolveWhisparrIdentity(current, config);
     S().updateConfig.run(
       encryptString(loadKey(), JSON.stringify(resolved)),
@@ -1007,6 +1033,9 @@ function rowToAcquisition(row: AcquisitionRow): AcquisitionRecord {
     lastObservedAt: row.last_observed_at,
     lastErrorAt: row.last_error_at,
     lastError: row.last_error,
+    whisparrId: row.whisparr_id ?? null,
+    whisparrPath: row.whisparr_path ?? null,
+    whisparrTitle: row.whisparr_title ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1147,7 +1176,12 @@ export function decideRequest(
   requestId: string,
   decision: "approved" | "declined",
 ): RequestRecord {
-  if (actor.role !== "admin" && actor.role !== "moderator") {
+  const elevated = actor.role === "admin" || actor.role === "moderator";
+  // The autoApprove grant is exactly permission to approve one's own request.
+  // Declining someone's request still requires an elevated role.
+  const selfApproving =
+    decision === "approved" && actor.autoApprove === true && !elevated;
+  if (!elevated && !selfApproving) {
     throw new AppError(403, "forbidden", "decisions require elevated role");
   }
   const d = open();
@@ -1161,6 +1195,13 @@ export function decideRequest(
         409,
         "request_not_pending",
         "only pending requests can be decided",
+      );
+    }
+    if (selfApproving && row.account_id !== actor.id) {
+      throw new AppError(
+        403,
+        "forbidden",
+        "the auto-approve grant only covers your own requests",
       );
     }
     const now = Date.now();
@@ -1210,6 +1251,24 @@ export function cancelRequest(
     S().decideRequest.run("cancelled", Date.now(), requestId);
     return rowToRequest(S().getRequest.get(requestId) as RequestRow);
   });
+}
+
+/** Shared acquisition for one identity on the configured instance, or null.
+ * Carries no per-user request history. */
+export function getAcquisitionByReference(
+  media: MediaReference,
+  instanceId?: string,
+): AcquisitionRecord | null {
+  assertMediaReference(media);
+  const instance = instanceId ?? getConfig()?.whisparr?.instanceId;
+  if (!instance) return null;
+  const row = S().getAcquisitionByIdentity.get(
+    instance,
+    media.provider,
+    media.kind,
+    media.id,
+  ) as AcquisitionRow | undefined;
+  return row ? rowToAcquisition(row) : null;
 }
 
 /** Schedulable work: due, unclaimed acquisitions ordered oldest-due first. */
@@ -1347,10 +1406,25 @@ export function recordAcquisitionObservation(
     // Imported work is terminal for scheduling; other states recheck.
     const due =
       observation.state === "imported" ? null : now + RECHECK_DELAY_MS;
+    // Validated, bounded item facts; a missing field keeps the stored value.
+    const item = observation.item;
+    const whisparrId =
+      typeof item?.whisparrId === "number" && Number.isInteger(item.whisparrId)
+        ? item.whisparrId
+        : null;
+    const whisparrPath = nonemptyString(item?.path, 4096)
+      ? (item?.path as string)
+      : null;
+    const whisparrTitle = nonemptyString(item?.title, 300)
+      ? (item?.title as string)
+      : null;
     res = S().recordObservation.run(
       observation.state,
       now,
       due,
+      whisparrId,
+      whisparrPath,
+      whisparrTitle,
       now,
       id,
       claim,

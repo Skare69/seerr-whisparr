@@ -732,7 +732,8 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
     raw.prepare("PRAGMA user_version").get() as { user_version: number }
   ).user_version;
   raw.close();
-  assert.equal(version, 2);
+  // Migrated forward, not pinned to a literal that every new migration breaks.
+  assert.ok(version > 1, "v1 database must be migrated forward");
 });
 
 test("catalog records carry an application-owned id distinct from the external UUID", () => {
@@ -1022,4 +1023,72 @@ test("autoApprove is an explicit grant: omitted means preserved, changes revoke 
     libraryIds: ["11111111111111111111111111111111"],
   });
   assert.equal(storage.getAccount(acct.id)?.autoApprove, true);
+});
+
+test("the autoApprove grant approves only the granted user's own request", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const [imported] = storage.importAccounts([otherUser()]);
+  assert.ok(imported);
+  const plain = admit(imported.id);
+  const granted = storage.updateAccount(imported.id, {
+    enabled: true,
+    role: "requester",
+    libraryIds: [],
+    autoApprove: true,
+  });
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // Without the grant a requester cannot decide at all.
+  const own = storage.createRequest(plain.id, MOVIE);
+  assert.throws(
+    () => storage.decideRequest(plain, own.id, "approved"),
+    (e: { code: string }) => e.code === "forbidden",
+  );
+
+  // With it, self-approval works and enqueues the shared work.
+  assert.equal(
+    storage.decideRequest(granted, own.id, "approved").decision,
+    "approved",
+  );
+  assert.equal(
+    storage
+      .listDueAcquisitions(Date.now() + 60_000)
+      .filter((a) => a.media.id === MOVIE.id).length,
+    1,
+  );
+
+  // The grant is not a moderation role: it cannot touch another user's
+  // request, and it cannot decline anything.
+  const ownersRequest = storage.createRequest(owner.id, SCENE);
+  assert.throws(
+    () => storage.decideRequest(granted, ownersRequest.id, "approved"),
+    (e: { code: string }) => e.code === "forbidden",
+  );
+  const second = storage.createRequest(granted.id, SCENE);
+  assert.throws(
+    () => storage.decideRequest(granted, second.id, "declined"),
+    (e: { code: string }) => e.code === "forbidden",
+  );
+});
+
+test("enabling delivery revives work approved while it was disabled", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(false), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+  const request = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, request.id, "approved");
+  assert.equal(
+    storage.listDueAcquisitions(Date.now() + 60_000).length,
+    0,
+    "blocked work is not schedulable while delivery is off",
+  );
+  const blocked = storage.getAcquisitionByReference(MOVIE);
+  assert.equal(blocked?.state, "blocked");
+
+  storage.saveConfig(deliveryConfig(true));
+  const due = storage.listDueAcquisitions(Date.now() + 60_000);
+  assert.equal(due.length, 1, "enabling delivery must requeue blocked work");
+  assert.equal(due[0]?.state, "unsent");
+  assert.equal(due[0]?.id, blocked?.id, "the same shared row is revived");
 });

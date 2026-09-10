@@ -109,6 +109,12 @@ export type AcquisitionRecord = {
   lastObservedAt: number | null;
   lastErrorAt: number | null;
   lastError: string | null;
+  /** Last observed external item facts, kept so per-user availability can be
+   * resolved without calling Whisparr on every read. Only overwritten by a
+   * successful observation. */
+  whisparrId: number | null;
+  whisparrPath: string | null;
+  whisparrTitle: string | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -118,7 +124,11 @@ export type AttemptOutcome = "accepted" | "failed" | "uncertain";
 /** Result of one external acquisition check: a real observed state, or an
  * unavailable/error check that must not touch recorded state. */
 export type AcquisitionObservation =
-  | { state: "monitoring" | "downloading" | "imported" }
+  | {
+      state: "monitoring" | "downloading" | "imported";
+      /** Observed external item facts to persist alongside the state. */
+      item?: { whisparrId?: number; path?: string; title?: string };
+    }
   | { unavailable: true; reason: string };
 
 /** Per-user playback verdict. An exact Jellyfin match plus the current user's

@@ -37,6 +37,11 @@ const MOVIES_LIB = "a".repeat(32);
 const SHOWS_LIB = "b".repeat(32);
 const ITEM_MOVIE = "1".repeat(32);
 const ITEM_SHOW = "2".repeat(32);
+const TPDB_MOVIE = "2a2b3c4d-0000-0000-0000-000000000001";
+const TPDB_MOVIE2 = "2a2b3c4d-0000-0000-0000-000000000002";
+const TPDB_MOVIE3 = "2a2b3c4d-0000-0000-0000-000000000003";
+const TPDB_MOVIE4 = "2a2b3c4d-0000-0000-0000-000000000004";
+const TPDB_PERFORMER = "2a2b3c4d-0000-0000-0000-00000000000f";
 
 interface FxUser {
   id: string;
@@ -335,13 +340,64 @@ let otherServer: Server;
 let jellyfinUrl: string;
 let whisparrUrl: string;
 let otherServerUrl: string;
+let tpdbServer: Server;
+let tpdbUrl: string;
 
-type Handler = (
-  request: Request,
-  context: { params: Promise<{ path: string[] }> },
-) => Promise<Response>;
-let api: { GET: Handler; POST: Handler; PATCH: Handler };
-let closeStorage: () => void;
+// --- M2 fixtures: TPDB metadata + artwork ---
+
+const tpdbToken = "tpdb-fixture-token";
+const tpdbFx = { fail: 0, calls: 0, imageAuth: "unset" };
+
+function tpdbMovieRow(id: string) {
+  return {
+    id,
+    title: `Fixture Movie ${id.slice(-1)}`,
+    date: "2024-02-03",
+    description: "Fixture description",
+    url: `https://theporndb.net/movies/${id}`,
+    site: { name: "Fixture Studio" },
+    posters: { full: "https://cdn.theporndb.net/fixture-poster.jpg" },
+    performers: [],
+    tags: [],
+    scenes: [],
+  };
+}
+
+async function tpdbHandler(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const url = new URL(req.url ?? "/", "http://fixture");
+  const p = url.pathname;
+  tpdbFx.calls += 1;
+  const auth = String(req.headers.authorization ?? "");
+  // Artwork pass-through: no credential may ever arrive here.
+  if (p.endsWith(".png") || p.endsWith(".jpg")) {
+    tpdbFx.imageAuth = auth;
+    res.writeHead(200, { "content-type": "image/png" });
+    res.end(Buffer.from(PNG_1PX));
+    return;
+  }
+  if (tpdbFx.fail > 0) {
+    tpdbFx.fail -= 1;
+    return json(res, 500, {});
+  }
+  if (auth !== `Bearer ${tpdbToken}`) return json(res, 401, {});
+  if (p === "/user") return json(res, 200, { data: { name: "Fixture TPDB" } });
+  if (p === "/movies") {
+    // TPDB caps unfiltered totals at the fake 10000 marker; a countable
+    // filter (q) yields a real total. Mirrors the live provider behavior.
+    const realTotal = url.searchParams.get("q") !== null;
+    return json(res, 200, {
+      data: [tpdbMovieRow(TPDB_MOVIE)],
+      meta: { total: realTotal ? 1 : 10000 },
+      links: {},
+    });
+  }
+  if (p === `/movies/${TPDB_MOVIE}`)
+    return json(res, 200, { data: tpdbMovieRow(TPDB_MOVIE) });
+  json(res, 404, {});
+}
 
 function listen(
   handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
@@ -366,6 +422,23 @@ function segments(pathname: string): string[] {
     .split("/")
     .map((part) => decodeURIComponent(part));
 }
+
+type Handler = (
+  request: Request,
+  context: { params: Promise<{ path: string[] }> },
+) => Promise<Response>;
+let api: { GET: Handler; POST: Handler; PATCH: Handler };
+let closeStorage: () => void;
+let getAcquisitionByReference: (media: {
+  provider: "tpdb" | "stashdb";
+  kind: "movie" | "scene";
+  id: string;
+}) => { id: string } | null;
+let recordAcquisitionObservation: (
+  id: string,
+  observation: unknown,
+  claimToken?: string,
+) => unknown;
 
 async function call(
   method: "GET" | "POST" | "PATCH",
@@ -434,6 +507,7 @@ before(async () => {
     await listen(jellyfinHandler));
   ({ server: whisparrServer, url: whisparrUrl } =
     await listen(whisparrHandler));
+  ({ server: tpdbServer, url: tpdbUrl } = await listen(tpdbHandler));
   ({ server: otherServer, url: otherServerUrl } = await listen(
     differentServerHandler,
   ));
@@ -452,13 +526,29 @@ before(async () => {
   const storageHref = pathToFileURL(
     fileURLToPath(new URL("../src/server/storage.ts", import.meta.url)),
   ).href;
-  ({ closeStorage } = (await import(storageHref)) as {
-    closeStorage: () => void;
-  });
+  ({ closeStorage, getAcquisitionByReference, recordAcquisitionObservation } =
+    (await import(storageHref)) as {
+      closeStorage: () => void;
+      getAcquisitionByReference: (media: {
+        provider: "tpdb" | "stashdb";
+        kind: "movie" | "scene";
+        id: string;
+      }) => { id: string } | null;
+      recordAcquisitionObservation: (
+        id: string,
+        observation: unknown,
+        claimToken?: string,
+      ) => unknown;
+    });
 });
 
 after(() => {
-  for (const server of [jellyfinServer, whisparrServer, otherServer]) {
+  for (const server of [
+    jellyfinServer,
+    whisparrServer,
+    tpdbServer,
+    otherServer,
+  ]) {
     server.closeAllConnections?.();
     server.close();
   }
@@ -1068,4 +1158,653 @@ test("login admission: outsider denied, logout revokes immediately", async () =>
   assert.deepEqual(await out.json(), { ok: true });
   assert.match(out.headers.get("set-cookie") ?? "", /velvarr_session=/);
   assert.equal((await call("GET", "/api/me", { cookie: member })).status, 401);
+});
+
+// --- M2 phase 3: catalog, requests, availability ---
+test("catalog search: auth, filter combos, honest totals, outage honesty", async () => {
+  const anon = await call(
+    "GET",
+    "/api/catalog/search?provider=tpdb&kind=movie",
+  );
+  assert.equal(anon.status, 401);
+
+  // member's session was revoked by the logout test; re-establish it once
+  // for the whole M2 block.
+  member = await loginAs("member");
+
+  // Providers read credentials and base at call time; point them at the fixture.
+  process.env.TPDB_API_TOKEN = tpdbToken;
+  process.env.TPDB_BASE_URL = tpdbUrl;
+
+  // Fake-capped TPDB total: totalCountKnown false, no total leaked.
+  const unfiltered = await call(
+    "GET",
+    "/api/catalog/search?provider=tpdb&kind=movie",
+    {
+      cookie: member,
+    },
+  );
+  assert.equal(unfiltered.status, 200);
+  const page = (await unfiltered.json()) as {
+    totalCountKnown: boolean;
+    total?: number;
+    hasMore: boolean;
+    items: { reference: { provider: string; kind: string; id: string } }[];
+  };
+  assert.equal(page.totalCountKnown, false);
+  assert.equal(page.total, undefined);
+  assert.equal(page.hasMore, false);
+  assert.deepEqual(page.items[0]?.reference, {
+    provider: "tpdb",
+    kind: "movie",
+    id: TPDB_MOVIE,
+  });
+
+  // Countable filter: real total passes through honestly.
+  const filtered = await call(
+    "GET",
+    "/api/catalog/search?provider=tpdb&kind=movie&q=Fixture",
+    { cookie: member },
+  );
+  const filteredBody = (await filtered.json()) as {
+    totalCountKnown: boolean;
+    total?: number;
+  };
+  assert.equal(filteredBody.totalCountKnown, true);
+  assert.equal(filteredBody.total, 1);
+
+  // Unsupported provider+kind+filter combinations: explicit errors, never
+  // silent ignores.
+  for (const query of [
+    "provider=stashdb&kind=movie",
+    "provider=stashdb&kind=scene&year=2020",
+    "provider=tpdb&kind=movie&year=1800",
+    "provider=tpdb&kind=performer",
+    "provider=tpdb&kind=performer&q=x&year=2020",
+    `provider=tpdb&kind=performer&q=x&performer=${TPDB_PERFORMER}`,
+    "provider=stashdb&kind=performer&q=x&page=2",
+    "provider=tpdb&kind=scene&performer=",
+    "provider=junk&kind=movie",
+    "provider=tpdb&kind=movie&page=0",
+    "provider=tpdb&kind=movie&perPage=101",
+  ]) {
+    const res = await call("GET", `/api/catalog/search?${query}`, {
+      cookie: member,
+    });
+    await errorShape(res);
+  }
+
+  // Outage: an explicit error, never an empty result set.
+  tpdbFx.fail = 1;
+  const outage = await call(
+    "GET",
+    "/api/catalog/search?provider=tpdb&kind=movie",
+    {
+      cookie: member,
+    },
+  );
+  const err = await errorShape(outage, 500);
+  assert.equal(err.code, "upstream_unavailable");
+});
+
+test("catalog detail: validation before upstream, absence vs outage, own request only", async () => {
+  const anon = await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`);
+  assert.equal(anon.status, 401);
+
+  // Invalid provider/kind/UUID never reaches the provider.
+  const callsBefore = tpdbFx.calls;
+  await errorShape(
+    await call("GET", "/api/catalog/tpdb/movie/not-a-uuid", { cookie: member }),
+  );
+  await errorShape(
+    await call("GET", `/api/catalog/junk/movie/${TPDB_MOVIE}`, {
+      cookie: member,
+    }),
+  );
+  await errorShape(
+    await call("GET", `/api/catalog/stashdb/movie/${TPDB_MOVIE}`, {
+      cookie: member,
+    }),
+  );
+  assert.equal(tpdbFx.calls, callsBefore);
+
+  const detail = await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`, {
+    cookie: member,
+  });
+  assert.equal(detail.status, 200);
+  const body = (await detail.json()) as {
+    detail: { reference: { id: string }; title: string };
+    link: { unlinkedReason?: string };
+    catalogRecord: { id: string; reference: { id: string } };
+    myRequest: { decision: string } | null;
+    acquisition: { state: string } | null;
+  };
+  assert.equal(body.detail.reference.id, TPDB_MOVIE);
+  assert.equal(body.detail.title.length > 0, true);
+  // Media is never linked across providers; the reason is explicit.
+  assert.equal(typeof body.link.unlinkedReason, "string");
+  assert.ok(body.catalogRecord.id);
+  assert.equal(body.catalogRecord.reference.id, TPDB_MOVIE);
+  assert.equal(body.myRequest, null);
+  assert.equal(body.acquisition, null);
+
+  // Authoritative absence is 404 with a distinct code; outage is an error.
+  const missing = await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE2}`, {
+    cookie: member,
+  });
+  assert.equal(missing.status, 404);
+  assert.equal(
+    ((await missing.json()) as { error: { code: string } }).error.code,
+    "catalog_not_found",
+  );
+  tpdbFx.fail = 1;
+  await errorShape(
+    await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`, {
+      cookie: member,
+    }),
+    500,
+  );
+});
+
+test("catalog artwork proxy: provider-only, no credentials, no-store", async () => {
+  const target = encodeURIComponent(`${tpdbUrl}/fixture-artwork.png`);
+  const anon = await call("GET", `/api/catalog/image?url=${target}`);
+  assert.equal(anon.status, 401);
+
+  // Non-provider hosts and credential-bearing URLs are rejected before fetch.
+  await errorShape(
+    await call(
+      "GET",
+      `/api/catalog/image?url=${encodeURIComponent("https://evil.example/art.png")}`,
+      { cookie: member },
+    ),
+  );
+  await errorShape(
+    await call(
+      "GET",
+      `/api/catalog/image?url=${encodeURIComponent(
+        "https://user:pass@cdn.theporndb.net/art.png",
+      )}`,
+      { cookie: member },
+    ),
+  );
+  await errorShape(await call("GET", "/api/catalog/image", { cookie: member }));
+  assert.equal(tpdbFx.imageAuth, "unset");
+
+  const ok = await call("GET", `/api/catalog/image?url=${target}`, {
+    cookie: member,
+  });
+  assert.equal(ok.status, 200);
+  assert.match(ok.headers.get("content-type") ?? "", /^image\//);
+  assert.equal(ok.headers.get("cache-control"), "private, no-store");
+  assert.equal(ok.headers.get("x-content-type-options"), "nosniff");
+  assert.deepEqual(new Uint8Array(await ok.arrayBuffer()), PNG_1PX);
+  // No Velvarr or provider credential reached the image host.
+  assert.equal(tpdbFx.imageAuth, "");
+});
+
+test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
+  // Re-establish Whisparr (removed by the rotation test) with delivery settings.
+  const readd = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body: {
+      password: "pass-owner",
+      jellyfinUrl,
+      jellyfinExternalUrl: jellyfinUrl,
+      whisparrUrl,
+      whisparrApiKey: whisparrKey,
+      delivery: {
+        enabled: true,
+        rootFolderPath: "/movies",
+        qualityProfileId: 1,
+        searchOnAdd: true,
+      },
+      pathMappings: [
+        { whisparrPrefix: "/data/whisparr", jellyfinPrefix: "/media" },
+      ],
+    },
+  });
+  assert.equal(readd.status, 200);
+  const shape = (await readd.json()) as {
+    whisparr: {
+      delivery: { enabled: boolean; rootFolderPath: string } | null;
+      pathMappings: { whisparrPrefix: string }[];
+    };
+  };
+  assert.equal(shape.whisparr.delivery?.enabled, true);
+  assert.equal(shape.whisparr.delivery?.rootFolderPath, "/movies");
+  assert.deepEqual(shape.whisparr.pathMappings, [
+    { whisparrPrefix: "/data/whisparr", jellyfinPrefix: "/media" },
+  ]);
+
+  // Delivery validation: enabled requires a root folder; ids must be positive.
+  await errorShape(
+    await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: {
+        password: "pass-owner",
+        jellyfinUrl,
+        jellyfinExternalUrl: jellyfinUrl,
+        delivery: {
+          enabled: true,
+          rootFolderPath: "",
+          qualityProfileId: 1,
+          searchOnAdd: true,
+        },
+      },
+    }),
+  );
+  await errorShape(
+    await call("PATCH", "/api/admin/integrations", {
+      cookie: owner,
+      body: {
+        password: "pass-owner",
+        jellyfinUrl,
+        jellyfinExternalUrl: jellyfinUrl,
+        delivery: {
+          enabled: true,
+          rootFolderPath: "/movies",
+          qualityProfileId: 0,
+          searchOnAdd: true,
+        },
+      },
+    }),
+  );
+
+  // Real provider verification on the admin surface; unconfigured stays honest.
+  const providers = await call("GET", "/api/admin/providers", {
+    cookie: owner,
+  });
+  assert.equal(providers.status, 200);
+  const providersBody = (await providers.json()) as {
+    providers: {
+      provider: string;
+      configured: boolean;
+      verified?: boolean;
+      account?: string;
+    }[];
+  };
+  const tpdb = providersBody.providers.find((p) => p.provider === "tpdb");
+  assert.equal(tpdb?.configured, true);
+  assert.equal(tpdb?.verified, true);
+  assert.equal(tpdb?.account, "Fixture TPDB");
+  const stashdb = providersBody.providers.find((p) => p.provider === "stashdb");
+  assert.equal(stashdb?.configured, false);
+  assert.equal((await call("GET", "/api/admin/providers")).status, 401);
+
+  // Unauthenticated and cross-origin mutations are rejected.
+  const media = { provider: "tpdb", kind: "movie", id: TPDB_MOVIE };
+  assert.equal(
+    (await call("POST", "/api/requests", { body: { media } })).status,
+    401,
+  );
+  await errorShape(
+    await call("POST", "/api/requests", {
+      origin: null,
+      cookie: member,
+      body: { media },
+    }),
+    403,
+  );
+
+  // Forged payloads: only the server-validated reference is stored.
+  await errorShape(
+    await call("POST", "/api/requests", {
+      cookie: member,
+      body: { media: { provider: "tpdb", kind: "movie", id: "not-a-uuid" } },
+    }),
+  );
+  await errorShape(
+    await call("POST", "/api/requests", {
+      cookie: member,
+      body: {
+        media: { provider: "tpdb", kind: "performer", id: TPDB_PERFORMER },
+      },
+    }),
+  );
+
+  // Plain requester: 201 pending.
+  const created = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media },
+  });
+  assert.equal(created.status, 201);
+  const createdBody = (await created.json()) as {
+    request: { id: string; decision: string };
+    autoApproved?: boolean;
+  };
+  assert.equal(createdBody.request.decision, "pending");
+  assert.equal(createdBody.autoApproved, undefined);
+  const memberRequestId = createdBody.request.id;
+
+  // Duplicate active intent is an honest 409.
+  const dup = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media },
+  });
+  assert.equal(dup.status, 409);
+  assert.equal(
+    ((await dup.json()) as { error: { code: string } }).error.code,
+    "request_exists",
+  );
+
+  // member2 (no grant yet): own request stays pending.
+  const m2 = await loginAs("member2");
+  const m2Created = await call("POST", "/api/requests", {
+    cookie: m2,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE2 } },
+  });
+  assert.equal(m2Created.status, 201);
+  const m2RequestId = ((await m2Created.json()) as { request: { id: string } })
+    .request.id;
+
+  // Role enforcement: requesters cannot decide, own or foreign.
+  await errorShape(
+    await call("PATCH", `/api/requests/${memberRequestId}`, {
+      cookie: member,
+      body: { decision: "approved" },
+    }),
+    403,
+  );
+  await errorShape(
+    await call("PATCH", `/api/requests/${memberRequestId}`, {
+      cookie: m2,
+      body: { decision: "approved" },
+    }),
+    403,
+  );
+
+  // Privacy: member2 sees only their own list entry.
+  const m2List = await call("GET", "/api/requests", { cookie: m2 });
+  assert.deepEqual(
+    ((await m2List.json()) as { requests: { id: string }[] }).requests.map(
+      (r) => r.id,
+    ),
+    [m2RequestId],
+  );
+  // The owner sees all requests.
+  const ownerIds = (
+    (await (await call("GET", "/api/requests", { cookie: owner })).json()) as {
+      requests: { id: string }[];
+    }
+  ).requests.map((r) => r.id);
+  assert.ok(ownerIds.includes(memberRequestId));
+  assert.ok(ownerIds.includes(m2RequestId));
+
+  // Detail: the caller's own decision only; no acquisition before approval.
+  const detailForMember = await call(
+    "GET",
+    `/api/catalog/tpdb/movie/${TPDB_MOVIE}`,
+    { cookie: member },
+  );
+  const detailMemberBody = (await detailForMember.json()) as {
+    myRequest: { decision: string } | null;
+    acquisition: { state: string } | null;
+  };
+  assert.equal(detailMemberBody.myRequest?.decision, "pending");
+  assert.equal(detailMemberBody.acquisition, null);
+  const detailForM2 = await call(
+    "GET",
+    `/api/catalog/tpdb/movie/${TPDB_MOVIE}`,
+    { cookie: m2 },
+  );
+  assert.equal(
+    ((await detailForM2.json()) as { myRequest: unknown }).myRequest,
+    null,
+  );
+
+  // Owner approves: shared acquisition state visible to both viewers, while
+  // myRequest stays per-user.
+  const approve = await call("PATCH", `/api/requests/${memberRequestId}`, {
+    cookie: owner,
+    body: { decision: "approved" },
+  });
+  assert.equal(approve.status, 200);
+  const afterBody = (await (
+    await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`, {
+      cookie: member,
+    })
+  ).json()) as {
+    myRequest: { decision: string } | null;
+    acquisition: { state: string } | null;
+  };
+  assert.equal(afterBody.myRequest?.decision, "approved");
+  assert.equal(afterBody.acquisition?.state, "unsent");
+  const sharedForM2 = (await (
+    await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`, { cookie: m2 })
+  ).json()) as { acquisition: { state: string } | null };
+  assert.equal(sharedForM2.acquisition?.state, "unsent");
+
+  // Owner declines member2's pending request.
+  const decline = await call("PATCH", `/api/requests/${m2RequestId}`, {
+    cookie: owner,
+    body: { decision: "declined" },
+  });
+  assert.equal(decline.status, 200);
+  assert.equal(
+    ((await decline.json()) as { request: { decision: string } }).request
+      .decision,
+    "declined",
+  );
+
+  // Cancel: own pending only; a foreign cancel is a bare 404 with no leak.
+  const m2Second = await call("POST", "/api/requests", {
+    cookie: m2,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE2 } },
+  });
+  assert.equal(m2Second.status, 201);
+  const m2SecondId = ((await m2Second.json()) as { request: { id: string } })
+    .request.id;
+  const foreignCancel = await call("PATCH", `/api/requests/${m2SecondId}`, {
+    cookie: member,
+    body: { decision: "cancelled" },
+  });
+  assert.equal(foreignCancel.status, 404);
+  assert.equal(
+    ((await foreignCancel.json()) as { error: { code: string } }).error.code,
+    "request_not_found",
+  );
+  assert.equal(
+    (
+      await call("PATCH", `/api/requests/${m2SecondId}`, {
+        cookie: m2,
+        body: { decision: "cancelled" },
+      })
+    ).status,
+    200,
+  );
+  // Storage allows cancelling pending|approved; cancelling an already
+  // cancelled request is the faithful 409.
+  const cancelAgain = await call("PATCH", `/api/requests/${m2SecondId}`, {
+    cookie: m2,
+    body: { decision: "cancelled" },
+  });
+  assert.equal(cancelAgain.status, 409);
+  assert.equal(
+    ((await cancelAgain.json()) as { error: { code: string } }).error.code,
+    "request_not_cancellable",
+  );
+  await errorShape(
+    await call("PATCH", `/api/requests/${memberRequestId}`, {
+      cookie: owner,
+      body: { decision: "nope" },
+    }),
+  );
+  assert.equal(
+    (
+      await call("PATCH", `/api/requests/${memberRequestId}`, {
+        body: { decision: "approved" },
+      })
+    ).status,
+    401,
+  );
+  await errorShape(
+    await call("PATCH", `/api/requests/${memberRequestId}`, {
+      origin: "https://evil.example",
+      cookie: owner,
+      body: { decision: "declined" },
+    }),
+    403,
+  );
+
+  // autoApprove grant: the request auto-decides approved and enqueues work.
+  // Uses the nogrants account: member2's login bucket is spent, and a grant
+  // change revokes the target's sessions by design, so a fresh login is
+  // part of the flow.
+  const grant = await call("PATCH", `/api/admin/users/${NOGRANT_ID}`, {
+    cookie: owner,
+    body: {
+      enabled: true,
+      role: "requester",
+      libraryIds: [],
+      autoApprove: true,
+    },
+  });
+  assert.equal(grant.status, 200);
+  assert.equal(
+    ((await grant.json()) as { account: { autoApprove: boolean } }).account
+      .autoApprove,
+    true,
+  );
+  const autoCookie = await loginAs("nogrants");
+  const auto = await call("POST", "/api/requests", {
+    cookie: autoCookie,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE3 } },
+  });
+  assert.equal(auto.status, 201);
+  const autoBody = (await auto.json()) as {
+    request: { decision: string };
+    autoApproved: boolean;
+  };
+  assert.equal(autoBody.autoApproved, true);
+  assert.equal(autoBody.request.decision, "approved");
+  assert.ok(
+    getAcquisitionByReference({
+      provider: "tpdb",
+      kind: "movie",
+      id: TPDB_MOVIE3,
+    }),
+  );
+});
+
+test("availability: distinct verdicts under the caller's own token", async () => {
+  assert.equal(
+    (await call("GET", `/api/availability/tpdb/movie/${TPDB_MOVIE}`)).status,
+    401,
+  );
+
+  // Worker-equivalent: persist observed Whisparr facts on the shared
+  // acquisition; the availability route must read them, never call Whisparr.
+  const acq = getAcquisitionByReference({
+    provider: "tpdb",
+    kind: "movie",
+    id: TPDB_MOVIE,
+  });
+  assert.ok(acq);
+  recordAcquisitionObservation(acq.id, {
+    state: "monitoring",
+    item: {
+      whisparrId: 77,
+      path: `/media/${ITEM_MOVIE}.mkv`,
+      title: "Alpha Movie",
+    },
+  });
+
+  // available: exact path correspondence, granted library, playable source.
+  const available = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE}`,
+    { cookie: member },
+  );
+  assert.equal(available.status, 200);
+  const availableBody = (await available.json()) as {
+    outcome: string;
+    item?: { id: string };
+  };
+  assert.equal(availableBody.outcome, "available");
+  assert.equal(availableBody.item?.id, ITEM_MOVIE);
+
+  // denied: no granted libraries for this caller.
+  fx.grants.set(NOGRANT_ID, []);
+  const noGrantCookie = await loginAs("nogrants");
+  const denied = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE}`,
+    { cookie: noGrantCookie },
+  );
+  assert.equal(
+    ((await denied.json()) as { outcome: string }).outcome,
+    "denied",
+  );
+
+  // ambiguous: title-only similarity is never upgraded to a guess.
+  const acq3Req = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE3 } },
+  });
+  assert.equal(acq3Req.status, 201);
+  const acq3Id = ((await acq3Req.json()) as { request: { id: string } }).request
+    .id;
+  await call("PATCH", `/api/requests/${acq3Id}`, {
+    cookie: owner,
+    body: { decision: "approved" },
+  });
+  const acq3 = getAcquisitionByReference({
+    provider: "tpdb",
+    kind: "movie",
+    id: TPDB_MOVIE3,
+  });
+  assert.ok(acq3);
+  recordAcquisitionObservation(acq3.id, {
+    state: "monitoring",
+    item: { title: "Alpha Movie" },
+  });
+  const ambiguous = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE3}`,
+    { cookie: member },
+  );
+  assert.equal(
+    ((await ambiguous.json()) as { outcome: string }).outcome,
+    "ambiguous",
+  );
+
+  // missing: known identity, nothing on the media server.
+  const m4Req = await call("POST", "/api/requests", {
+    cookie: member,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE4 } },
+  });
+  const m4Id = ((await m4Req.json()) as { request: { id: string } }).request.id;
+  await call("PATCH", `/api/requests/${m4Id}`, {
+    cookie: owner,
+    body: { decision: "approved" },
+  });
+  const missing = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    { cookie: member },
+  );
+  assert.equal(
+    ((await missing.json()) as { outcome: string }).outcome,
+    "missing",
+  );
+
+  // unavailable: an upstream failure is never reported as missing.
+  fx.fail.items = 1;
+  const unavailable = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    { cookie: member },
+  );
+  assert.equal(
+    ((await unavailable.json()) as { outcome: string }).outcome,
+    "unavailable",
+  );
+
+  // Performers are not requestable/available media.
+  await errorShape(
+    await call("GET", `/api/availability/tpdb/performer/${TPDB_PERFORMER}`, {
+      cookie: member,
+    }),
+  );
 });
