@@ -1326,6 +1326,26 @@ test("integration rotation: no re-auth, pinned server, whisparr add/remove", asy
     true,
   );
 
+  // A key without a URL is contradictory: the URL is the connection. Blank
+  // URL alone removes Whisparr; key + blank URL is rejected, never dropped.
+  const keyNoUrl = await call("PATCH", "/api/admin/integrations", {
+    cookie: owner,
+    body: {
+      jellyfinUrl,
+      jellyfinExternalUrl: external,
+      whisparrUrl: "",
+      whisparrApiKey: whisparrKey,
+    },
+  });
+  await errorShape(keyNoUrl, 400);
+  const stillThere = await call("GET", "/api/admin/whisparr", {
+    cookie: owner,
+  });
+  assert.equal(
+    ((await stillThere.json()) as { configured: boolean }).configured,
+    true,
+  );
+
   const remove = await call("PATCH", "/api/admin/integrations", {
     cookie: owner,
     body: {

@@ -706,6 +706,12 @@ async function adminUpdateIntegrations(
   const whisparrUrl = optionalText(body, "whisparrUrl", 2048);
   if (whisparrUrl !== undefined) {
     if (whisparrUrl === "") {
+      if (optionalText(body, "whisparrApiKey", 512) !== undefined)
+        throw new AppError(
+          400,
+          "invalid_field",
+          "A Whisparr API key requires a Whisparr URL; clear the key to remove Whisparr.",
+        );
       whisparr = undefined;
     } else {
       const whisparrApiKey = optionalText(body, "whisparrApiKey", 512);
@@ -826,10 +832,35 @@ async function adminUpdateIntegrations(
 }
 
 async function adminWhisparr(ctx: AuthContext): Promise<Response> {
-  return json(await getWhisparrStatus(ctx.config));
+  try {
+    return json(await getWhisparrStatus(ctx.config));
+  } catch (err) {
+    // Upstream rejection or outage is status information, never a dead
+    // Velvarr session: an HTTP 401 here would fire the client's global
+    // sign-out and bounce the admin off the settings page in a loop.
+    if (err instanceof AppError && err.status >= 400) {
+      return json({
+        configured: true,
+        error: { code: err.code, message: err.message },
+      });
+    }
+    throw err;
+  }
 }
 async function adminJellyfin(ctx: AuthContext): Promise<Response> {
-  return json(await getJellyfinStatus(ctx.config));
+  try {
+    return json(await getJellyfinStatus(ctx.config));
+  } catch (err) {
+    // Same as the Whisparr probe: upstream rejection is status information,
+    // not a dead Velvarr session.
+    if (err instanceof AppError && err.status >= 400) {
+      return json({
+        configured: true,
+        error: { code: err.code, message: err.message },
+      });
+    }
+    throw err;
+  }
 }
 
 // --- catalog, requests, availability ---

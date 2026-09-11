@@ -1635,8 +1635,18 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
       setError("Jellyfin URL and external URL are required.");
       return;
     }
+    if (!hasUrl && whisparrApiKey.trim() !== "") {
+      setError(
+        "A Whisparr API key needs the Whisparr URL — the URL is the connection, the key authenticates it.",
+      );
+      return;
+    }
     const profile = Number(effectiveProfile);
-    if (hasUrl && (!Number.isInteger(profile) || profile < 1)) {
+    if (
+      hasUrl &&
+      (deliveryEnabled || info?.whisparr?.delivery) &&
+      (!Number.isInteger(profile) || profile < 1)
+    ) {
       setError("Choose a quality profile (a positive whole number).");
       return;
     }
@@ -1660,10 +1670,11 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
           ...(jellyfinApiKey ? { jellyfinApiKey } : {}),
           whisparrUrl: whisparrUrl.trim(),
           ...(whisparrApiKey ? { whisparrApiKey } : {}),
-          // Always sent with a Whisparr URL: the server stores delivery on the
-          // connection wholesale, so an omitted key on a re-saved URL would
-          // silently drop the configured delivery.
-          ...(hasUrl
+          // Delivery travels only when it exists on either side: enabled now,
+          // or previously configured (an omitted key would drop it wholesale).
+          // A first-time save with delivery off stores none — profiles and
+          // roots can be chosen after the connection probe succeeds.
+          ...(hasUrl && (deliveryEnabled || info?.whisparr?.delivery)
             ? {
                 delivery: {
                   enabled: deliveryEnabled,
