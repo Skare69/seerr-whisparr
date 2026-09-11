@@ -702,7 +702,7 @@ const DECISION_TEXT: Record<RequestDecision, string> = {
   cancelled: "Request cancelled",
 };
 
-function acquisitionText(a: {
+export function acquisitionText(a: {
   state: AcquisitionState;
   lastError: string | null;
 }): string {

@@ -1559,6 +1559,7 @@ test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
       ],
     },
   });
+  if (readd.status !== 200) console.error("READDBODY", await readd.text());
   assert.equal(readd.status, 200);
   const shape = (await readd.json()) as {
     whisparr: {
@@ -1770,6 +1771,24 @@ test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
   ).json()) as { acquisition: { state: string } | null };
   assert.equal(sharedForM2.acquisition?.state, "unsent");
 
+  // The requests LIST carries the shared acquisition state on approved rows
+  // only: the requester can watch progress without another user's history.
+  const listed = (await (
+    await call("GET", "/api/requests", { cookie: member })
+  ).json()) as {
+    requests: {
+      decision: string;
+      acquisition: { state: string } | null;
+    }[];
+  };
+  const approvedRow = listed.requests.find((r) => r.decision === "approved");
+  assert.equal(approvedRow?.acquisition?.state, "unsent");
+  assert.ok(
+    listed.requests
+      .filter((r) => r.decision !== "approved")
+      .every((r) => r.acquisition === null),
+  );
+
   // Owner declines member2's pending request.
   const decline = await call("PATCH", `/api/requests/${m2RequestId}`, {
     cookie: owner,
@@ -1840,6 +1859,24 @@ test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
       body: { decision: "declined" },
     }),
     403,
+  );
+  // A terminal decision (decline, cancel) never blocks re-requesting: the
+  // detail vacates the myRequest slot (button re-offered) and a fresh POST
+  // creates a new pending row instead of 409. m2's TPDB_MOVIE request was
+  // declined above; the provider fixture serves that movie's detail.
+  const afterDecline = (await (
+    await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`, { cookie: m2 })
+  ).json()) as { myRequest: unknown };
+  assert.equal(afterDecline.myRequest, null);
+  const reRequest = await call("POST", "/api/requests", {
+    cookie: m2,
+    body: { media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE } },
+  });
+  assert.equal(reRequest.status, 201);
+  assert.equal(
+    ((await reRequest.json()) as { request: { decision: string } }).request
+      .decision,
+    "pending",
   );
 
   // autoApprove grant: the request auto-decides approved and enqueues work.

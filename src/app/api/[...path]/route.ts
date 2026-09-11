@@ -1400,7 +1400,13 @@ async function catalogDetail(
   // state; never another user's request history.
   const mine = media
     ? (listRequests(ctx.account).find(
-        (r) => r.accountId === ctx.account.id && sameMedia(r.media, media),
+        (r) =>
+          r.accountId === ctx.account.id &&
+          sameMedia(r.media, media) &&
+          // Terminal decisions (cancelled, declined) never block a fresh
+          // request: they hide the button only if counted here. History
+          // stays on the Requests page.
+          (r.decision === "pending" || r.decision === "approved"),
       ) ?? null)
     : null;
   const acquisition = media ? getAcquisitionByReference(media) : null;
@@ -1493,8 +1499,24 @@ async function createRequestRoute(request: Request): Promise<Response> {
 
 async function listRequestsRoute(request: Request): Promise<Response> {
   const ctx = await requireSession(request);
-  // Storage role-filters: a requester sees only their own history.
-  return json({ requests: listRequests(ctx.account) });
+  // Storage role-filters: a requester sees only their own history. Approved
+  // rows carry the SHARED acquisition state for their identity, so the
+  // requester can see whether the work actually went through — without
+  // exposing anyone else's request history.
+  const requests = listRequests(ctx.account).map((r) => {
+    if (r.decision !== "approved") return r;
+    const a = getAcquisitionByReference(r.media);
+    return {
+      ...r,
+      acquisition: a && {
+        state: a.state,
+        lastError: a.lastError,
+        updatedAt: a.updatedAt,
+        observationStale: isObservationStale(a),
+      },
+    };
+  });
+  return json({ requests });
 }
 
 async function decideRequestRoute(

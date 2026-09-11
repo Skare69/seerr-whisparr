@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api, ErrorPanel, messageOf, useSession } from "./shared";
+import { acquisitionText } from "./catalog";
 import type {
+  AcquisitionState,
   MediaReference,
   ProviderStatus,
   RequestDecision,
@@ -11,9 +13,9 @@ import type {
 
 /* Facts displayed per row, kept visibly separate:
  *  1. Decision  — one user's intent (this list, from RequestRecord).
- *  2. Acquisition — shared work several requests attach to. GET /api/requests
- *     returns RequestRecord[] only, so the list never has an acquisition state
- *     to show; it is surfaced on the catalog detail, never invented here.
+ *  2. Acquisition — shared work several requests attach to. Approved rows
+ *     carry the shared acquisition state (GET /api/requests enriches them),
+ *     so the requester can see whether the work went through.
  *  3. Playback — per-user; resolved on the catalog detail, never here.
  * Cancelling removes only the request (intent) and never shared media — stated
  * in the visible note below. */
@@ -120,9 +122,9 @@ function detailHref(media: MediaReference): string {
   const view = media.kind === "movie" ? "movies" : "scenes";
   return `/?view=${view}&provider=${media.provider}&kind=${media.kind}&id=${encodeURIComponent(media.id)}`;
 }
-
 function RequestRow({
   record,
+  acquisition,
   canApprove,
   canDecline,
   canCancel,
@@ -132,6 +134,12 @@ function RequestRow({
   rowError,
 }: {
   record: RequestRecord;
+  acquisition: {
+    state: AcquisitionState;
+    lastError: string | null;
+    updatedAt: number;
+    observationStale: boolean;
+  } | null;
   canApprove: boolean;
   canDecline: boolean;
   canCancel: boolean;
@@ -158,6 +166,11 @@ function RequestRow({
               ? ` · Decided ${DATE_FMT.format(new Date(r.decidedAt))}`
               : ""}
           </p>
+          {acquisition && (
+            <p className="mt-1 text-xs text-muted">
+              Acquisition status: {acquisitionText(acquisition)}
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span
@@ -209,9 +222,18 @@ function RequestRow({
   );
 }
 
+type Row = RequestRecord & {
+  acquisition: {
+    state: AcquisitionState;
+    lastError: string | null;
+    updatedAt: number;
+    observationStale: boolean;
+  } | null;
+};
+
 export function RequestsView() {
   const { account, providers } = useSession();
-  const [requests, setRequests] = useState<RequestRecord[] | null>(null);
+  const [rows, setRows] = useState<Row[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const busyRef = useRef(false);
@@ -223,11 +245,10 @@ export function RequestsView() {
 
   const isStaff = account.role === "admin" || account.role === "moderator";
 
-  // Re-read after every successful decision — the UI never guesses a result.
   const load = useCallback(() => {
     setError(null);
-    api<{ requests: RequestRecord[] }>("/api/requests")
-      .then((d) => setRequests(d.requests))
+    api<{ requests: Row[] }>("/api/requests")
+      .then((d) => setRows(d.requests))
       .catch((e: unknown) => setError(messageOf(e)));
   }, []);
 
@@ -267,11 +288,11 @@ export function RequestsView() {
     () =>
       GROUP_ORDER.map((decision) => ({
         decision,
-        items: (requests ?? [])
-          .filter((r) => r.decision === decision)
+        items: (rows ?? [])
+          .filter((row) => row.decision === decision)
           .sort((a, b) => b.createdAt - a.createdAt),
       })).filter((g) => g.items.length > 0),
-    [requests],
+    [rows],
   );
 
   let content;
@@ -280,7 +301,7 @@ export function RequestsView() {
     content = (
       <ErrorPanel title="Requests unavailable" message={error} onRetry={load} />
     );
-  } else if (requests === null) {
+  } else if (rows === null) {
     content = (
       <>
         <div className="sr-only" role="status">
@@ -293,7 +314,7 @@ export function RequestsView() {
         </div>
       </>
     );
-  } else if (requests.length === 0) {
+  } else if (rows.length === 0) {
     content = (
       <div className="panel p-8 text-center text-sm text-muted">
         {isStaff
@@ -310,19 +331,20 @@ export function RequestsView() {
               id={`requests-${g.decision}`}
               className="mb-3 text-lg font-semibold"
             >
-              {GROUP_LABEL[g.decision]}{" "}
               <span className="text-sm font-normal text-muted">
                 ({g.items.length})
               </span>
             </h2>
             <ul className="grid gap-3">
-              {g.items.map((r) => {
+              {g.items.map((row) => {
+                const r = row;
                 const mine = r.accountId === account.id;
                 const pending = r.decision === "pending";
                 return (
                   <RequestRow
                     key={r.id}
                     record={r}
+                    acquisition={row.acquisition}
                     providers={providers}
                     busy={busyId !== null}
                     rowError={rowError}
