@@ -310,6 +310,11 @@ test("stashdb scene detail maps performers, clamps duration, drops absurd values
           details: "Fixture details.",
           date: "2026-10-08",
           duration: 99_999_999, // absurd -> dropped
+          images: [
+            {
+              url: "https://stashdb.org/images/d695a097-3cf5-41c6-bf00-be5c7bc185b8",
+            },
+          ],
           urls: [
             {
               url: "https://r18.dev/videos/vod/movies/detail/-/id=1start602",
@@ -363,6 +368,10 @@ test("stashdb scene detail maps performers, clamps duration, drops absurd values
     assert.equal(detail.title, "START-602");
     assert.equal(detail.releaseDate, "2026-10-08");
     assert.equal(detail.durationSeconds, undefined); // absurd duration dropped
+    assert.equal(
+      detail.imageUrl,
+      "https://stashdb.org/images/d695a097-3cf5-41c6-bf00-be5c7bc185b8",
+    );
     assert.equal(detail.studio?.name, "SOD Create");
     assert.deepEqual(detail.tags, [
       { id: "1792db6e-514c-43d7-aed1-5ed92ec655ae", name: "Slutty" },
@@ -961,7 +970,7 @@ test("tpdb filmography pages the canonical performer route and rejects mixed fil
   }
 });
 
-test("stashdb scene search passes performers INCLUDES and reports real counts", async () => {
+test("stashdb scene search keeps artwork, performer filters, and real counts", async () => {
   const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
   const fixture = await startFixture((req, res) => {
     replyJson(res, 200, {
@@ -975,6 +984,12 @@ test("stashdb scene search passes performers INCLUDES and reports real counts", 
               tags: [],
               performers: [],
               urls: [],
+              images: [
+                { url: "https://untrusted.example/scene.jpg" },
+                {
+                  url: "https://stashdb.org/images/1c73ec9e-0643-4564-aae6-441999853fac",
+                },
+              ],
             },
             { id: MISSING_ID, title: "S2", tags: [], performers: [], urls: [] },
           ],
@@ -988,6 +1003,7 @@ test("stashdb scene search passes performers INCLUDES and reports real counts", 
       provider: "stashdb",
       kind: "scene",
       performer: STASH_PERFORMER_ID,
+      sort: "trending",
       perPage: 2,
     });
     const body = stashBody(fixture, 0);
@@ -1004,7 +1020,11 @@ test("stashdb scene search passes performers INCLUDES and reports real counts", 
     assert.equal(page.totalCountKnown, true);
     assert.equal(page.hasMore, true); // 1*2 < 5
     assert.equal(page.items.length, 2);
-    assert.equal(body.query.includes("queryScenes(input: $f)"), true);
+    assert.equal(
+      page.items[0]?.imageUrl,
+      "https://stashdb.org/images/1c73ec9e-0643-4564-aae6-441999853fac",
+    );
+    assert.equal(page.items[1]?.imageUrl, undefined);
   } finally {
     await fixture.close();
     restore();

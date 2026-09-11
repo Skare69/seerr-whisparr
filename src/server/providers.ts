@@ -587,6 +587,7 @@ function stashSceneDetail(row: unknown): CatalogDetail | undefined {
   const studioId = studio?.id;
   const details = cleanString(r.details, MAX.description);
   const duration = cleanDuration(r.duration);
+  const imageUrl = stashImageUrl(r.images);
   const links = stashLinks(r.urls);
   return {
     reference: { provider: "stashdb", kind: "scene", id },
@@ -594,6 +595,7 @@ function stashSceneDetail(row: unknown): CatalogDetail | undefined {
     ...(details !== undefined ? { description: details } : {}),
     ...(isIsoDate(r.date) ? { releaseDate: r.date } : {}),
     ...(duration !== undefined ? { durationSeconds: duration } : {}),
+    ...(imageUrl !== undefined ? { imageUrl } : {}),
     ...(studioName !== undefined
       ? {
           studio: {
@@ -1521,7 +1523,7 @@ export async function searchCatalog(
     );
   }
   const res = (await stashQuery(
-    "query($f: SceneQueryInput!) { queryScenes(input: $f) { count scenes { id title code details date duration urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted images { url } } } } } }",
+    "query($f: SceneQueryInput!) { queryScenes(input: $f) { count scenes { id title code details date duration images { url } urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted images { url } } } } } }",
     { f: input },
     "queryScenes",
   )) as { count?: unknown; scenes?: unknown } | null;
@@ -1622,7 +1624,7 @@ export async function getCatalogDetail(
 
   if (kind === "scene") {
     const row = await stashQuery(
-      "query($id: ID!) { findScene(id: $id) { id title code details date duration urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted aliases images { url } urls { url type } } } } }",
+      "query($id: ID!) { findScene(id: $id) { id title code details date duration images { url } urls { url type } studio { id name } tags { id name } performers { as performer { id name deleted aliases images { url } urls { url type } } } } }",
       { id },
       "findScene",
     );
