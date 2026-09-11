@@ -2017,8 +2017,10 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
 
 function WhisparrCard({ onForbidden }: { onForbidden: () => void }) {
   const [status, setStatus] = useState<WhisparrStatus | null>(null);
+  const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [ready, setReady] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -2026,12 +2028,15 @@ function WhisparrCard({ onForbidden }: { onForbidden: () => void }) {
     api<WhisparrStatus>("/api/admin/whisparr")
       .then((s) => {
         setStatus(s);
+        setCheckedAt(new Date().toLocaleTimeString());
+        setReady(true);
         setLoading(false);
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 403) onForbidden();
         else {
           setError(messageOf(e));
+          setReady(true);
           setLoading(false);
         }
       });
@@ -2046,11 +2051,11 @@ function WhisparrCard({ onForbidden }: { onForbidden: () => void }) {
       <div className="flex items-center justify-between gap-3">
         <h3 className="font-semibold">Whisparr</h3>
         <button type="button" className="btn" onClick={load} disabled={loading}>
-          Refresh
+          {loading ? "Checking…" : "Refresh"}
         </button>
       </div>
 
-      {loading ? (
+      {!ready ? (
         <div className="mt-3 space-y-2" aria-label="Checking Whisparr">
           <div className="skel h-5 w-1/2" />
           <div className="skel h-5 w-2/3" />
@@ -2077,6 +2082,12 @@ function WhisparrCard({ onForbidden }: { onForbidden: () => void }) {
               {status.version ? ` ${status.version}` : ""}
             </dd>
           </div>
+          {checkedAt && (
+            <div className="flex gap-2">
+              <dt className="text-muted">Checked</dt>
+              <dd>{checkedAt}</dd>
+            </div>
+          )}
           <div>
             <dt className="text-muted">Root folders</dt>
             <dd className="mt-1">
@@ -2112,8 +2123,10 @@ function WhisparrCard({ onForbidden }: { onForbidden: () => void }) {
 }
 function JellyfinCard({ onForbidden }: { onForbidden: () => void }) {
   const [status, setStatus] = useState<JellyfinStatus | null>(null);
+  const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [ready, setReady] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -2121,12 +2134,15 @@ function JellyfinCard({ onForbidden }: { onForbidden: () => void }) {
     api<JellyfinStatus>("/api/admin/jellyfin")
       .then((s) => {
         setStatus(s);
+        setCheckedAt(new Date().toLocaleTimeString());
+        setReady(true);
         setLoading(false);
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 403) onForbidden();
         else {
           setError(messageOf(e));
+          setReady(true);
           setLoading(false);
         }
       });
@@ -2141,11 +2157,11 @@ function JellyfinCard({ onForbidden }: { onForbidden: () => void }) {
       <div className="flex items-center justify-between gap-3">
         <h3 className="font-semibold">Jellyfin</h3>
         <button type="button" className="btn" onClick={load} disabled={loading}>
-          Test connection
+          {loading ? "Testing…" : "Test connection"}
         </button>
       </div>
 
-      {loading ? (
+      {!ready ? (
         <div className="mt-3 space-y-2" aria-label="Checking Jellyfin">
           <div className="skel h-5 w-1/2" />
         </div>
@@ -2171,6 +2187,12 @@ function JellyfinCard({ onForbidden }: { onForbidden: () => void }) {
               {status.version ? ` ${status.version}` : ""}
             </dd>
           </div>
+          {checkedAt && (
+            <div className="flex gap-2">
+              <dt className="text-muted">Checked</dt>
+              <dd>{checkedAt}</dd>
+            </div>
+          )}
         </dl>
       )}
     </div>
