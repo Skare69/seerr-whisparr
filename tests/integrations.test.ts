@@ -1606,6 +1606,10 @@ function avHandler(opts: {
   sweepStatus?: number;
   /** compact item id -> PlaybackInfo MediaSources override. */
   playback?: Record<string, unknown[]>;
+  /** Status forced for every /Items/{id}/Ancestors probe. */
+  ancestorsStatus?: number;
+  /** Status forced for every /Items/{id}/PlaybackInfo probe. */
+  playbackStatus?: number;
 }): FixtureHandler {
   return (req, res) => {
     const path = pathOf(req.url ?? "");
@@ -1624,6 +1628,7 @@ function avHandler(opts: {
     }
     const anc = path.match(/^\/items\/([0-9a-f]{32})\/ancestors$/);
     if (anc) {
+      if (opts.ancestorsStatus) return sendJson(res, opts.ancestorsStatus, {});
       const entry = opts.entries.find(
         (e) => String(e.item.Id).replace(/-/g, "") === (anc[1] ?? ""),
       );
@@ -1639,6 +1644,7 @@ function avHandler(opts: {
     }
     const info = path.match(/^\/items\/([0-9a-f]{32})\/playbackinfo$/);
     if (info) {
+      if (opts.playbackStatus) return sendJson(res, opts.playbackStatus, {});
       const sources = opts.playback?.[info[1] ?? ""] ?? [
         {
           Id: "src1",
@@ -2817,6 +2823,310 @@ test("recently-added items carry playability and watch links matching the list p
       assert.equal(
         feature.watchUrl,
         `${fx.origin}/jf/web/index.html#!/details?id=${feature.id}&serverId=${SERVER_ID}`,
+      );
+    },
+  );
+});
+
+// --- M4 availability hardening: revalidation, multi-source, distinct
+// --- outcomes, remote policy (hazard table rows 3, 4, 9, 10). Uses the M2
+// --- availability fixtures above, unchanged.
+
+const AV_MULTI = hexId(0x10a);
+const AV_STUB = hexId(0x10b);
+
+function avSource(
+  size: number | undefined,
+  playable: boolean,
+): Record<string, unknown> {
+  return {
+    Id: `src-${size ?? "none"}-${playable}`,
+    ...(size === undefined ? {} : { Size: size }),
+    SupportsDirectPlay: playable,
+    SupportsDirectStream: playable,
+    SupportsTranscoding: playable,
+  };
+}
+
+function avSourcesEntry(o: {
+  id: string;
+  name: string;
+  providerId: string;
+  sources: Record<string, unknown>[];
+}): AvEntry {
+  return {
+    lib: LIB_A,
+    item: {
+      Id: dashed(o.id),
+      Name: o.name,
+      Type: "Movie",
+      LocationType: "FileSystem",
+      ProviderIds: { Tpdb: o.providerId },
+      MediaSources: o.sources,
+    },
+  };
+}
+
+test("resolvePlaybackAccess revalidates a stale persisted path against the live item", async () => {
+  await withFixture(avHandler({ entries: avEntries() }), async (fx) => {
+    const cfg = avConfig(fx.origin, [LIB_A]);
+    const grants = account([LIB_A]);
+    // Persisted path points at a folder that no longer exists on any live
+    // item, but the provider id still matches: the exact id match wins and
+    // the stale path is never trusted.
+    assert.equal(
+      avItemId(
+        await resolvePlaybackAccess(cfg, TOKEN, grants, {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-movie-uuid",
+          whisparrPath: "X:\\Media\\Movies\\Vanished Movie",
+        }),
+      ),
+      AV_PID,
+    );
+    // Stale path, unknown provider id, title/year agrees with a live item:
+    // similarity is ambiguous for review, never an available match.
+    assert.deepEqual(
+      await resolvePlaybackAccess(cfg, TOKEN, grants, {
+        provider: "tpdb",
+        kind: "movie",
+        id: "tpdb-unknown-uuid",
+        whisparrPath: "X:\\Media\\Movies\\Vanished Movie",
+        title: "Path Movie",
+        year: 2020,
+      }),
+      {
+        outcome: "ambiguous",
+        reason: "Title/year similarity only; administrator review required.",
+      },
+    );
+    // Stale path with no other signal: proven absent, not available.
+    assert.deepEqual(
+      await resolvePlaybackAccess(cfg, TOKEN, grants, {
+        provider: "tpdb",
+        kind: "movie",
+        id: "tpdb-unknown-uuid",
+        whisparrPath: "X:\\Media\\Movies\\Vanished Movie",
+      }),
+      { outcome: "missing" },
+    );
+  });
+  // The edition's file was renamed under a folder that still holds two
+  // editions: the persisted file-level path no longer matches anything, and
+  // title agreement alone stays ambiguous.
+  const renamed = avEntries();
+  const editionA = renamed.find((e) => e.item.Id === dashed(AV_ED1));
+  assert.ok(editionA);
+  editionA.item = {
+    ...editionA.item,
+    Path: "C:\\media\\movies\\Edition Split\\Edition C.mkv",
+    MediaSources: [
+      {
+        Id: "src1",
+        Path: "C:\\media\\movies\\Edition Split\\Edition C.mkv",
+        Size: 21_000,
+        SupportsDirectPlay: true,
+        SupportsDirectStream: true,
+        SupportsTranscoding: true,
+      },
+    ],
+  };
+  await withFixture(avHandler({ entries: renamed }), async (fx) => {
+    assert.deepEqual(
+      await resolvePlaybackAccess(
+        avConfig(fx.origin, [LIB_A]),
+        TOKEN,
+        account([LIB_A]),
+        {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-unknown-uuid",
+          whisparrPath: "X:\\Media\\Movies\\Edition Split\\Edition A.mkv",
+          title: "Edition Split",
+          year: 2019,
+        },
+      ),
+      {
+        outcome: "ambiguous",
+        reason: "Title/year similarity only; administrator review required.",
+      },
+    );
+  });
+});
+
+test("resolvePlaybackAccess judges every source and denies placeholder-only items", async () => {
+  await withFixture(
+    avHandler({
+      entries: [
+        avSourcesEntry({
+          id: AV_MULTI,
+          name: "Multi Source Movie",
+          providerId: "tpdb-multi-uuid",
+          sources: [avSource(0, true), avSource(21_000, true)],
+        }),
+        avSourcesEntry({
+          id: AV_STUB,
+          name: "Stub Source Movie",
+          providerId: "tpdb-stub-uuid",
+          sources: [
+            avSource(0, true),
+            avSource(undefined, true),
+            avSource(21_000, false),
+          ],
+        }),
+      ],
+      playback: {
+        [AV_MULTI]: [avSource(0, true), avSource(21_000, true)],
+        [AV_STUB]: [
+          avSource(0, true),
+          avSource(undefined, true),
+          avSource(21_000, false),
+        ],
+      },
+    }),
+    async (fx) => {
+      const cfg = avConfig(fx.origin, [LIB_A]);
+      const grants = account([LIB_A]);
+      // Several sources, one genuinely playable: available. Never decided by
+      // the first source alone.
+      assert.equal(
+        (
+          await resolvePlaybackAccess(cfg, TOKEN, grants, {
+            provider: "tpdb",
+            kind: "movie",
+            id: "tpdb-multi-uuid",
+          })
+        ).outcome,
+        "available",
+      );
+      // Only zero-length, size-less, and undeliverable sources: denied,
+      // never available on the strength of the first entry.
+      assert.deepEqual(
+        await resolvePlaybackAccess(cfg, TOKEN, grants, {
+          provider: "tpdb",
+          kind: "movie",
+          id: "tpdb-stub-uuid",
+        }),
+        {
+          outcome: "denied",
+          reason: "No playable media source (file missing or empty).",
+        },
+      );
+    },
+  );
+  // The media source vanished upstream: PlaybackInfo reports none, so the
+  // exact match can no longer produce a stale 'available'.
+  await withFixture(
+    avHandler({
+      entries: [
+        avSourcesEntry({
+          id: AV_MULTI,
+          name: "Multi Source Movie",
+          providerId: "tpdb-multi-uuid",
+          sources: [avSource(21_000, true)],
+        }),
+      ],
+      playback: { [AV_MULTI]: [] },
+    }),
+    async (fx) => {
+      assert.deepEqual(
+        await resolvePlaybackAccess(
+          avConfig(fx.origin, [LIB_A]),
+          TOKEN,
+          account([LIB_A]),
+          { provider: "tpdb", kind: "movie", id: "tpdb-multi-uuid" },
+        ),
+        {
+          outcome: "denied",
+          reason: "No playable media source (file missing or empty).",
+        },
+      );
+    },
+  );
+});
+
+test("resolvePlaybackAccess denies remote-restricted and disabled accounts", async () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [
+      { ...ME.Policy, EnableRemoteAccess: false },
+      "Remote access is disabled for this Jellyfin user.",
+    ],
+    // Conservative: a missing remote-access policy never grants playback.
+    [
+      { IsAdministrator: false, IsDisabled: false, EnableMediaPlayback: true },
+      "Remote access is disabled for this Jellyfin user.",
+    ],
+    [{ ...ME.Policy, IsDisabled: true }, "This Jellyfin account is disabled."],
+  ];
+  for (const [policy, reason] of cases) {
+    await withFixture(
+      avHandler({
+        entries: avEntries(),
+        me: { ...ME, Policy: policy },
+      }),
+      async (fx) => {
+        assert.deepEqual(
+          await resolvePlaybackAccess(
+            avConfig(fx.origin, [LIB_A]),
+            TOKEN,
+            account([LIB_A]),
+            { provider: "tpdb", kind: "movie", id: "tpdb-movie-uuid" },
+          ),
+          { outcome: "denied", reason },
+        );
+      },
+    );
+  }
+});
+
+test("resolvePlaybackAccess keeps proven rejections, outages, and auth deaths distinct", async () => {
+  // Ancestors outage on an exactly matched item: 'unavailable', never
+  // folded into 'denied' or 'missing'.
+  await withFixture(
+    avHandler({ entries: avEntries(), ancestorsStatus: 500 }),
+    async (fx) => {
+      const verdict = await resolvePlaybackAccess(
+        avConfig(fx.origin, [LIB_A]),
+        TOKEN,
+        account([LIB_A]),
+        { provider: "tpdb", kind: "movie", id: "tpdb-movie-uuid" },
+      );
+      assert.equal(verdict.outcome, "unavailable");
+      if (verdict.outcome !== "unavailable") return assert.fail("unreachable");
+      assert.ok(verdict.reason !== undefined && verdict.reason.length > 0);
+    },
+  );
+  // PlaybackInfo outage on an exactly matched item: also 'unavailable'.
+  await withFixture(
+    avHandler({ entries: avEntries(), playbackStatus: 500 }),
+    async (fx) => {
+      assert.equal(
+        (
+          await resolvePlaybackAccess(
+            avConfig(fx.origin, [LIB_A]),
+            TOKEN,
+            account([LIB_A]),
+            { provider: "tpdb", kind: "movie", id: "tpdb-movie-uuid" },
+          )
+        ).outcome,
+        "unavailable",
+      );
+    },
+  );
+  // Token revoked after identity resolution: the caller-visible 401
+  // propagates as an auth rejection, never as missing or unavailable.
+  await withFixture(
+    avHandler({ entries: avEntries(), ancestorsStatus: 401 }),
+    async (fx) => {
+      await assert.rejects(
+        resolvePlaybackAccess(
+          avConfig(fx.origin, [LIB_A]),
+          TOKEN,
+          account([LIB_A]),
+          { provider: "tpdb", kind: "movie", id: "tpdb-movie-uuid" },
+        ),
+        appError(401, "upstream_auth"),
       );
     },
   );

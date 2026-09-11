@@ -920,7 +920,11 @@ async function sweepVisibleItems(
 // Verdict for one exactly matched candidate. Every call re-runs under the
 // user token, so item-level policy applies each time. A visible-but-ungranted
 // item is 'denied', never 'missing'; a placeholder or empty file is
-// 'denied', never 'available'.
+// 'denied', never 'available'. Account-level policy is checked before any
+// item probing: a disabled account, or a user whose Jellyfin policy denies
+// remote access (or whose policy is missing — the mapping is conservative),
+// can never obtain a playable verdict or a watch link through Velvarr's
+// LAN-side connection.
 async function verdictForItem(
   config: IntegrationConfig,
   userToken: string,
@@ -929,10 +933,22 @@ async function verdictForItem(
   candidate: CandidateItem,
 ): Promise<PlaybackAccess> {
   const itemId = normalizeItemId(candidate.dto.Id);
+  if (user.isDisabled) {
+    return {
+      outcome: "denied",
+      reason: "This Jellyfin account is disabled.",
+    };
+  }
   if (!user.enableMediaPlayback) {
     return {
       outcome: "denied",
       reason: "Playback is disabled for this Jellyfin user.",
+    };
+  }
+  if (!user.enableRemoteAccess) {
+    return {
+      outcome: "denied",
+      reason: "Remote access is disabled for this Jellyfin user.",
     };
   }
   // Grant proof by ancestry — the only exact folder-membership proof on the
@@ -975,12 +991,18 @@ async function verdictForItem(
     };
   }
   const sources = playback?.MediaSources ?? candidate.dto.MediaSources ?? [];
+  // Judged across ALL sources, never the first one: any single source that
+  // is genuinely playable carries the item. A source counts only with an
+  // explicit delivery flag AND a real, non-empty file (verified live: real
+  // sources always report a positive Size); zero-length, placeholder
+  // (size-less), and undeliverable sources never make an item available.
   const playable = sources.some(
     (s) =>
       (s.SupportsDirectPlay === true ||
         s.SupportsDirectStream === true ||
         s.SupportsTranscoding === true) &&
-      s.Size !== 0,
+      typeof s.Size === "number" &&
+      s.Size > 0,
   );
   if (!playable) {
     return {
@@ -1011,14 +1033,20 @@ async function verdictForItem(
 
 // Per-user availability verdict for one external identity. Runs entirely
 // under the caller's Jellyfin user token, reads existing state only, and
-// never mutates the server. Matching precedence, strictest first:
+// never mutates the server. Every call re-sweeps the live catalog, so a
+// persisted Whisparr path is only ever a matching hint: a renamed file, a
+// vanished media source, or a changed edition set re-runs the match and can
+// never resurrect a stale 'available'. Matching precedence, strictest first:
 // 1. exact ProviderIds match, compared in-process (no server-side filter
 //    exists on Jellyfin 12.0.0 — verified live);
 // 2. exact Whisparr-to-Jellyfin path correspondence through the configured
 //    pathMappings, full components only;
-// 3. title/year similarity alone is 'ambiguous', never a guess.
+// 3. title/year similarity alone is 'ambiguous', never a guess, and a
+//    parent/child (ancestor) relationship proves grants, never availability.
 // Auth failures (401, dead user token) propagate; every other upstream
 // failure is 'unavailable', so an outage is never reported as 'missing'.
+// The verdict stays Jellyfin-truthful; the caller composes 'awaiting_scan'
+// from 'missing' plus the acquisition record's own imported state.
 export async function resolvePlaybackAccess(
   config: IntegrationConfig,
   userToken: string,

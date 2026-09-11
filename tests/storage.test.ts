@@ -849,6 +849,16 @@ test("two admitted users share one acquisition per identity; active intent is un
     shared[0]?.instanceId,
     storage.getConfig()?.whisparr?.instanceId,
   );
+  // Shared work stays private per user: neither requester sees the other's
+  // request history for the same target.
+  assert.ok(
+    storage.listRequests(other).every((r) => r.accountId === other.id),
+    "a requester's history view never includes the other approver's request",
+  );
+  assert.throws(
+    () => storage.getRequest(r1.id, other),
+    (e: { code: string }) => e.code === "request_not_found",
+  );
 
   assert.throws(
     () => storage.createRequest(owner.id, MOVIE),
@@ -1176,5 +1186,192 @@ test("an upgraded config without an instance identity is repaired at startup", (
     storage.listDueAcquisitions(Date.now() + 60_000).length,
     1,
     "approval after repair enqueues real shared work",
+  );
+});
+
+test("the last withdrawal suppresses only undispatched work; sent work survives", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+
+  // Last withdrawal of undispatched work removes the shared row only.
+  const r1 = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, r1.id, "approved");
+  const unsent = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(unsent);
+  assert.equal(unsent.state, "unsent");
+  storage.cancelRequest(owner, r1.id);
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE),
+    null,
+    "the last withdrawal suppresses undispatched work",
+  );
+  assert.equal(
+    storage
+      .listDueAcquisitions(Date.now() + 60_000)
+      .filter((a) => a.media.id === MOVIE.id).length,
+    0,
+  );
+  // History is preserved and a re-request creates fresh work, never a
+  // resurrection of the half-cancelled row.
+  assert.equal(storage.getRequest(r1.id, owner).decision, "cancelled");
+  const r1b = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, r1b.id, "approved");
+  const fresh = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(fresh);
+  assert.notEqual(fresh.id, unsent.id, "re-requested work is a fresh row");
+  assert.equal(fresh.state, "unsent");
+
+  // A non-last withdrawal suppresses nothing: another intent remains.
+  const [imported] = storage.importAccounts([otherUser()]);
+  assert.ok(imported);
+  const other = admit(imported.id);
+  const r2 = storage.createRequest(other.id, MOVIE);
+  storage.decideRequest(owner, r2.id, "approved");
+  storage.cancelRequest(owner, r1b.id);
+  const still = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(still, "a non-last withdrawal suppresses nothing");
+  assert.equal(still.id, fresh.id);
+
+  // Accepted work survives even the last withdrawal.
+  const claim = storage.claimAcquisition(still.id);
+  const attempt = storage.beginSubmission(still.id, claim.claimToken);
+  storage.completeSubmission(
+    still.id,
+    claim.claimToken,
+    attempt.attemptToken,
+    "accepted",
+  );
+  storage.releaseAcquisitionClaim(still.id, claim.claimToken);
+  storage.cancelRequest(other, r2.id);
+  const kept = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(kept, "accepted work is never deleted by a withdrawal");
+  assert.equal(kept.state, "monitoring");
+  // In-flight (submitting) work survives too: the external system may
+  // already hold the add.
+  const inflightRef: MediaReference = {
+    provider: "tpdb",
+    kind: "movie",
+    id: "33333333-3333-4333-8333-333333333333",
+  };
+  const r5 = storage.createRequest(owner.id, inflightRef);
+  storage.decideRequest(owner, r5.id, "approved");
+  const inflight = storage.getAcquisitionByReference(inflightRef);
+  assert.ok(inflight);
+  const claim2 = storage.claimAcquisition(inflight.id);
+  storage.beginSubmission(inflight.id, claim2.claimToken);
+  storage.cancelRequest(owner, r5.id);
+  assert.equal(
+    storage.getAcquisitionByReference(inflightRef)?.state,
+    "submitting",
+    "in-flight work survives a withdrawal",
+  );
+
+  // Undispatched blocked work is withdrawn by the last withdrawal as well.
+  storage.saveConfig(deliveryConfig(false));
+  const r3 = storage.createRequest(owner.id, SCENE);
+  storage.decideRequest(owner, r3.id, "approved");
+  const blocked = storage.getAcquisitionByReference(SCENE);
+  assert.ok(blocked);
+  assert.equal(blocked.state, "blocked");
+  storage.cancelRequest(owner, r3.id);
+  assert.equal(
+    storage.getAcquisitionByReference(SCENE),
+    null,
+    "undispatched blocked work is withdrawn too",
+  );
+});
+
+test("observations update changed facts; a proven absence is distinct from an outage", () => {
+  freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const owner = storage.getAccount(ownerUser().id) as Account;
+  const request = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, request.id, "approved");
+  const work = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(work);
+
+  // A changed path must overwrite the stored facts, never stick stale.
+  const first = storage.recordAcquisitionObservation(work.id, {
+    state: "monitoring",
+    item: { whisparrId: 5, path: "/data/old", title: "Old" },
+  });
+  assert.equal(first.whisparrPath, "/data/old");
+  const moved = storage.recordAcquisitionObservation(work.id, {
+    state: "monitoring",
+    item: { whisparrId: 6, path: "/data/new", title: "New" },
+  });
+  assert.equal(moved.whisparrPath, "/data/new", "a changed path is persisted");
+  assert.ok(moved.lastObservedAt);
+
+  // An outage is an unknown check: facts and the observation survive.
+  const outage = storage.recordAcquisitionObservation(work.id, {
+    unavailable: true,
+    reason: "whisparr timeout",
+  });
+  assert.equal(outage.whisparrPath, "/data/new");
+  assert.equal(outage.lastObservedAt, moved.lastObservedAt);
+  assert.ok(outage.lastErrorAt);
+  assert.equal(
+    storage.hasAuthoritativeAbsence(outage),
+    false,
+    "an outage is never an authoritative absence",
+  );
+  assert.equal(
+    storage.isObservationStale(outage, (outage.lastErrorAt ?? 0) + 1),
+    false,
+    "inside the threshold the fact is not yet stale",
+  );
+  assert.equal(
+    storage.isObservationStale(
+      outage,
+      (outage.lastErrorAt ?? 0) + 10 * 60_000 + 1,
+    ),
+    true,
+    "aged past the threshold with a later failed check is stale",
+  );
+
+  // A fresh success heals staleness.
+  const healed = storage.recordAcquisitionObservation(work.id, {
+    state: "downloading",
+    item: { whisparrId: 6, path: "/data/new" },
+  });
+  assert.equal(
+    storage.isObservationStale(
+      healed,
+      (healed.lastObservedAt ?? 0) + 10 * 60_000 + 1,
+    ),
+    false,
+    "a newer successful observation is never stale",
+  );
+
+  // Proven absence from a successful lookup: facts cleared, state and the
+  // last real observation intact — distinguishable from any outage.
+  const absent = storage.recordAcquisitionObservation(work.id, {
+    absent: true,
+    reason: "whisparr no longer has this identity",
+  });
+  assert.equal(
+    storage.hasAuthoritativeAbsence(absent),
+    true,
+    "a proven removal is authoritative",
+  );
+  assert.equal(absent.whisparrId, null);
+  assert.equal(absent.whisparrPath, null);
+  assert.equal(absent.whisparrTitle, null);
+  assert.equal(absent.state, "downloading", "absence keeps the recorded state");
+  assert.equal(
+    absent.lastObservedAt,
+    moved.lastObservedAt,
+    "absence never overwrites the last real observation",
+  );
+  const outage2 = storage.recordAcquisitionObservation(work.id, {
+    unavailable: true,
+    reason: "down again",
+  });
+  assert.equal(
+    storage.hasAuthoritativeAbsence(outage2),
+    true,
+    "an outage after a proven absence keeps the authoritative absence",
   );
 });

@@ -42,6 +42,9 @@ const ROLES: readonly Role[] = ["admin", "moderator", "requester"];
 // ponytail: fixed 60s recheck delay after failed/unknown outcomes; a backoff
 // policy is worth adding only when the reconciliation loop exists to tune.
 const RECHECK_DELAY_MS = 60_000;
+// ponytail: fixed 10-minute staleness ceiling — ten missed 60s recheck passes
+// before a fact counts as aged; retune only alongside RECHECK_DELAY_MS.
+const STALE_OBSERVATION_MS = 10 * 60_000;
 const PROVIDERS: readonly CatalogProvider[] = ["tpdb", "stashdb"];
 const MEDIA_KINDS: readonly MediaKind[] = ["movie", "scene"];
 const CATALOG_KINDS: readonly CatalogKind[] = [
@@ -140,6 +143,8 @@ type Statements = {
   listAllRequests: StatementSync;
   listAccountRequests: StatementSync;
   decideRequest: StatementSync;
+  cancelOwnRequest: StatementSync;
+  countActiveRequestsExcept: StatementSync;
   insertAcquisition: StatementSync;
   getAcquisition: StatementSync;
   getAcquisitionByIdentity: StatementSync;
@@ -152,6 +157,8 @@ type Statements = {
   requeueBlocked: StatementSync;
   recordObservation: StatementSync;
   recordObservationError: StatementSync;
+  recordAbsence: StatementSync;
+  withdrawUndispatched: StatementSync;
   releaseClaim: StatementSync;
   recoverSubmitting: StatementSync;
   releaseAllClaims: StatementSync;
@@ -413,6 +420,12 @@ function S(): Statements {
       decideRequest: d.prepare(
         "UPDATE requests SET decision = ?, decided_at = ? WHERE id = ? AND decision = 'pending'",
       ),
+      cancelOwnRequest: d.prepare(
+        "UPDATE requests SET decision = 'cancelled', decided_at = ? WHERE id = ? AND decision IN ('pending', 'approved')",
+      ),
+      countActiveRequestsExcept: d.prepare(
+        "SELECT COUNT(*) AS n FROM requests WHERE provider = ? AND kind = ? AND external_id = ? AND decision IN ('pending', 'approved') AND id != ?",
+      ),
       insertAcquisition: d.prepare(
         "INSERT OR IGNORE INTO acquisitions (id, instance_id, provider, kind, external_id, state, due_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ),
@@ -454,6 +467,14 @@ function S(): Statements {
       ),
       recordObservationError: d.prepare(
         "UPDATE acquisitions SET last_error = ?, last_error_at = ?, due_at = ?, updated_at = ? WHERE id = ? AND (? IS NULL OR claim_token = ?)",
+      ),
+      recordAbsence: d.prepare(
+        `UPDATE acquisitions SET last_error = ?, last_error_at = ?, due_at = ?,
+           whisparr_id = NULL, whisparr_path = NULL, whisparr_title = NULL, updated_at = ?
+         WHERE id = ? AND (? IS NULL OR claim_token = ?)`,
+      ),
+      withdrawUndispatched: d.prepare(
+        "DELETE FROM acquisitions WHERE id = ? AND state IN ('unsent', 'blocked') AND claim_token IS NULL AND attempt_token IS NULL AND submitted_at IS NULL",
       ),
       releaseClaim: d.prepare(
         "UPDATE acquisitions SET claim_token = NULL, claimed_at = NULL, updated_at = ? WHERE id = ? AND claim_token = ?",
@@ -1291,8 +1312,17 @@ export function decideRequest(
   });
 }
 
-/** Cancels only the actor's own intent. Never touches shared acquisitions or
- * external media, and never suppresses another user's request. */
+/** Cancels only the actor's own intent; never another user's request and
+ * never any external media. Withdrawal decision: when the cancelled request
+ * was the LAST active intent for the identity, shared work that provably
+ * never left the building — state 'unsent' or 'blocked', no claim, no
+ * attempt, no submission — is withdrawn by REMOVING the shared acquisition
+ * row. Nothing external ever received it, so removal deletes no media and no
+ * history (request rows are untouched); removal rather than a terminal state
+ * is what lets a later re-request create fresh work instead of resurrecting
+ * a half-cancelled row, and a removed row can never be scheduled.
+ * 'submitting', 'uncertain' and everything already observed always survives,
+ * because the external system may already hold it. */
 export function cancelRequest(
   actor: Account,
   requestId: string,
@@ -1310,7 +1340,27 @@ export function cancelRequest(
         "only pending or approved requests can be cancelled",
       );
     }
-    S().decideRequest.run("cancelled", Date.now(), requestId);
+    S().cancelOwnRequest.run(Date.now(), requestId);
+    // Last-withdrawal suppression: only undispatched work, only when no
+    // other active intent remains for this identity.
+    const instance = getConfig()?.whisparr?.instanceId;
+    if (instance !== undefined) {
+      const active = S().countActiveRequestsExcept.get(
+        row.provider,
+        row.kind,
+        row.external_id,
+        requestId,
+      ) as { n: number };
+      if (active.n === 0) {
+        const shared = S().getAcquisitionByIdentity.get(
+          instance,
+          row.provider,
+          row.kind,
+          row.external_id,
+        ) as AcquisitionRow | undefined;
+        if (shared !== undefined) S().withdrawUndispatched.run(shared.id);
+      }
+    }
     return rowToRequest(S().getRequest.get(requestId) as RequestRow);
   });
 }
@@ -1450,8 +1500,10 @@ export function completeSubmission(
   return rowToAcquisition(S().getAcquisition.get(id) as AcquisitionRow);
 }
 
-/** A successful observation updates recorded state and the last-observed fact;
- * an unavailable/error check never touches state or the last observation. */
+/** A successful observation updates recorded state and the last-observed
+ * fact; a proven absence clears the recorded facts while keeping state and
+ * the last observation; an unavailable/error check never touches state, the
+ * last observation, or the facts. */
 export function recordAcquisitionObservation(
   id: string,
   observation: AcquisitionObservation,
@@ -1492,6 +1544,22 @@ export function recordAcquisitionObservation(
       claim,
       claim,
     );
+  } else if ("absent" in observation) {
+    if (!nonemptyString(observation.reason, 2000)) {
+      throw new AppError(400, "invalid_observation", "observation is invalid");
+    }
+    // Proven absence from a successful lookup: the recorded facts are now
+    // known false, so they are cleared; state and lastObservedAt (the last
+    // real observation) stay, keeping this distinct from an unknown check.
+    res = S().recordAbsence.run(
+      observation.reason,
+      now,
+      now + RECHECK_DELAY_MS,
+      now,
+      id,
+      claim,
+      claim,
+    );
   } else {
     if (!nonemptyString(observation.reason, 2000)) {
       throw new AppError(400, "invalid_observation", "observation is invalid");
@@ -1514,6 +1582,35 @@ export function recordAcquisitionObservation(
     );
   }
   return rowToAcquisition(S().getAcquisition.get(id) as AcquisitionRow);
+}
+
+/** True when the recorded item facts have aged past the staleness ceiling
+ * while a later check failed (lastErrorAt after lastObservedAt): the caller
+ * is looking at old facts, honestly labeled. Purely derived; never mutates. */
+export function isObservationStale(
+  record: AcquisitionRecord,
+  now: number = Date.now(),
+): boolean {
+  return (
+    record.lastObservedAt !== null &&
+    record.lastErrorAt !== null &&
+    record.lastErrorAt >= record.lastObservedAt &&
+    now - record.lastObservedAt > STALE_OBSERVATION_MS
+  );
+}
+
+/** True only for a proven Whisparr absence recorded after a real
+ * observation: the item facts were cleared because a successful lookup
+ * showed the identity gone. An outage/unknown check keeps the facts and
+ * never sets this. */
+export function hasAuthoritativeAbsence(record: AcquisitionRecord): boolean {
+  return (
+    record.lastObservedAt !== null &&
+    record.lastErrorAt !== null &&
+    record.whisparrId === null &&
+    record.whisparrPath === null &&
+    record.whisparrTitle === null
+  );
 }
 
 export function releaseAcquisitionClaim(id: string, claimToken: string): void {

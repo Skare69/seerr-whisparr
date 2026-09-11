@@ -168,6 +168,9 @@ function jfItem(item: (typeof fx.items)[number]) {
         Path: `/media/${item.Id}.mkv`,
         Protocol: "File",
         SupportsDirectPlay: true,
+        // Real Jellyfin sources always report a positive Size; the verdict
+        // treats a size-less source as a placeholder.
+        Size: 600_000_000,
       },
     ],
   };
@@ -2331,4 +2334,211 @@ test("studioMode: withChildren reaches provider; every other combo is a 400 befo
     assert.equal(errBody.error.code, "invalid_query", query);
   }
   assert.equal(stashdbFx.calls, before, "no upstream call on rejection");
+});
+
+// --- M4 wire shapes. Named boundary casts per the suite convention: json()
+// arrives untyped and no schema validator exists in this suite. ---
+interface OutcomeBody {
+  outcome: string;
+  observationStale?: boolean;
+}
+
+interface AcquisitionDetailBody {
+  acquisition: { state: string; observationStale: boolean } | null;
+}
+
+interface AccountsBody {
+  accounts: { id: string }[];
+}
+
+async function outcomeOf(res: Response): Promise<OutcomeBody> {
+  return (await res.json()) as OutcomeBody;
+}
+
+// --- M4: scan lag (hazard 9) — awaiting_scan is distinct from missing ---
+test("scan lag: imported-but-unscanned is awaiting_scan; outage and denial stay truthful", async () => {
+  // An identity that was never acquired stays missing.
+  const never = await call(
+    "GET",
+    "/api/availability/tpdb/movie/2a2b3c4d-0000-0000-0000-000000000005",
+    { cookie: member },
+  );
+  assert.equal((await outcomeOf(never)).outcome, "missing");
+
+  // Worker-equivalent: persist observed Whisparr facts on the shared
+  // acquisition for TPDB_MOVIE4 (approved earlier, never observed).
+  const acq = getAcquisitionByReference({
+    provider: "tpdb",
+    kind: "movie",
+    id: TPDB_MOVIE4,
+  });
+  assert.ok(acq);
+  const observation = {
+    state: "monitoring" as const,
+    item: {
+      whisparrId: 91,
+      path: "/data/whisparr/unscanned.mkv",
+      title: "Unscanned Movie",
+    },
+  };
+
+  // Monitoring (nothing imported yet) stays missing, never awaiting_scan.
+  recordAcquisitionObservation(acq.id, observation);
+  const monitoring = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    { cookie: member },
+  );
+  assert.equal((await outcomeOf(monitoring)).outcome, "missing");
+
+  // Imported but unscanned: the file exists, the library has not caught up.
+  recordAcquisitionObservation(acq.id, { ...observation, state: "imported" });
+  const lagging = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    { cookie: member },
+  );
+  const lagBody = await outcomeOf(lagging);
+  assert.equal(lagBody.outcome, "awaiting_scan");
+  assert.equal(lagBody.observationStale, false);
+
+  // Catalog detail surfaces the shared state with honest freshness labeling.
+  const detail = await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`, {
+    cookie: member,
+  });
+  const detailBody = (await detail.json()) as AcquisitionDetailBody;
+  assert.equal(detailBody.acquisition?.state, "monitoring");
+  assert.equal(detailBody.acquisition?.observationStale, false);
+
+  // A Jellyfin outage during scan lag stays unavailable, never awaiting_scan.
+  fx.fail.items = 1;
+  const outage = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    { cookie: member },
+  );
+  assert.equal((await outcomeOf(outage)).outcome, "unavailable");
+
+  // A library-denied caller stays denied even while the item is imported.
+  const denied = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    { cookie: await loginAs("nogrants") },
+  );
+  assert.equal((await outcomeOf(denied)).outcome, "denied");
+
+  // A proven Whisparr absence demotes back to missing — no false scan lag.
+  recordAcquisitionObservation(acq.id, {
+    absent: true,
+    reason: "Removed from Whisparr.",
+  });
+  const gone = await call(
+    "GET",
+    `/api/availability/tpdb/movie/${TPDB_MOVIE4}`,
+    { cookie: member },
+  );
+  assert.equal((await outcomeOf(gone)).outcome, "missing");
+});
+
+// --- M4: hazard 5 — foreign origin rejected on EVERY mutating route ---
+// setup/inspect, setup, login (CSRF test), POST /api/requests and
+// PATCH /api/requests/:id (request lifecycle test) are covered above; this
+// test closes the remaining mutating surface and proves no state changed.
+test("foreign origin is rejected on the remaining mutating routes before any mutation", async () => {
+  const evil = "https://evil.example";
+
+  // Foreign logout must not revoke the real session.
+  await errorShape(
+    await call("POST", "/api/logout", {
+      origin: evil,
+      cookie: member,
+      body: {},
+    }),
+    403,
+  );
+  assert.equal((await call("GET", "/api/me", { cookie: member })).status, 200);
+
+  await errorShape(
+    await call("POST", "/api/admin/users/import", {
+      origin: evil,
+      cookie: owner,
+      body: {},
+    }),
+    403,
+  );
+
+  // Grant mutation: rejected, and the target account is unchanged afterwards.
+  const listed = await call("GET", "/api/admin/users", { cookie: owner });
+  const beforeBody = (await listed.json()) as AccountsBody;
+  const before = JSON.stringify(
+    beforeBody.accounts.find((account) => account.id === MEMBER_ID),
+  );
+  await errorShape(
+    await call("PATCH", `/api/admin/users/${MEMBER_ID}`, {
+      origin: evil,
+      cookie: owner,
+      body: {
+        enabled: true,
+        role: "admin",
+        libraryIds: [MOVIES_LIB, SHOWS_LIB],
+      },
+    }),
+    403,
+  );
+  const relisted = await call("GET", "/api/admin/users", { cookie: owner });
+  const afterBody = (await relisted.json()) as AccountsBody;
+  assert.equal(
+    JSON.stringify(
+      afterBody.accounts.find((account) => account.id === MEMBER_ID),
+    ),
+    before,
+  );
+
+  await errorShape(
+    await call("PATCH", "/api/admin/integrations", {
+      origin: evil,
+      cookie: owner,
+      body: {},
+    }),
+    403,
+  );
+});
+
+// --- M4: hazard 2 — warmed artwork/detail stays protected for everyone else ---
+test("warmed library artwork and detail refuse anonymous, library-denied and revoked callers", async () => {
+  // An admitted, granted user fetches the bytes first ("warming").
+  const warm = await call("GET", `/api/images/${ITEM_MOVIE}`, {
+    cookie: member,
+  });
+  assert.equal(warm.status, 200);
+
+  // Anonymous: no session, no bytes.
+  const anon = await call("GET", `/api/images/${ITEM_MOVIE}`);
+  assert.equal(anon.status, 401);
+  await errorShape(await call("GET", `/api/library/${ITEM_MOVIE}`), 401);
+
+  // Library-denied: admitted but granted no libraries; denied without
+  // upstream contact (anti-enumeration 404).
+  const denied = await loginAs("nogrants");
+  await errorShape(
+    await call("GET", `/api/images/${ITEM_MOVIE}`, { cookie: denied }),
+  );
+  await errorShape(
+    await call("GET", `/api/library/${ITEM_MOVIE}`, { cookie: denied }),
+  );
+
+  // Revoked: after logout the same cookie is dead for protected reads.
+  const still = await call("GET", `/api/library/${ITEM_MOVIE}`, {
+    cookie: member,
+  });
+  assert.equal(still.status, 200);
+  await call("POST", "/api/logout", { cookie: member, body: {} });
+  const revokedImage = await call("GET", `/api/images/${ITEM_MOVIE}`, {
+    cookie: member,
+  });
+  assert.equal(revokedImage.status, 401);
+  const revokedItem = await call("GET", `/api/library/${ITEM_MOVIE}`, {
+    cookie: member,
+  });
+  assert.equal(revokedItem.status, 401);
 });

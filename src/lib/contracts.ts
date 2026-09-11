@@ -121,14 +121,17 @@ export type AcquisitionRecord = {
 
 export type AttemptOutcome = "accepted" | "failed" | "uncertain";
 
-/** Result of one external acquisition check: a real observed state, or an
- * unavailable/error check that must not touch recorded state. */
+/** Result of one external acquisition check: a real observed state, a proven
+ * absence from a successful check (authoritative — recorded item facts are
+ * cleared), or an unavailable/error check that must not touch recorded
+ * state. */
 export type AcquisitionObservation =
   | {
       state: "monitoring" | "downloading" | "imported";
       /** Observed external item facts to persist alongside the state. */
       item?: { whisparrId?: number; path?: string; title?: string };
     }
+  | { absent: true; reason: string }
   | { unavailable: true; reason: string };
 
 /** Per-user playback verdict. An exact Jellyfin match plus the current user's
@@ -136,6 +139,9 @@ export type AcquisitionObservation =
 export type PlaybackAccess =
   | { outcome: "available"; item: LibraryItem; watchUrl?: string }
   | { outcome: "missing" }
+  // Imported in Whisparr but Jellyfin has not yet produced an authorized
+  // exact match — distinct from missing and from unavailable.
+  | { outcome: "awaiting_scan"; reason?: string }
   | { outcome: "denied"; reason?: string }
   | { outcome: "ambiguous"; reason?: string }
   | { outcome: "unavailable"; reason?: string };

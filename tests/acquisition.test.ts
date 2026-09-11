@@ -52,6 +52,7 @@ let knobs = {
   addStatus: 201,
   failFindAfterAdd: false,
   failFindOnce: 0,
+  pathOverride: null as string | null,
   holdAdd: null as Promise<void> | null,
 };
 let storedItems = new Map<string, number>();
@@ -66,7 +67,7 @@ function dtoFor(ext: string, id: number) {
     title: "Fixture Movie",
     monitored: true,
     hasFile: knobs.hasFile && ext === EXT_A,
-    path: `/data/whisparr/${ext.slice(0, 8)}`,
+    path: knobs.pathOverride ?? `/data/whisparr/${ext.slice(0, 8)}`,
     foreignId: `tpdbId:${ext}`,
     tmdbId: 0,
     tpdbId: ext,
@@ -172,6 +173,7 @@ function freshDb(): void {
     addStatus: 201,
     failFindAfterAdd: false,
     failFindOnce: 0,
+    pathOverride: null,
     holdAdd: null,
   };
   storedItems = new Map();
@@ -391,7 +393,7 @@ test("a rejected add is failed once and never blind-retried", async () => {
   // A later pass observes; it does not re-POST the rejected add.
   const second = await acquisition.runDueWork(later());
   assert.equal(second.delivered, 0);
-  assert.equal(second.unavailable, 1);
+  assert.equal(second.absent, 1);
   assert.equal(postCount(), 1, "no blind retry of a failed add");
   assert.equal(probe(id).state, "failed");
 });
@@ -591,4 +593,136 @@ test("passes never overlap and the loop start/stop is exact", async (t) => {
   await t.mock.timers.tick(300_000);
   await until(() => false);
   assert.equal(postCount(), 2, "stopped loop never passes again");
+});
+
+test("restart after an upstream-accepted add reconciles by identity without a second POST", async () => {
+  const owner = boot();
+  approve(owner.id, MOVIE_A);
+  const id = workId(MOVIE_A);
+
+  // Whisparr accepts the add, then the process dies before acknowledgement:
+  // the durable attempt row is the last local evidence.
+  const claim = storage.claimAcquisition(id);
+  storage.beginSubmission(id, claim.claimToken);
+  storedItems.set(EXT_A, 1);
+
+  storage.recoverAbandonedWork();
+  assert.equal(probe(id).state, "uncertain");
+
+  const summary = await acquisition.runDueWork();
+  assert.equal(summary.reconciled, 1);
+  assert.equal(postCount(), 0, "reconciliation after a death never re-POSTs");
+  const rec = probe(id);
+  assert.equal(rec.state, "monitoring");
+  assert.equal(rec.whisparrId, 1);
+  assert.equal(rec.whisparrPath, "/data/whisparr/0f0f0f0f");
+});
+
+test("cancellation suppresses only undispatched work; sent and in-flight work survive", async () => {
+  const owner = boot();
+
+  // Accepted work: delivered, then its only request withdrawn.
+  approve(owner.id, MOVIE_A);
+  const idA = workId(MOVIE_A);
+  await acquisition.runDueWork();
+  assert.equal(probe(idA).state, "monitoring");
+
+  // In-flight work: attempt persisted (submitting), no acknowledgement.
+  approve(owner.id, MOVIE_B);
+  const idB = workId(MOVIE_B);
+  const claim = storage.claimAcquisition(idB);
+  storage.beginSubmission(idB, claim.claimToken);
+  assert.equal(rawState(idB).state, "submitting");
+
+  // Undispatched work: approved but never claimed or sent.
+  approve(owner.id, MOVIE_C);
+  const idC = workId(MOVIE_C);
+
+  // Withdraw every request; each is the last active intent for its identity.
+  for (const request of storage
+    .listRequests(owner)
+    .filter((r) => r.decision === "approved")) {
+    storage.cancelRequest(owner, request.id);
+  }
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE_A)?.state,
+    "monitoring",
+    "accepted work is never deleted by a withdrawal",
+  );
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE_B)?.state,
+    "submitting",
+    "in-flight work survives a withdrawal",
+  );
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE_C),
+    null,
+    "the last withdrawal suppresses undispatched work",
+  );
+  assert.equal(
+    storage.listDueAcquisitions(later(), 100).some((a) => a.id === idC),
+    false,
+  );
+
+  // A re-request creates fresh work that dispatches like new.
+  approve(owner.id, MOVIE_C);
+  const freshId = workId(MOVIE_C);
+  assert.notEqual(freshId, idC, "re-requested work is a fresh row");
+  const before = postCount();
+  const summary = await acquisition.runDueWork();
+  assert.equal(summary.delivered, 1);
+  assert.equal(postCount(), before + 1, "fresh work POSTs after suppression");
+  assert.equal(probe(freshId).state, "monitoring");
+});
+
+test("changed facts persist; a proven removal is authoritative while an outage is not", async () => {
+  const owner = boot();
+  approve(owner.id, MOVIE_A);
+  const id = workId(MOVIE_A);
+  await acquisition.runDueWork();
+
+  // Upstream path changed: the next observation must persist the new facts.
+  knobs.pathOverride = "/data/whisparr/moved";
+  let summary = await acquisition.runDueWork(later());
+  assert.equal(summary.observed, 1);
+  let rec = probe(id);
+  assert.equal(
+    rec.whisparrPath,
+    "/data/whisparr/moved",
+    "a changed path is persisted, never kept stale",
+  );
+
+  // Outage: an unknown check keeps facts and the last observation intact.
+  const observedAt = rec.lastObservedAt;
+  knobs.downAll = true;
+  summary = await acquisition.runDueWork(later());
+  assert.equal(summary.unavailable, 1);
+  rec = probe(id);
+  assert.equal(rec.whisparrPath, "/data/whisparr/moved");
+  assert.equal(rec.lastObservedAt, observedAt);
+  assert.equal(
+    storage.hasAuthoritativeAbsence(rec),
+    false,
+    "an outage is never an authoritative absence",
+  );
+
+  // Proven removal: a successful lookup says the identity is gone.
+  knobs.downAll = false;
+  storedItems.delete(EXT_A);
+  summary = await acquisition.runDueWork(later());
+  assert.equal(summary.absent, 1);
+  rec = probe(id);
+  assert.equal(
+    storage.hasAuthoritativeAbsence(rec),
+    true,
+    "a proven removal is authoritative",
+  );
+  assert.equal(rec.whisparrPath, null);
+  assert.equal(rec.whisparrId, null);
+  assert.equal(rec.state, "monitoring", "removal keeps state and history");
+  assert.equal(
+    rec.lastObservedAt,
+    observedAt,
+    "removal never overwrites the last real observation",
+  );
 });

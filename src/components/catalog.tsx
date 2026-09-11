@@ -724,10 +724,15 @@ function acquisitionText(a: {
   }
 }
 
-const AVAIL_NOTE: Record<"denied" | "ambiguous" | "unavailable", string> = {
+const AVAIL_NOTE: Record<
+  "denied" | "ambiguous" | "unavailable" | "awaiting_scan",
+  string
+> = {
   denied: "Your account is not permitted to play this item.",
   ambiguous: "The library match is ambiguous — ask an administrator to check.",
   unavailable: "Availability cannot be checked right now.",
+  awaiting_scan:
+    "Downloaded and imported — waiting for Jellyfin to scan it into your library.",
 };
 
 function AvailabilityBox({

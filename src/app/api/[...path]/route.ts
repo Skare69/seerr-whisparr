@@ -25,8 +25,10 @@ import {
   getAccount,
   getConfig,
   getSession,
+  hasAuthoritativeAbsence,
   importAccounts,
   isInitialized,
+  isObservationStale,
   listAccounts,
   listRequests,
   revokeSession,
@@ -1401,6 +1403,7 @@ async function catalogDetail(
       state: acquisition.state,
       lastError: acquisition.lastError,
       updatedAt: acquisition.updatedAt,
+      observationStale: isObservationStale(acquisition),
     },
   });
 }
@@ -1529,6 +1532,23 @@ async function availability(
         : {}),
     },
   );
+  // Scan lag (hazard 9): Whisparr has imported the item but Jellyfin's fresh
+  // check under this caller's token found no authorized match — the library
+  // simply has not caught up. A proven Whisparr absence demotes back to
+  // missing; outages stay unavailable and per-user denials stay denied
+  // because they never reach this branch.
+  if (
+    verdict.outcome === "missing" &&
+    acquisition !== null &&
+    acquisition.state === "imported" &&
+    !hasAuthoritativeAbsence(acquisition)
+  ) {
+    return json({
+      outcome: "awaiting_scan",
+      reason: "Imported on Whisparr; the media server has not matched it yet.",
+      observationStale: isObservationStale(acquisition),
+    });
+  }
   return json(verdict);
 }
 

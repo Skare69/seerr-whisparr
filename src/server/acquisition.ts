@@ -42,9 +42,11 @@ export type WorkSummary = {
   reconciled: number;
   /** Real observations (monitoring/downloading/imported) recorded. */
   observed: number;
-  /** Failed checks (outage, proven upstream absence) that left state intact. */
+  /** Failed/unknown checks (outage) that left state and facts intact. */
   unavailable: number;
-  /** Submissions that failed definitively. */
+  /** Proven upstream absences: a successful lookup showed the identity
+   * gone; facts cleared, state and history intact. */
+  absent: number;
   failed: number;
   /** Outcomes still unknown; reconciled by identity on a later pass. */
   uncertain: number;
@@ -65,6 +67,7 @@ const EMPTY_SUMMARY: WorkSummary = {
   reconciled: 0,
   observed: 0,
   unavailable: 0,
+  absent: 0,
   failed: 0,
   uncertain: 0,
   blocked: 0,
@@ -253,8 +256,9 @@ async function reconcileUncertain(
 
 /** Recheck previously-sent work. Real observations persist state and the
  * item facts playback depends on; an outage records a failed check without
- * touching recorded state or the last successful observation. Monitoring
- * with no release is never a failure — it is the steady state. */
+ * touching recorded state or the last successful observation; a proven
+ * absence (successful lookup, identity gone) is recorded authoritatively.
+ * Monitoring with no release is never a failure — it is the steady state. */
 async function observe(
   record: AcquisitionRecord,
   config: IntegrationConfig,
@@ -283,13 +287,16 @@ async function observe(
     );
     summary.observed++;
   } else {
-    // Proven upstream absence (removed out of band): an honest failed check.
+    // Proven upstream absence from a successful lookup (removed out of
+    // band): an authoritative absence — facts cleared for callers, state
+    // and history intact. Never a blind re-add and never a deletion
+    // upstream.
     storage.recordAcquisitionObservation(
       record.id,
-      { unavailable: true, reason: "whisparr no longer has this identity" },
+      { absent: true, reason: "whisparr no longer has this identity" },
       claimToken,
     );
-    summary.unavailable++;
+    summary.absent++;
   }
 }
 
