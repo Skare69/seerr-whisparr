@@ -1,14 +1,17 @@
 import type {
   Account,
+  CatalogDetail,
   CatalogKind,
   CatalogProvider,
   CatalogReference,
   ExternalUser,
   IntegrationConfig,
   Library,
+  LibraryItem,
   MediaKind,
   MediaReference,
   ProviderStatus,
+  RequestRecord,
   Role,
   WhisparrPathMapping,
 } from "../../../lib/contracts.ts";
@@ -45,6 +48,7 @@ import {
   getServer,
   listLibraries,
   listLibraryItems,
+  listRecentlyAddedItems,
   listUsers,
   resolvePlaybackAccess,
   validateUser,
@@ -1456,7 +1460,281 @@ async function adminProviders(ctx: AuthContext): Promise<Response> {
   return json({ providers: [tpdb, stashdb] });
 }
 
-// --- dispatch ---
+// --- discover shelves + global search ---
+
+// Wire shapes for the phase-3 UI. Response contracts only; contracts.ts stays
+// domain records. Every shelf/category fails independently: one provider
+// outage or storage error fills its own error field and never fails the page.
+interface ShelfError {
+  code: string;
+  message: string;
+}
+
+interface Shelf {
+  id: string;
+  title: string;
+  // The honest one-line explanation of what this shelf actually is.
+  scope: string;
+  source: "tpdb" | "stashdb" | "jellyfin" | "velvarr";
+  browse?: { view: string; params: Record<string, string> };
+  kind: "catalog" | "library" | "requests";
+  items?: CatalogDetail[] | LibraryItem[] | RequestRecord[];
+  error?: ShelfError;
+}
+
+interface SearchCategory {
+  id: string;
+  provider: "tpdb" | "stashdb";
+  kind: CatalogKind;
+  items: CatalogDetail[];
+  error?: ShelfError;
+}
+
+// AppError codes pass through verbatim so "not configured" stays distinct
+// from "unavailable" at the UI; anything unknown is a bare internal error.
+function shelfError(err: unknown): ShelfError {
+  if (err instanceof AppError) return { code: err.code, message: err.message };
+  return { code: "internal", message: "Internal server error." };
+}
+
+const SHELF_ITEMS = 12;
+const SEARCH_PER_PAGE = 6;
+
+type ShelfItems = CatalogDetail[] | LibraryItem[] | RequestRecord[];
+
+function shelfOf(
+  base: Omit<Shelf, "items" | "error">,
+  result: PromiseSettledResult<ShelfItems>,
+): Shelf {
+  return result.status === "fulfilled"
+    ? { ...base, items: result.value }
+    : // An errored shelf carries no items at all: never an empty list that
+      // could render as a quiet success.
+      { ...base, error: shelfError(result.reason) };
+}
+
+async function discover(request: Request): Promise<Response> {
+  const ctx = await requireSession(request);
+  const requestsScope =
+    ctx.account.role === "requester"
+      ? "Your recent requests."
+      : "Recent requests across all accounts you can moderate.";
+  const [tpdbMovies, tpdbScenes, stashTrending, recentlyAdded, requests] =
+    await Promise.allSettled([
+      searchCatalog({
+        provider: "tpdb",
+        kind: "movie",
+        sort: "recency",
+        direction: "desc",
+        page: 1,
+        perPage: SHELF_ITEMS,
+      }).then((page) => page.items),
+      searchCatalog({
+        provider: "tpdb",
+        kind: "scene",
+        sort: "recency",
+        direction: "desc",
+        page: 1,
+        perPage: SHELF_ITEMS,
+      }).then((page) => page.items),
+      searchCatalog({
+        provider: "stashdb",
+        kind: "scene",
+        sort: "trending",
+        direction: "desc",
+        page: 1,
+        perPage: SHELF_ITEMS,
+      }).then((page) => page.items),
+      listRecentlyAddedItems(ctx.config, ctx.token, ctx.account, SHELF_ITEMS),
+      // storage is sync; defer so its failures settle like the rest.
+      Promise.resolve().then(() => listRequests(ctx.account)),
+    ]);
+  return json({
+    shelves: [
+      shelfOf(
+        {
+          id: "tpdb-recent-movies",
+          title: "Recently released movies",
+          scope:
+            "TPDB movies in release-date order, newest first — release recency, not popularity.",
+          source: "tpdb",
+          kind: "catalog",
+          browse: {
+            view: "catalog",
+            params: {
+              provider: "tpdb",
+              kind: "movie",
+              sort: "recency",
+              direction: "desc",
+            },
+          },
+        },
+        tpdbMovies,
+      ),
+      shelfOf(
+        {
+          id: "tpdb-recent-scenes",
+          title: "Recently released scenes",
+          scope:
+            "TPDB scenes in release-date order, newest first — release recency, not popularity.",
+          source: "tpdb",
+          kind: "catalog",
+          browse: {
+            view: "catalog",
+            params: {
+              provider: "tpdb",
+              kind: "scene",
+              sort: "recency",
+              direction: "desc",
+            },
+          },
+        },
+        tpdbScenes,
+      ),
+      shelfOf(
+        {
+          id: "stashdb-trending-scenes",
+          title: "Trending scenes",
+          scope:
+            "StashDB scenes in StashDB's own TRENDING order, as the provider computes it.",
+          source: "stashdb",
+          kind: "catalog",
+          browse: {
+            view: "catalog",
+            params: {
+              provider: "stashdb",
+              kind: "scene",
+              sort: "trending",
+              direction: "desc",
+            },
+          },
+        },
+        stashTrending,
+      ),
+      shelfOf(
+        {
+          id: "jellyfin-recent",
+          title: "Recently added in your libraries",
+          scope:
+            "Recent additions in the Jellyfin libraries granted to your account, in the server's recently-added order.",
+          source: "jellyfin",
+          kind: "library",
+          browse: { view: "library", params: {} },
+        },
+        recentlyAdded,
+      ),
+      shelfOf(
+        {
+          id: "velvarr-requests",
+          title: "Recent requests",
+          scope: requestsScope,
+          source: "velvarr",
+          kind: "requests",
+          browse: { view: "requests", params: {} },
+        },
+        requests,
+      ),
+    ],
+  });
+}
+
+function categoryOf(
+  id: string,
+  provider: "tpdb" | "stashdb",
+  kind: CatalogKind,
+  result: PromiseSettledResult<CatalogDetail[]>,
+): SearchCategory {
+  return result.status === "fulfilled"
+    ? { id, provider, kind, items: result.value }
+    : { id, provider, kind, items: [], error: shelfError(result.reason) };
+}
+
+async function globalSearch(request: Request): Promise<Response> {
+  await requireSession(request);
+  const url = new URL(request.url);
+  const term = (url.searchParams.get("q") ?? "").trim();
+  if (term.length < 2) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      "Enter at least 2 characters to search.",
+    );
+  }
+  const [
+    tpdbMovies,
+    tpdbScenes,
+    stashdbScenes,
+    tpdbPerformers,
+    stashdbPerformers,
+    tpdbStudios,
+    stashdbStudios,
+  ] = await Promise.allSettled([
+    searchCatalog({
+      provider: "tpdb",
+      kind: "movie",
+      query: term,
+      page: 1,
+      perPage: SEARCH_PER_PAGE,
+    }).then((page) => page.items),
+    searchCatalog({
+      provider: "tpdb",
+      kind: "scene",
+      query: term,
+      page: 1,
+      perPage: SEARCH_PER_PAGE,
+    }).then((page) => page.items),
+    searchCatalog({
+      provider: "stashdb",
+      kind: "scene",
+      query: term,
+      page: 1,
+      perPage: SEARCH_PER_PAGE,
+    }).then((page) => page.items),
+    searchCatalog({
+      provider: "tpdb",
+      kind: "performer",
+      query: term,
+      page: 1,
+      perPage: SEARCH_PER_PAGE,
+    }).then((page) => page.items),
+    searchCatalog({
+      provider: "stashdb",
+      kind: "performer",
+      query: term,
+    }).then((page) => page.items),
+    searchCatalog({
+      provider: "tpdb",
+      kind: "studio",
+      query: term,
+      page: 1,
+      perPage: SEARCH_PER_PAGE,
+    }).then((page) => page.items),
+    searchCatalog({
+      provider: "stashdb",
+      kind: "studio",
+      query: term,
+    }).then((page) => page.items),
+  ]);
+  // Seven source-labeled categories, never merged across providers. Each is
+  // the provider's own search order — no global ranking is computed here.
+  return json({
+    query: term,
+    categories: [
+      categoryOf("tpdb-movies", "tpdb", "movie", tpdbMovies),
+      categoryOf("tpdb-scenes", "tpdb", "scene", tpdbScenes),
+      categoryOf("stashdb-scenes", "stashdb", "scene", stashdbScenes),
+      categoryOf("tpdb-performers", "tpdb", "performer", tpdbPerformers),
+      categoryOf(
+        "stashdb-performers",
+        "stashdb",
+        "performer",
+        stashdbPerformers,
+      ),
+      categoryOf("tpdb-studios", "tpdb", "studio", tpdbStudios),
+      categoryOf("stashdb-studios", "stashdb", "studio", stashdbStudios),
+    ],
+  });
+}
 
 async function routeRequest(
   request: Request,
@@ -1489,6 +1767,9 @@ async function routeRequest(
       return catalogDetail(request, a!, b!, segments[4]!);
     if (root === "requests" && segments.length === 2)
       return listRequestsRoute(request);
+    if (root === "discover" && segments.length === 2) return discover(request);
+    if (root === "search" && segments.length === 2)
+      return globalSearch(request);
     if (root === "availability" && segments.length === 5)
       return availability(request, a!, b!, segments[4]!);
     if (root === "admin" && a === "users" && segments.length === 3)

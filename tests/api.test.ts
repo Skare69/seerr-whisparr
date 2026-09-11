@@ -44,6 +44,8 @@ const TPDB_MOVIE4 = "2a2b3c4d-0000-0000-0000-000000000004";
 const TPDB_PERFORMER = "2a2b3c4d-0000-0000-0000-00000000000f";
 const TPDB_STUDIO = "2a2b3c4d-0000-0000-0000-0000000000a1";
 const STASH_STUDIO = "3b3c4d5e-0000-0000-0000-0000000000b2";
+const STASH_SCENE = "4c4d5e6f-0000-0000-0000-0000000000c3";
+const STASH_PERFORMER = "4c4d5e6f-0000-0000-0000-0000000000d4";
 const TAG_A = "cc000000-0000-0000-0000-000000000001";
 const TAG_B = "cc000000-0000-0000-0000-000000000002";
 
@@ -417,6 +419,13 @@ async function tpdbHandler(
       links: {},
     });
   }
+  if (p === "/performers") {
+    return json(res, 200, {
+      data: [{ id: TPDB_PERFORMER, name: "Fixture Performer" }],
+      meta: { total: 1 },
+      links: {},
+    });
+  }
   if (p === "/sites") {
     return json(res, 200, {
       data: [tpdbSiteRow(TPDB_STUDIO)],
@@ -434,6 +443,7 @@ async function tpdbHandler(
 // --- M3 fixtures: StashDB graphql ---
 
 const stashdbKey = "stash-fixture-key";
+const stashdbFx = { fail: 0 };
 
 async function stashdbHandler(
   req: IncomingMessage,
@@ -441,6 +451,10 @@ async function stashdbHandler(
 ): Promise<void> {
   if (String(req.headers.apikey ?? "") !== stashdbKey) {
     return json(res, 401, {});
+  }
+  if (stashdbFx.fail > 0) {
+    stashdbFx.fail -= 1;
+    return json(res, 500, {});
   }
   const body = await readBody(req);
   const query = typeof body.query === "string" ? body.query : "";
@@ -450,6 +464,44 @@ async function stashdbHandler(
         searchStudio: [
           { id: STASH_STUDIO, name: "Fixture Studio", deleted: false },
         ],
+      },
+    });
+  }
+  if (query.includes("queryScenes")) {
+    return json(res, 200, {
+      data: {
+        queryScenes: {
+          count: 1,
+          scenes: [
+            {
+              id: STASH_SCENE,
+              title: "Fixture Scene",
+              date: "2024-05-06",
+              duration: 600,
+              urls: [],
+              studio: null,
+              tags: [],
+              performers: [],
+            },
+          ],
+        },
+      },
+    });
+  }
+  if (query.includes("searchPerformers")) {
+    return json(res, 200, {
+      data: {
+        searchPerformers: {
+          count: 1,
+          performers: [
+            {
+              id: STASH_PERFORMER,
+              name: "Fixture Performer",
+              deleted: false,
+              images: [],
+            },
+          ],
+        },
       },
     });
   }
@@ -2006,4 +2058,239 @@ test("studio search per provider; studio references refused as media; unsupporte
     { cookie: member },
   );
   assert.equal(commaed.status, 200);
+});
+
+// --- M3 phase B: discover shelves + global multi-category search ---
+
+// Response wire shapes for the endpoints under test. Named boundary casts:
+// json() arrives untyped and no schema validator exists in this suite.
+interface FixtureShelf {
+  id: string;
+  scope: string;
+  browse?: { view: string; params: Record<string, string> };
+  items?: { id?: string; accountId?: string; reference?: unknown }[];
+  error?: { code: string };
+}
+
+interface FixtureCategory {
+  id: string;
+  provider: string;
+  kind: string;
+  items: { reference: { provider: string; kind: string; id: string } }[];
+  error?: { code: string };
+}
+
+async function shelvesOf(res: Response): Promise<FixtureShelf[]> {
+  const body = (await res.json()) as { shelves: FixtureShelf[] };
+  return body.shelves;
+}
+
+async function searchOf(res: Response): Promise<{
+  query: string;
+  categories: FixtureCategory[];
+}> {
+  return (await res.json()) as {
+    query: string;
+    categories: FixtureCategory[];
+  };
+}
+
+test("discover: five isolated shelves, honest scopes, grants, not-configured", async () => {
+  assert.equal((await call("GET", "/api/discover")).status, 401);
+
+  const ok = await call("GET", "/api/discover", { cookie: member });
+  assert.equal(ok.status, 200);
+  const shelves = await shelvesOf(ok);
+  assert.deepEqual(
+    shelves.map((shelf) => shelf.id),
+    [
+      "tpdb-recent-movies",
+      "tpdb-recent-scenes",
+      "stashdb-trending-scenes",
+      "jellyfin-recent",
+      "velvarr-requests",
+    ],
+  );
+  const [movies, scenes, trending, library, requests] = shelves;
+
+  // Every shelf carries items and an honest scope; none fails silently.
+  for (const shelf of shelves) {
+    assert.equal(shelf.error, undefined, shelf.id);
+    assert.ok((shelf.items?.length ?? 0) > 0, `${shelf.id} carries items`);
+    assert.ok(shelf.scope.length > 10, shelf.id);
+  }
+
+  // Recency shelves say release recency and never claim trending/popular.
+  for (const shelf of [movies, scenes]) {
+    assert.match(shelf?.scope ?? "", /release/i, shelf?.id);
+    assert.doesNotMatch(
+      shelf?.scope ?? "",
+      /(?<!not )(trending|popular)/i,
+      shelf?.id,
+    );
+  }
+  assert.match(trending?.scope ?? "", /StashDB/);
+  assert.match(trending?.scope ?? "", /trending/i);
+
+  // Browse destinations mirror the shelf's actual upstream order.
+  assert.deepEqual(movies?.browse, {
+    view: "catalog",
+    params: {
+      provider: "tpdb",
+      kind: "movie",
+      sort: "recency",
+      direction: "desc",
+    },
+  });
+
+  // Catalog shelves carry provider-labeled references.
+  assert.deepEqual(movies?.items?.[0]?.reference, {
+    provider: "tpdb",
+    kind: "movie",
+    id: TPDB_MOVIE,
+  });
+
+  // Jellyfin shelf: granted libraries only — member holds just Movies.
+  assert.deepEqual((library?.items ?? []).map((item) => item.id).sort(), [
+    ITEM_MOVIE,
+  ]);
+  assert.equal(JSON.stringify(library).includes(ITEM_SHOW), false);
+
+  // Requests shelf: storage role-filters; member (requester) sees own only.
+  assert.ok((requests?.items?.length ?? 0) > 0);
+  for (const record of requests?.items ?? []) {
+    assert.equal(record.accountId, MEMBER_ID);
+  }
+
+  // A TPDB outage fills only the TPDB shelves' errors; others keep items.
+  tpdbFx.fail = 2;
+  const outage = await call("GET", "/api/discover", { cookie: member });
+  assert.equal(outage.status, 200, "shelf failure must not fail the page");
+  const [outMovies, outScenes, outTrending, outLibrary, outRequests] =
+    await shelvesOf(outage);
+  for (const shelf of [outMovies, outScenes]) {
+    assert.ok(shelf?.error, shelf?.id);
+    assert.match(shelf?.error?.code ?? "", /unavailable/, shelf?.id);
+    assert.equal(shelf?.items, undefined, shelf?.id);
+  }
+  for (const shelf of [outTrending, outLibrary, outRequests]) {
+    assert.equal(shelf?.error, undefined, shelf?.id);
+    assert.ok((shelf?.items?.length ?? 0) > 0, shelf?.id);
+  }
+
+  // Not-configured is an explicit error on its own shelf only — never an
+  // empty list that could read as a quiet success.
+  const key = process.env.STASHDB_API_KEY;
+  delete process.env.STASHDB_API_KEY;
+  const unconfigured = await call("GET", "/api/discover", { cookie: member });
+  process.env.STASHDB_API_KEY = key;
+  assert.equal(unconfigured.status, 200);
+  const [unconfMovies, , unconfTrending] = await shelvesOf(unconfigured);
+  assert.equal(unconfTrending?.error?.code, "provider_not_configured");
+  assert.equal(unconfTrending?.items, undefined);
+  assert.ok((unconfMovies?.items?.length ?? 0) > 0);
+});
+
+test("global search: seven isolated categories, auth, blank q 400", async () => {
+  assert.equal((await call("GET", "/api/search?q=Fixture")).status, 401);
+
+  // Missing or too-short q is an explicit 400, never an empty result.
+  for (const query of ["/api/search", "/api/search?q=", "/api/search?q=f"]) {
+    const short = await call("GET", query, { cookie: member });
+    assert.equal(short.status, 400, query);
+    const errShape = (await short.json()) as { error?: { code?: string } };
+    assert.equal(errShape.error?.code, "invalid_query", query);
+  }
+
+  const ok = await call("GET", "/api/search?q=Fixture", { cookie: member });
+  assert.equal(ok.status, 200);
+  const search = await searchOf(ok);
+  assert.equal(search.query, "Fixture");
+  assert.deepEqual(
+    search.categories.map((category) => category.id),
+    [
+      "tpdb-movies",
+      "tpdb-scenes",
+      "stashdb-scenes",
+      "tpdb-performers",
+      "stashdb-performers",
+      "tpdb-studios",
+      "stashdb-studios",
+    ],
+  );
+  const [
+    moviesCat,
+    ,
+    stashScenesCat,
+    performersCat,
+    stashPerformersCat,
+    studiosCat,
+    stashStudiosCat,
+  ] = search.categories;
+  for (const category of search.categories) {
+    assert.equal(category.error, undefined, category.id);
+    assert.ok(category.items.length > 0, category.id);
+    // Never merged: every item belongs to the category's own provider.
+    for (const item of category.items) {
+      assert.equal(item.reference.provider, category.provider, category.id);
+    }
+  }
+  assert.deepEqual(moviesCat?.items[0]?.reference, {
+    provider: "tpdb",
+    kind: "movie",
+    id: TPDB_MOVIE,
+  });
+  assert.deepEqual(performersCat?.items[0]?.reference, {
+    provider: "tpdb",
+    kind: "performer",
+    id: TPDB_PERFORMER,
+  });
+  assert.deepEqual(stashScenesCat?.items[0]?.reference, {
+    provider: "stashdb",
+    kind: "scene",
+    id: STASH_SCENE,
+  });
+  assert.deepEqual(stashPerformersCat?.items[0]?.reference, {
+    provider: "stashdb",
+    kind: "performer",
+    id: STASH_PERFORMER,
+  });
+  assert.deepEqual(studiosCat?.items[0]?.reference, {
+    provider: "tpdb",
+    kind: "studio",
+    id: TPDB_STUDIO,
+  });
+  assert.deepEqual(stashStudiosCat?.items[0]?.reference, {
+    provider: "stashdb",
+    kind: "studio",
+    id: STASH_STUDIO,
+  });
+
+  // One provider's outage isolates to its own categories only.
+  stashdbFx.fail = 3;
+  const outage = await call("GET", "/api/search?q=Fixture", { cookie: member });
+  assert.equal(outage.status, 200, "category failure must not fail the page");
+  const outageSearch = await searchOf(outage);
+  const [
+    outMovies,
+    outScenes,
+    outStashScenes,
+    outPerformers,
+    outStashPerformers,
+    outStudios,
+    outStashStudios,
+  ] = outageSearch.categories;
+  for (const category of [
+    outStashScenes,
+    outStashPerformers,
+    outStashStudios,
+  ]) {
+    assert.ok(category?.error, category?.id);
+    assert.match(category?.error?.code ?? "", /unavailable/, category?.id);
+    assert.deepEqual(category?.items, [], category?.id);
+  }
+  for (const category of [outMovies, outScenes, outPerformers, outStudios]) {
+    assert.equal(category?.error, undefined, category?.id);
+    assert.ok((category?.items.length ?? 0) > 0, category?.id);
+  }
 });
