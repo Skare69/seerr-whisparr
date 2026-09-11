@@ -37,7 +37,10 @@
 // - StashDB searchStudio(term, limit) and searchTag(term, limit) return
 //   flat [Studio]/[Tag] lists with no count (unpaged, provider-capped);
 //   queryScenes accepts studios/tags criteria with INCLUDES/EXCLUDES plus
-//   sort/direction (TRENDING and POPULARITY verified live). StudioSortEnum
+//   sort/direction (TRENDING and POPULARITY verified live). SceneQueryInput
+//   also takes parentStudio (a plain ID string, verified live 2026-09-11 —
+//   scenes under that studio's child rows; mutually exclusive with studios,
+//   which is a MultiIDCriterionInput). StudioSortEnum
 //   has no trending order, so studio search exposes no sort at all. StashDB
 //   studio records carry explicit provider URLs, but cross-provider linking
 //   stays performer-level only — studios are never merged across providers.
@@ -639,10 +642,12 @@ function stashPerformerDetail(row: unknown): CatalogDetail | undefined {
   };
 }
 
-/** StashDB Studio: {id, name, deleted, urls, images, parent}. Deleted rows
- * are unusable everywhere (authoritative absence), so they never map; the
- * parent studio is mapped only when the provider supplies one. */
-function stashStudioDetail(row: unknown): CatalogDetail | undefined {
+/** StashDB Studio: {id, name, deleted, urls, images, parent, child_studios}.
+ * Deleted rows are unusable everywhere (authoritative absence), so they never
+ * map; the parent studio is mapped only when the provider supplies one. */
+function stashStudioDetail(
+  row: unknown,
+): (CatalogDetail & { childStudioCount?: number }) | undefined {
   if (row === null || typeof row !== "object") return undefined;
   const r = row as Record<string, unknown>;
   const id = r.id;
@@ -654,6 +659,15 @@ function stashStudioDetail(row: unknown): CatalogDetail | undefined {
   const parentId = parent?.id;
   const imageUrl = stashImageUrl(r.images);
   const links = stashLinks(r.urls);
+  // Provider-supplied structural hint only: an absent child_studios field
+  // stays absent (unknown), a supplied empty list is a real zero. Never
+  // invented for providers that do not expose one.
+  const childStudioCount = Array.isArray(r.child_studios)
+    ? r.child_studios.filter((c) => {
+        if (c === null || typeof c !== "object" || !("id" in c)) return false;
+        return isUuid(c.id);
+      }).length
+    : undefined;
   return {
     reference: { provider: "stashdb", kind: "studio", id },
     title: name,
@@ -666,6 +680,7 @@ function stashStudioDetail(row: unknown): CatalogDetail | undefined {
           },
         }
       : {}),
+    ...(childStudioCount !== undefined ? { childStudioCount } : {}),
     credits: [],
     tags: [],
     related: [],
@@ -901,6 +916,12 @@ export type CatalogSearchQuery =
       query?: string;
       performer?: string;
       studio?: string;
+      /** Only real on a StashDB scene search paired with `studio`. Omitted or
+       * "exact" keeps the studios INCLUDES criterion (this studio only);
+       * "withChildren" issues the parentStudio criterion instead so scenes
+       * living under child studios are included. Rejected for TPDB (no
+       * equivalent criterion), other kinds, or a missing studio. */
+      studioMode?: "exact" | "withChildren";
       tags?: string[];
       tagsExclude?: string[];
       sort?: CatalogSortKey;
@@ -1128,6 +1149,26 @@ export async function searchCatalog(
   // are dispatched before the paging defaults so every remaining query
   // variant genuinely accepts page/perPage.
   const raw = query as Record<string, unknown>;
+  // studioMode is real only on a StashDB scene search paired with a studio
+  // filter. Every other carrier — TPDB (no parentStudio criterion), other
+  // kinds, or a missing studio — is rejected before any upstream request;
+  // parent inclusion is never emulated by widening another provider's query.
+  if (raw.studioMode !== undefined) {
+    if (query.provider !== "stashdb" || query.kind !== "scene") {
+      throw new AppError(
+        400,
+        "invalid_search",
+        "studioMode is only supported on StashDB scene searches.",
+      );
+    }
+    if (query.studio === undefined) {
+      throw new AppError(
+        400,
+        "invalid_search",
+        "studioMode requires a studio filter.",
+      );
+    }
+  }
   if (query.provider === "stashdb" && query.kind === "performer") {
     rejectUnusedFilters(
       raw,
@@ -1366,10 +1407,15 @@ export async function searchCatalog(
     };
   }
   if (query.studio !== undefined) {
-    input.studios = {
-      value: [requireStashStudioId(query.studio)],
-      modifier: "INCLUDES",
-    };
+    // Verified live 2026-09-11: SceneQueryInput.studios is a MultiIDCriterionInput
+    // (INCLUDES = this studio only), while parentStudio is a plain ID string —
+    // scenes under that studio's child rows. The two are mutually exclusive.
+    const studioId = requireStashStudioId(query.studio);
+    if (query.studioMode === "withChildren") {
+      input.parentStudio = studioId;
+    } else {
+      input.studios = { value: [studioId], modifier: "INCLUDES" };
+    }
   }
   const includeTags = cleanTagIds(query.tags, "StashDB");
   const excludeTags = cleanTagIds(query.tagsExclude, "StashDB");
@@ -1537,7 +1583,7 @@ export async function getCatalogDetail(
   }
   if (kind === "studio") {
     const row = await stashQuery(
-      "query($id: ID!) { findStudio(id: $id) { id name deleted urls { url type } images { url } parent { id name } } }",
+      "query($id: ID!) { findStudio(id: $id) { id name deleted urls { url type } images { url } parent { id name } child_studios { id } } }",
       { id },
       "findStudio",
     );

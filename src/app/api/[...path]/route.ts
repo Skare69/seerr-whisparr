@@ -934,6 +934,7 @@ interface CatalogSearchParams {
   year: number | undefined;
   performer: string | null;
   studio: string | null;
+  studioMode: "exact" | "withChildren" | undefined;
   tags: string[] | undefined;
   tagsAll: string[] | undefined;
   tagsExclude: string[] | undefined;
@@ -1076,11 +1077,24 @@ function catalogSearchParams(
     }
     direction = directionRaw;
   }
+  const studioModeRaw = params.get("studioMode");
+  let studioMode: "exact" | "withChildren" | undefined;
+  if (studioModeRaw !== null) {
+    if (studioModeRaw !== "exact" && studioModeRaw !== "withChildren") {
+      throw new AppError(
+        400,
+        "invalid_query",
+        "studioMode must be exact or withChildren.",
+      );
+    }
+    studioMode = studioModeRaw;
+  }
   return {
     q,
     year: yearRaw !== null ? Number(yearRaw) : undefined,
     performer,
     studio,
+    studioMode,
     tags: tagList(params, "tags"),
     tagsAll: tagList(params, "tagsAll"),
     tagsExclude: tagList(params, "tagsExclude"),
@@ -1132,6 +1146,22 @@ function stashdbSearchQuery(
       "StashDB exposes one tag criterion per query; combine include and exclude lists client-side.",
     );
   }
+  if (s.studioMode !== undefined) {
+    if (kind !== "scene") {
+      throw new AppError(
+        400,
+        "invalid_query",
+        `studioMode applies only to StashDB scene search, not ${kind}.`,
+      );
+    }
+    if (s.studio === null) {
+      throw new AppError(
+        400,
+        "invalid_query",
+        "studioMode requires a studio filter.",
+      );
+    }
+  }
   if (kind !== "scene") {
     if (s.q === null) {
       throw new AppError(400, "invalid_query", `${kind} search requires q.`);
@@ -1176,7 +1206,9 @@ function stashdbSearchQuery(
     kind,
     ...(s.q !== null ? { query: s.q } : {}),
     ...(s.performer !== null ? { performer: s.performer } : {}),
-    ...(s.studio !== null ? { studio: s.studio } : {}),
+    ...(s.studio !== null
+      ? { studio: s.studio, studioMode: s.studioMode ?? "exact" }
+      : {}),
     ...(s.tags !== undefined ? { tags: s.tags } : {}),
     ...(s.tagsExclude !== undefined ? { tagsExclude: s.tagsExclude } : {}),
     ...supportedSort("stashdb", kind, s.sort, s.direction),
@@ -1186,13 +1218,21 @@ function stashdbSearchQuery(
 }
 
 // TPDB hosts movies, scenes, performers, and studios (sites); performer and
-// studio searches require q and take no other filters.
+// studio searches require q and take no other filters. studioMode is a
+// StashDB-only criterion; TPDB has no parent-studio equivalent to emulate.
 function tpdbSearchQuery(
   params: URLSearchParams,
   kind: CatalogKind,
   url: URL,
 ): CatalogSearchQuery {
   const s = catalogSearchParams(url, params);
+  if (s.studioMode !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      "studioMode is a StashDB-only filter; TPDB has no parent-studio criterion.",
+    );
+  }
   if (s.tagsExclude !== undefined) {
     throw new AppError(
       400,

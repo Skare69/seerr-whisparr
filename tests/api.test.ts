@@ -443,7 +443,7 @@ async function tpdbHandler(
 // --- M3 fixtures: StashDB graphql ---
 
 const stashdbKey = "stash-fixture-key";
-const stashdbFx = { fail: 0 };
+const stashdbFx = { fail: 0, calls: 0, lastQuery: "", lastVars: "" };
 
 async function stashdbHandler(
   req: IncomingMessage,
@@ -456,8 +456,10 @@ async function stashdbHandler(
     stashdbFx.fail -= 1;
     return json(res, 500, {});
   }
+  stashdbFx.calls += 1;
   const body = await readBody(req);
   const query = typeof body.query === "string" ? body.query : "";
+  stashdbFx.lastVars = JSON.stringify(body.variables ?? null);
   if (query.includes("searchStudio")) {
     return json(res, 200, {
       data: {
@@ -2293,4 +2295,40 @@ test("global search: seven isolated categories, auth, blank q 400", async () => 
     assert.equal(category?.error, undefined, category?.id);
     assert.ok((category?.items.length ?? 0) > 0, category?.id);
   }
+});
+
+// --- M3: studioMode — accepted only for StashDB scene + studio filter ---
+test("studioMode: withChildren reaches provider; every other combo is a 400 before upstream", async () => {
+  // StashDB env points at the fixture (set by the studio-search test above).
+  const ok = await call(
+    "GET",
+    `/api/catalog/search?provider=stashdb&kind=scene&studio=${STASH_STUDIO}&studioMode=withChildren`,
+    { cookie: member },
+  );
+  assert.equal(ok.status, 200);
+  const okBody = (await ok.json()) as {
+    items: { reference: { id: string } }[];
+  };
+  assert.equal(okBody.items[0]?.reference.id, STASH_SCENE);
+  // The provider layer actually issued the parentStudio criterion.
+  assert.match(stashdbFx.lastVars, /parentStudio/);
+
+  // Explicit rejections before any upstream call.
+  const before = stashdbFx.calls;
+  const rejected = [
+    `provider=tpdb&kind=scene&studio=${TPDB_STUDIO}&studioMode=withChildren`,
+    `provider=stashdb&kind=performer&q=x&studio=${STASH_STUDIO}&studioMode=exact`,
+    `provider=stashdb&kind=studio&q=x&studio=${STASH_STUDIO}&studioMode=exact`,
+    `provider=stashdb&kind=scene&studioMode=exact`,
+    `provider=stashdb&kind=scene&studio=${STASH_STUDIO}&studioMode=sometimes`,
+  ];
+  for (const query of rejected) {
+    const res = await call("GET", `/api/catalog/search?${query}`, {
+      cookie: member,
+    });
+    assert.equal(res.status, 400, query);
+    const errBody = (await res.json()) as { error: { code: string } };
+    assert.equal(errBody.error.code, "invalid_query", query);
+  }
+  assert.equal(stashdbFx.calls, before, "no upstream call on rejection");
 });

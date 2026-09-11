@@ -39,7 +39,11 @@ type CatalogSearchPage = {
 };
 
 type DetailPayload = {
-  detail: CatalogDetail;
+  detail: CatalogDetail & {
+    /** StashDB studio detail only: provider-supplied child-studio count
+     * (omitted when the provider supplies none — never defaulted to 0). */
+    childStudioCount?: number;
+  };
   link: { linked?: CatalogReference } | { unlinkedReason?: string };
   myRequest: {
     id: string;
@@ -483,6 +487,8 @@ type CatalogQuery = {
   year: string;
   performer: string;
   studio: string;
+  /** StashDB scene + studio only; omitted means exact studio. */
+  studioMode?: string;
   tags: string;
   sort: string;
   direction: string;
@@ -515,6 +521,7 @@ function useCatalogSearch(f: CatalogQuery): {
     if (f.year) qs.set("year", f.year);
     if (f.performer) qs.set("performer", f.performer);
     if (f.studio) qs.set("studio", f.studio);
+    if (f.studioMode) qs.set("studioMode", f.studioMode);
     if (f.tags) qs.set("tags", f.tags);
     if (f.sort) {
       qs.set("sort", f.sort);
@@ -544,6 +551,7 @@ function useCatalogSearch(f: CatalogQuery): {
     f.year,
     f.performer,
     f.studio,
+    f.studioMode,
     f.tags,
     f.sort,
     f.direction,
@@ -1516,6 +1524,15 @@ export function ScenesView() {
   const year = provider === "tpdb" ? (params.get("year") ?? "") : "";
   const performer = params.get("performer") ?? "";
   const studio = params.get("studio") ?? "";
+  // studioMode is real only for a StashDB scene browse with a studio
+  // filter active; every other combination is ignored here so a stale
+  // URL value can never trigger the server's 400.
+  const studioMode =
+    provider === "stashdb" &&
+    studio !== "" &&
+    params.get("studioMode") === "withChildren"
+      ? "withChildren"
+      : "";
   const tags = params.get("tags") ?? "";
   // A sort from the other provider, or one no longer supported, is ignored
   // rather than sent upstream for an explicit 400.
@@ -1537,6 +1554,7 @@ export function ScenesView() {
     year,
     performer,
     studio,
+    studioMode,
     tags,
     sort: sortKey ?? "",
     direction,
@@ -1578,6 +1596,7 @@ export function ScenesView() {
         sort: null,
         direction: null,
         studio: null,
+        studioMode: null,
         tags: null,
       }),
     [setP, year],
@@ -1591,7 +1610,15 @@ export function ScenesView() {
     [setP],
   );
   const onStudio = useCallback(
-    (v: string) => setP({ studio: v || null, page: null }),
+    (v: string) => setP({ studio: v || null, studioMode: null, page: null }),
+    [setP],
+  );
+  const onStudioMode = useCallback(
+    (v: string) =>
+      setP({
+        studioMode: v === "withChildren" ? "withChildren" : null,
+        page: null,
+      }),
     [setP],
   );
   const removeTag = useCallback(
@@ -1606,6 +1633,52 @@ export function ScenesView() {
     [setP, tags],
   );
   const retry = useCallback(() => setReload((n) => n + 1), []);
+  // A StashDB studio browse that returns zero items may mean the studio is
+  // a parent label whose scenes live under its child studios. The studio's
+  // own detail is fetched only in exactly that case, to tell "parent
+  // label" from a genuinely empty result; a failed fetch keeps the wording
+  // honest without asserting a number.
+  const emptyStashStudio =
+    provider === "stashdb" &&
+    studio !== "" &&
+    data !== null &&
+    data.items.length === 0;
+  const [studioInfo, setStudioInfo] = useState<
+    { title: string; childStudioCount?: number } | "failed" | null
+  >(null);
+  useEffect(() => {
+    setStudioInfo(null);
+    if (!emptyStashStudio) return;
+    let live = true;
+    api<DetailPayload>(
+      `/api/catalog/stashdb/studio/${encodeURIComponent(studio)}`,
+    )
+      .then((d) => {
+        if (live)
+          setStudioInfo({
+            title: d.detail.title,
+            childStudioCount: d.detail.childStudioCount,
+          });
+      })
+      .catch(() => {
+        if (live) setStudioInfo("failed");
+      });
+    return () => {
+      live = false;
+    };
+  }, [emptyStashStudio, studio, data]);
+  const parentEmpty = emptyStashStudio
+    ? studioInfo === null || studioInfo === "failed"
+      ? { kind: "maybe" as const }
+      : typeof studioInfo.childStudioCount === "number" &&
+          studioInfo.childStudioCount > 0
+        ? {
+            kind: "count" as const,
+            count: studioInfo.childStudioCount,
+            title: studioInfo.title,
+          }
+        : null
+    : null;
   return (
     <section aria-label="Scenes">
       <h2 className="text-xl font-semibold">Scenes</h2>
@@ -1653,6 +1726,22 @@ export function ScenesView() {
             placeholder="Performer name…"
           />
         </div>
+        {provider === "stashdb" && studio && (
+          <div className="sm:w-56">
+            <label className="label" htmlFor="scene-studio-scope">
+              Studio scope
+            </label>
+            <select
+              id="scene-studio-scope"
+              className="input mt-1"
+              value={studioMode}
+              onChange={(e) => onStudioMode(e.target.value)}
+            >
+              <option value="">This studio only</option>
+              <option value="withChildren">Include child studios</option>
+            </select>
+          </div>
+        )}
       </div>
       {(q ||
         (provider === "tpdb" && year) ||
@@ -1676,6 +1765,12 @@ export function ScenesView() {
             <FilterChip
               label={`Studio: ${filterName(provider, "studio", studio)}`}
               onRemove={() => onStudio("")}
+            />
+          )}
+          {studioMode === "withChildren" && (
+            <FilterChip
+              label="Scope: include child studios"
+              onRemove={() => onStudioMode("")}
             />
           )}
           {[...new Set(tags.split(",").filter(Boolean))].map((id) => (
@@ -1705,11 +1800,28 @@ export function ScenesView() {
         ) : !data ? (
           <GridSkeleton aspect="aspect-video" cols={LANDSCAPE_COLS} count={6} />
         ) : data.items.length === 0 ? (
-          <div className="panel p-8 text-center text-sm text-muted">
-            {q || year || performer || studio || tags
-              ? `No ${providerLabel(provider)} scenes match your filters.`
-              : `No ${providerLabel(provider)} scenes found.`}
-          </div>
+          parentEmpty ? (
+            <div className="panel p-8 text-center text-sm text-muted">
+              <p>
+                {parentEmpty.kind === "count"
+                  ? `No ${providerLabel(provider)} scenes match your filters. ${parentEmpty.title} is a parent label — its scenes are catalogued under its ${parentEmpty.count} child studios.`
+                  : `No ${providerLabel(provider)} scenes match your filters. If ${filterName("stashdb", "studio", studio)} is a parent label, its scenes are catalogued under its child studios.`}
+              </p>
+              <button
+                type="button"
+                className="btn mt-3"
+                onClick={() => onStudioMode("withChildren")}
+              >
+                Include child studios
+              </button>
+            </div>
+          ) : (
+            <div className="panel p-8 text-center text-sm text-muted">
+              {q || year || performer || studio || tags
+                ? `No ${providerLabel(provider)} scenes match your filters.`
+                : `No ${providerLabel(provider)} scenes found.`}
+            </div>
+          )
         ) : (
           <>
             <div className={LANDSCAPE_COLS}>

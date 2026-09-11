@@ -1867,3 +1867,195 @@ test("sort resolution maps exactly to upstream orders and refuses fake ones", ()
     "TRENDING",
   );
 });
+
+// --- studioMode: parent-studio inclusion on StashDB scenes only ---
+
+test("stashdb studioMode withChildren emits parentStudio; default keeps studios INCLUDES; never both", async () => {
+  const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const fixture = await startFixture((req, res) => {
+    replyJson(res, 200, { data: { queryScenes: { count: 3, scenes: [] } } });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = fixture.origin;
+    await searchCatalog({
+      provider: "stashdb",
+      kind: "scene",
+      studio: STASH_STUDIO_ID,
+      studioMode: "withChildren",
+    });
+    const withChildren = stashBody(fixture, 0).variables.f as Record<
+      string,
+      unknown
+    >;
+    assert.equal(withChildren.parentStudio, STASH_STUDIO_ID);
+    assert.equal("studios" in withChildren, false); // never both criteria
+
+    await searchCatalog({
+      provider: "stashdb",
+      kind: "scene",
+      studio: STASH_STUDIO_ID,
+      studioMode: "exact",
+    });
+    const exact = stashBody(fixture, 1).variables.f as {
+      studios?: { value: string[]; modifier: string };
+      parentStudio?: unknown;
+    };
+    assert.deepEqual(exact.studios, {
+      value: [STASH_STUDIO_ID],
+      modifier: "INCLUDES",
+    });
+    assert.equal("parentStudio" in exact, false);
+
+    // omitted studioMode is byte-for-byte today's behavior
+    await searchCatalog({
+      provider: "stashdb",
+      kind: "scene",
+      studio: STASH_STUDIO_ID,
+    });
+    const omitted = stashBody(fixture, 2).variables.f as {
+      studios?: { value: string[]; modifier: string };
+      parentStudio?: unknown;
+    };
+    assert.deepEqual(omitted.studios, {
+      value: [STASH_STUDIO_ID],
+      modifier: "INCLUDES",
+    });
+    assert.equal("parentStudio" in omitted, false);
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+test("studioMode is rejected before any upstream call outside stashdb scene + studio", async () => {
+  const restore = setEnv({
+    TPDB_API_TOKEN: TPDB_TOKEN,
+    STASHDB_API_KEY: STASH_TOKEN,
+  });
+  const fixture = await startFixture(() => {
+    assert.fail("no request may reach upstream for a rejected studioMode");
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    process.env.STASHDB_BASE_URL = fixture.origin;
+    // TPDB has no parentStudio criterion and must never emulate one by
+    // widening. The typed union already forbids studioMode here, so this
+    // proves the runtime guard an untyped caller would hit.
+    const tpdbSceneSmuggled: Record<string, unknown> = {
+      provider: "tpdb",
+      kind: "scene",
+      studio: TPDB_STUDIO_ID,
+      studioMode: "withChildren",
+    };
+    await assert.rejects(
+      searchCatalog(tpdbSceneSmuggled as CatalogSearchQuery),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    // smuggled onto a TPDB variant that has no studio filters at all
+    const tpdbSmuggled: Record<string, unknown> = {
+      provider: "tpdb",
+      kind: "studio",
+      query: "vixen",
+      studioMode: "withChildren",
+    };
+    await assert.rejects(
+      searchCatalog(tpdbSmuggled as CatalogSearchQuery),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    // stashdb scene: studioMode without a studio filter
+    await assert.rejects(
+      searchCatalog({
+        provider: "stashdb",
+        kind: "scene",
+        studioMode: "withChildren",
+      }),
+      (err: unknown) => {
+        assertProviderError(err, 400, "invalid_search");
+        return true;
+      },
+    );
+    // smuggled onto stashdb performer and studio searches
+    const stashSmuggles: Record<string, unknown>[] = [
+      {
+        provider: "stashdb",
+        kind: "performer",
+        query: "anna",
+        studioMode: "exact",
+      },
+      {
+        provider: "stashdb",
+        kind: "studio",
+        query: "vixen",
+        studioMode: "exact",
+      },
+    ];
+    for (const smuggled of stashSmuggles) {
+      await assert.rejects(
+        searchCatalog(smuggled as CatalogSearchQuery),
+        (err: unknown) => {
+          assertProviderError(err, 400, "invalid_search");
+          return true;
+        },
+      );
+    }
+    assert.equal(fixture.requests.length, 0); // nothing reached upstream
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+test("stashdb studio detail carries provider-supplied child count; absent stays absent", async () => {
+  const restore = setEnv({ STASHDB_API_KEY: STASH_TOKEN });
+  const fixture = await startFixture((req, res) => {
+    const body = JSON.parse(req.body) as { variables: { id?: string } };
+    const childIds =
+      body.variables.id === STASH_STUDIO_ID
+        ? [STASH_TAG_ID, MISSING_ID, "not-a-uuid"] // 2 valid, one malformed
+        : body.variables.id === STASH_PARENT_STUDIO_ID
+          ? [] // supplied empty list: a real zero, not an absence
+          : undefined; // field absent entirely
+    replyJson(res, 200, {
+      data: {
+        findStudio: {
+          id: body.variables.id,
+          name: "Studio",
+          deleted: false,
+          ...(childIds === undefined
+            ? {}
+            : { child_studios: childIds.map((id) => ({ id })) }),
+        },
+      },
+    });
+  });
+  try {
+    process.env.STASHDB_BASE_URL = fixture.origin;
+    const withChildren = (await getCatalogDetail({
+      provider: "stashdb",
+      kind: "studio",
+      id: STASH_STUDIO_ID,
+    })) as CatalogDetail & { childStudioCount?: number };
+    assert.equal(withChildren.childStudioCount, 2); // malformed ids never counted
+    const realZero = (await getCatalogDetail({
+      provider: "stashdb",
+      kind: "studio",
+      id: STASH_PARENT_STUDIO_ID,
+    })) as CatalogDetail & { childStudioCount?: number };
+    assert.equal(realZero.childStudioCount, 0); // real zero, distinguishable
+    const absent = await getCatalogDetail({
+      provider: "stashdb",
+      kind: "studio",
+      id: STASH_DELETED_STUDIO_ID,
+    });
+    assert.equal(absent !== null && "childStudioCount" in absent, false); // omitted, never defaulted
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
