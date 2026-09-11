@@ -151,6 +151,7 @@ function account(libraryIds: string[]): Account {
     libraryIds,
     isOwner: false,
     autoApprove: false,
+    canRemove: false,
   };
 }
 
@@ -3130,4 +3131,407 @@ test("resolvePlaybackAccess keeps proven rejections, outages, and auth deaths di
       );
     },
   );
+});
+
+// --- M7 removal ladder: Whisparr unmonitor/drop, honesty semantics ---
+// Disjoint block. Every destructive request below targets a 127.0.0.1
+// HTTP fixture created and closed by these tests; nothing here ever
+// touches a real Whisparr or Jellyfin instance.
+
+import type { RemovalLevel } from "../src/lib/contracts.ts";
+import {
+  dropWhisparrItem,
+  unmonitorWhisparrItem,
+  whisparrRemovalFlags,
+} from "../src/server/whisparr.ts";
+
+const ADDED_1 = "2026-01-01T00:00:00Z";
+const ADDED_NEWER = "2026-06-01T00:00:00Z";
+
+interface RemovalFixtureStore {
+  dto: Record<string, unknown> | null;
+  lookupStatus?: number;
+  putStatus?: number;
+  deleteStatus?: number;
+  /** Never respond to destructive calls: forces a client-side timeout. */
+  hang?: boolean;
+  /** Answer DELETE with 200 text/plain, which requestJson cannot parse. */
+  rawDelete?: boolean;
+}
+
+function removalHandler(store: RemovalFixtureStore): FixtureHandler {
+  return (req, res, body) => {
+    const p = pathOf(req.url ?? "");
+    if (req.method === "GET" && p === "/api/v3/movie") {
+      if (store.lookupStatus !== undefined) {
+        return sendJson(res, store.lookupStatus, {});
+      }
+      return sendJson(res, 200, store.dto === null ? [] : [store.dto]);
+    }
+    if (req.method === "PUT" && /^\/api\/v3\/movie\/\d+$/.test(p)) {
+      if (store.hang) return;
+      if (store.putStatus !== undefined) {
+        return sendJson(res, store.putStatus, {});
+      }
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      store.dto = {
+        ...(store.dto ?? storedMovie()),
+        ...parsed,
+        monitored: false,
+      };
+      return sendJson(res, 200, store.dto);
+    }
+    if (req.method === "DELETE" && /^\/api\/v3\/movie\/\d+/.test(p)) {
+      if (store.hang) return;
+      if (store.deleteStatus !== undefined) {
+        return sendJson(res, store.deleteStatus, {});
+      }
+      store.dto = null;
+      if (store.rawDelete) {
+        res.writeHead(200, { "content-type": "text/plain" });
+        return res.end("ok");
+      }
+      return sendJson(res, 200, { deleted: true });
+    }
+    sendJson(res, 404, {});
+  };
+}
+
+function requestsByMethod(fx: Fixture, method: string): RecordedRequest[] {
+  return fx.log.filter((entry) => entry.method === method);
+}
+
+test("whisparrRemovalFlags maps each ladder level to its exact DELETE flags", () => {
+  assert.deepEqual(whisparrRemovalFlags("drop"), {
+    deleteFiles: false,
+    addImportExclusion: false,
+  });
+  assert.deepEqual(whisparrRemovalFlags("exclude"), {
+    deleteFiles: false,
+    addImportExclusion: true,
+  });
+  assert.deepEqual(whisparrRemovalFlags("delete_files"), {
+    deleteFiles: true,
+    addImportExclusion: true,
+  });
+  // unmonitor is the separate PUT; delete_jellyfin_item never touches
+  // Whisparr. Neither maps to a Whisparr DELETE.
+  assert.equal(whisparrRemovalFlags("unmonitor"), null);
+  assert.equal(whisparrRemovalFlags("delete_jellyfin_item"), null);
+});
+
+test("unmonitorWhisparrItem issues exactly one PUT with monitored false and never deletes", async () => {
+  const store: RemovalFixtureStore = { dto: storedMovie({ added: ADDED_1 }) };
+  await withFixture(removalHandler(store), async (fx) => {
+    const result = await unmonitorWhisparrItem(
+      whisparrConfig(fx.origin),
+      movieRef,
+    );
+    assert.equal(result.outcome, "done");
+    if (result.outcome !== "done") return assert.fail("unreachable");
+    assert.deepEqual(result.facts, {
+      whisparrId: 2,
+      itemType: "movie",
+      identity: MOVIE_UUID,
+      path: "/data/xxx/Sample Movie",
+      fileCount: 0,
+      sizeOnDisk: 0,
+      monitored: false,
+      added: ADDED_1,
+    });
+    assert.equal(fx.log.length, 2);
+    assert.equal(fx.log[0]!.method, "GET");
+    assert.equal(fx.log[0]!.url, `/api/v3/movie?tpdbId=${MOVIE_UUID}`);
+    const put = fx.log[1]!;
+    assert.equal(put.method, "PUT");
+    assert.equal(pathOf(put.url), "/api/v3/movie/2");
+    assert.ok(!put.url.includes("?"), "unmonitor PUT carries no query flags");
+    const sent = JSON.parse(put.body) as Record<string, unknown>;
+    assert.equal(sent.monitored, false);
+    // The stored resource round-trips: a partial body would wipe fields.
+    assert.equal(sent.tpdbId, MOVIE_UUID);
+    assert.equal(sent.path, "/data/xxx/Sample Movie");
+    assert.equal(requestsByMethod(fx, "DELETE").length, 0);
+    assert.equal(store.dto !== null && store.dto.monitored, false);
+  });
+});
+
+test("drop issues DELETE with the exact query flags of the chosen ladder level", async () => {
+  const ladder: Array<[RemovalLevel, string]> = [
+    ["drop", "deleteFiles=false&addImportExclusion=false"],
+    ["exclude", "deleteFiles=false&addImportExclusion=true"],
+    ["delete_files", "deleteFiles=true&addImportExclusion=true"],
+  ];
+  for (const [level, expectedQuery] of ladder) {
+    const flags = whisparrRemovalFlags(level);
+    if (flags === null) return assert.fail("unreachable");
+    const store: RemovalFixtureStore = { dto: storedMovie({ added: ADDED_1 }) };
+    await withFixture(removalHandler(store), async (fx) => {
+      const result = await dropWhisparrItem(
+        whisparrConfig(fx.origin),
+        movieRef,
+        flags,
+      );
+      assert.equal(result.outcome, "done", level);
+      assert.equal(fx.log.length, 2, level);
+      const removed = fx.log[1]!;
+      assert.equal(removed.method, "DELETE", level);
+      assert.equal(pathOf(removed.url), "/api/v3/movie/2", level);
+      assert.equal(removed.url.split("?")[1], expectedQuery, level);
+      assert.equal(requestsByMethod(fx, "PUT").length, 0, level);
+      assert.equal(store.dto, null, level);
+    });
+  }
+});
+
+test("dropWhisparrItem passes the caller's explicit booleans straight to the wire", async () => {
+  // Files are deleted only when deleteFiles was explicitly chosen.
+  const explicit: RemovalFixtureStore = { dto: storedMovie() };
+  await withFixture(removalHandler(explicit), async (fx) => {
+    await dropWhisparrItem(whisparrConfig(fx.origin), movieRef, {
+      deleteFiles: true,
+    });
+    assert.equal(
+      fx.log[1]!.url.split("?")[1],
+      "deleteFiles=true&addImportExclusion=false",
+    );
+  });
+  // Omitted flags are false — Whisparr's own DELETE defaults.
+  const defaults: RemovalFixtureStore = { dto: storedMovie() };
+  await withFixture(removalHandler(defaults), async (fx) => {
+    await dropWhisparrItem(whisparrConfig(fx.origin), movieRef);
+    assert.equal(
+      fx.log[1]!.url.split("?")[1],
+      "deleteFiles=false&addImportExclusion=false",
+    );
+  });
+});
+
+test("a proven 404 from either destructive call is already-gone success", async () => {
+  const goneOnDelete: RemovalFixtureStore = {
+    dto: storedMovie({ added: ADDED_1 }),
+    deleteStatus: 404,
+  };
+  await withFixture(removalHandler(goneOnDelete), async (fx) => {
+    const result = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef);
+    assert.equal(result.outcome, "already_gone");
+    if (result.outcome !== "already_gone") return assert.fail("unreachable");
+    assert.ok(result.facts !== null && result.facts.whisparrId === 2);
+  });
+  const goneOnPut: RemovalFixtureStore = {
+    dto: storedMovie({ added: ADDED_1 }),
+    putStatus: 404,
+  };
+  await withFixture(removalHandler(goneOnPut), async (fx) => {
+    const result = await unmonitorWhisparrItem(
+      whisparrConfig(fx.origin),
+      movieRef,
+    );
+    assert.equal(result.outcome, "already_gone");
+  });
+});
+
+test("a provably absent identity succeeds without any destructive request", async () => {
+  const store: RemovalFixtureStore = { dto: null };
+  await withFixture(removalHandler(store), async (fx) => {
+    assert.deepEqual(
+      await dropWhisparrItem(whisparrConfig(fx.origin), movieRef),
+      {
+        outcome: "already_gone",
+        facts: null,
+      },
+    );
+    assert.deepEqual(
+      await unmonitorWhisparrItem(whisparrConfig(fx.origin), movieRef),
+      { outcome: "already_gone", facts: null },
+    );
+    assert.equal(requestsByMethod(fx, "DELETE").length, 0);
+    assert.equal(requestsByMethod(fx, "PUT").length, 0);
+    assert.equal(fx.log.length, 2); // the two identity lookups only
+  });
+});
+
+test("timeout on the destructive call is uncertain and carries the pre-call facts", async () => {
+  const store: RemovalFixtureStore = {
+    dto: storedMovie({ added: ADDED_1 }),
+    hang: true,
+  };
+  await withFixture(removalHandler(store), async (fx) => {
+    const result = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef, {
+      timeoutMs: 100,
+    });
+    assert.equal(result.outcome, "uncertain");
+    if (result.outcome !== "uncertain") return assert.fail("unreachable");
+    assert.equal(result.facts.whisparrId, 2);
+    assert.equal(result.facts.added, ADDED_1);
+    assert.ok(result.reason.length > 0);
+    // The attempt did reach the wire exactly once — its effect is what
+    // stays unknown.
+    assert.equal(requestsByMethod(fx, "DELETE").length, 1);
+  });
+});
+
+test("proven 5xx is uncertain; a generic 400 is a failure, never already-gone", async () => {
+  for (const status of [500, 502, 503]) {
+    const store: RemovalFixtureStore = {
+      dto: storedMovie(),
+      deleteStatus: status,
+    };
+    await withFixture(removalHandler(store), async (fx) => {
+      const result = await dropWhisparrItem(
+        whisparrConfig(fx.origin),
+        movieRef,
+      );
+      assert.equal(result.outcome, "uncertain", `DELETE ${status}`);
+    });
+  }
+  const put5xx: RemovalFixtureStore = { dto: storedMovie(), putStatus: 500 };
+  await withFixture(removalHandler(put5xx), async (fx) => {
+    const result = await unmonitorWhisparrItem(
+      whisparrConfig(fx.origin),
+      movieRef,
+    );
+    assert.equal(result.outcome, "uncertain", "PUT 500");
+  });
+  const delete400: RemovalFixtureStore = {
+    dto: storedMovie(),
+    deleteStatus: 400,
+  };
+  await withFixture(removalHandler(delete400), async (fx) => {
+    const result = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef);
+    assert.equal(result.outcome, "failed", "DELETE 400");
+    if (result.outcome !== "failed") return assert.fail("unreachable");
+    assert.ok(result.reason.length > 0);
+  });
+  const put400: RemovalFixtureStore = { dto: storedMovie(), putStatus: 400 };
+  await withFixture(removalHandler(put400), async (fx) => {
+    const result = await unmonitorWhisparrItem(
+      whisparrConfig(fx.origin),
+      movieRef,
+    );
+    assert.equal(result.outcome, "failed", "PUT 400");
+  });
+});
+
+test("retry after uncertainty refuses to delete a freshly re-added item", async () => {
+  const store: RemovalFixtureStore = {
+    dto: storedMovie({ added: ADDED_1 }),
+    hang: true,
+  };
+  await withFixture(removalHandler(store), async (fx) => {
+    const first = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef, {
+      timeoutMs: 100,
+    });
+    assert.equal(first.outcome, "uncertain");
+    if (first.outcome !== "uncertain") return assert.fail("unreachable");
+    // The identity was re-added with a new timestamp (and a new stored id).
+    store.hang = false;
+    store.dto = storedMovie({ id: 77, added: ADDED_NEWER });
+    const retry = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef, {
+      expectAdded: first.facts.added,
+    });
+    assert.equal(retry.outcome, "refused");
+    if (retry.outcome !== "refused") return assert.fail("unreachable");
+    assert.equal(retry.facts.added, ADDED_NEWER);
+    // Exactly one DELETE ever reached the wire: the uncertain first
+    // attempt. The retry refused before acting.
+    assert.equal(requestsByMethod(fx, "DELETE").length, 1);
+    assert.equal(requestsByMethod(fx, "GET").length, 2);
+  });
+});
+
+test("retry after uncertainty completes when the item is unchanged", async () => {
+  const store: RemovalFixtureStore = {
+    dto: storedMovie({ added: ADDED_1 }),
+    hang: true,
+  };
+  await withFixture(removalHandler(store), async (fx) => {
+    const first = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef, {
+      timeoutMs: 100,
+    });
+    if (first.outcome !== "uncertain") return assert.fail("expected uncertain");
+    store.hang = false;
+    const retry = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef, {
+      expectAdded: first.facts.added,
+    });
+    assert.equal(retry.outcome, "done");
+    assert.equal(requestsByMethod(fx, "DELETE").length, 2);
+    assert.equal(store.dto, null);
+  });
+});
+
+test("retry after uncertainty reports success when the item is already gone", async () => {
+  const store: RemovalFixtureStore = {
+    dto: storedMovie({ added: ADDED_1 }),
+    hang: true,
+  };
+  await withFixture(removalHandler(store), async (fx) => {
+    const first = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef, {
+      timeoutMs: 100,
+    });
+    if (first.outcome !== "uncertain") return assert.fail("expected uncertain");
+    // The uncertain attempt had actually completed the deletion.
+    store.hang = false;
+    store.dto = null;
+    const retry = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef, {
+      expectAdded: first.facts.added,
+    });
+    assert.deepEqual(retry, { outcome: "already_gone", facts: null });
+    assert.equal(requestsByMethod(fx, "DELETE").length, 1);
+  });
+});
+
+test("identity re-resolution always precedes the destructive call", async () => {
+  // A lookup outage aborts the preflight before any destructive request.
+  const down: RemovalFixtureStore = { dto: storedMovie(), lookupStatus: 503 };
+  await withFixture(removalHandler(down), async (fx) => {
+    await assert.rejects(
+      dropWhisparrItem(whisparrConfig(fx.origin), movieRef),
+      appError(502, "upstream_unavailable"),
+    );
+    await assert.rejects(
+      unmonitorWhisparrItem(whisparrConfig(fx.origin), movieRef),
+      appError(502, "upstream_unavailable"),
+    );
+    assert.equal(requestsByMethod(fx, "DELETE").length, 0);
+    assert.equal(requestsByMethod(fx, "PUT").length, 0);
+  });
+  // The destructive id comes only from the resolution: it is 2 here
+  // because the fixture served id 2, never because a caller supplied it.
+  const store: RemovalFixtureStore = { dto: storedMovie({ added: ADDED_1 }) };
+  await withFixture(removalHandler(store), async (fx) => {
+    await dropWhisparrItem(whisparrConfig(fx.origin), movieRef);
+    for (const removed of requestsByMethod(fx, "DELETE")) {
+      assert.equal(pathOf(removed.url), "/api/v3/movie/2");
+    }
+  });
+});
+
+test("removal requires a configured Whisparr connection before any traffic", async () => {
+  await withFixture(removalHandler({ dto: storedMovie() }), async (fx) => {
+    const base = whisparrConfig(fx.origin);
+    const unconfigured: IntegrationConfig = { jellyfin: base.jellyfin };
+    await assert.rejects(
+      dropWhisparrItem(unconfigured, movieRef),
+      appError(400, "not_configured"),
+    );
+    await assert.rejects(
+      unmonitorWhisparrItem(unconfigured, movieRef),
+      appError(400, "not_configured"),
+    );
+    assert.equal(fx.log.length, 0);
+  });
+});
+
+test("a 2xx whose body cannot be parsed still proves the drop happened", async () => {
+  // Status checks run before body parsing in the shared HTTP layer, so an
+  // unreadable 2xx payload is proof the server accepted the call — done,
+  // never uncertain.
+  const store: RemovalFixtureStore = { dto: storedMovie(), rawDelete: true };
+  await withFixture(removalHandler(store), async (fx) => {
+    const result = await dropWhisparrItem(whisparrConfig(fx.origin), movieRef);
+    assert.equal(result.outcome, "done");
+    assert.equal(store.dto, null);
+    assert.equal(requestsByMethod(fx, "DELETE").length, 1);
+  });
 });

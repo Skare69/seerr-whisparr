@@ -30,6 +30,7 @@ interface UserPolicy {
   IsDisabled?: boolean;
   EnableRemoteAccess?: boolean;
   EnableMediaPlayback?: boolean;
+  EnableContentDeletion?: boolean;
 }
 
 interface UserDto {
@@ -297,22 +298,27 @@ function effectiveLibraries(
 
 // Single home of the library-membership guarantee: some ancestor of the
 // item must be one of this account's granted (configured-intersected)
-// library folders. Every compared id goes through normalizeItemId.
-function hasGrantedAncestor(
+// library folders. Every compared id goes through normalizeItemId. Returns
+// the granted library folder (id + server name) so callers can audit WHERE
+// the item lived; undefined means no grant.
+function grantedAncestorOf(
   config: IntegrationConfig,
   account: Account,
   ancestors: unknown,
-): boolean {
+): { id: string; name: string } | undefined {
+  if (!Array.isArray(ancestors)) return undefined;
   const grantedLibraries = new Set(effectiveLibraries(config, account));
-  return Array.isArray(ancestors)
-    ? ancestors.some((a) => {
-        try {
-          return grantedLibraries.has(normalizeItemId(a?.Id));
-        } catch {
-          return false;
-        }
-      })
-    : false;
+  for (const a of ancestors) {
+    try {
+      const id = normalizeItemId(a?.Id);
+      if (grantedLibraries.has(id)) {
+        return { id, name: String(a?.Name ?? "").slice(0, 500) };
+      }
+    } catch {
+      // A malformed ancestor id simply is not a grant.
+    }
+  }
+  return undefined;
 }
 
 // Credential-free browser link against the external web base, preserving any
@@ -653,7 +659,7 @@ async function findGrantedItem(
   user: ExternalUser,
   account: Account,
   itemId: string,
-): Promise<BaseItemDto> {
+): Promise<{ dto: BaseItemDto; library: { id: string; name: string } }> {
   const { items } = await fetchItems(config, userToken, user.id, {
     ids: itemId,
     startIndex: 0,
@@ -676,14 +682,15 @@ async function findGrantedItem(
     userToken,
     { service: "jellyfin" },
   );
-  if (!hasGrantedAncestor(config, account, ancestors)) {
+  const library = grantedAncestorOf(config, account, ancestors);
+  if (!library) {
     throw new AppError(
       404,
       "item_not_found",
       "That item is not available to this account.",
     );
   }
-  return dto;
+  return { dto, library };
 }
 
 export async function getLibraryItem(
@@ -703,7 +710,13 @@ export async function getLibraryItem(
     );
   }
   const user = await getCurrentUser(config, userToken);
-  const dto = await findGrantedItem(config, userToken, user, account, itemId);
+  const { dto } = await findGrantedItem(
+    config,
+    userToken,
+    user,
+    account,
+    itemId,
+  );
   // PlaybackInfo is the server's real, user-scoped source verdict; a failure
   // here propagates instead of degrading into a fake "not playable".
   const playback = await requestJson<PlaybackInfoResponse>(
@@ -732,7 +745,13 @@ export async function getLibraryImage(
   }
   const user = await getCurrentUser(config, userToken);
   // Reauthorize item and library membership on EVERY image request.
-  const dto = await findGrantedItem(config, userToken, user, account, itemId);
+  const { dto } = await findGrantedItem(
+    config,
+    userToken,
+    user,
+    account,
+    itemId,
+  );
   if (!dto?.ImageTags?.Primary) {
     throw new AppError(
       404,
@@ -953,7 +972,7 @@ async function verdictForItem(
   }
   // Grant proof by ancestry — the only exact folder-membership proof on the
   // lab Jellyfin 12.0.0 (parentId is ignored alongside ids there); shares
-  // hasGrantedAncestor with findGrantedItem.
+  // grantedAncestorOf with findGrantedItem.
   let ancestors: BaseItemDto[];
   try {
     ancestors = await requestJson<BaseItemDto[]>(
@@ -972,7 +991,7 @@ async function verdictForItem(
     }
     throw err; // the outer catch maps non-auth failures to 'unavailable'
   }
-  if (!hasGrantedAncestor(config, account, ancestors)) {
+  if (!grantedAncestorOf(config, account, ancestors)) {
     return {
       outcome: "denied",
       reason: "The matched item is outside this account's granted libraries.",
@@ -1097,4 +1116,135 @@ export async function resolvePlaybackAccess(
     }
     throw err;
   }
+}
+
+// --- M7 removal: user-token-only Jellyfin item deletion ---
+
+/** The requester's own Jellyfin access token, wrapped so the type system —
+ * not a comment — makes it impossible to pass the integration administrator
+ * key (a bare string from IntegrationConfig) where a user session is
+ * required. Build it only from authenticate()/validateUser() output. */
+export interface JellyfinUserSession {
+  readonly token: string;
+}
+
+/** External facts the removal audit needs, observed BEFORE the delete. */
+export interface JellyfinRemovalFacts {
+  itemId: string;
+  name: string;
+  /** The granted library folder the membership proof resolved through. */
+  libraryId: string;
+  libraryName: string;
+  /** File paths the server supplies (item path plus media-source paths). */
+  paths: string[];
+  /** Total reported media-source size in bytes, when the server supplies it. */
+  size?: number;
+}
+
+export type JellyfinRemovalOutcome =
+  | { status: "removed"; facts: JellyfinRemovalFacts; watchLinkInvalid: true }
+  | {
+      status: "already_gone";
+      facts: JellyfinRemovalFacts;
+      watchLinkInvalid: true;
+    }
+  | { status: "denied"; reason: string; facts: JellyfinRemovalFacts }
+  | { status: "uncertain"; reason: string; facts: JellyfinRemovalFacts };
+
+/** Deletes one Jellyfin item under the REQUESTER'S OWN user token. The
+ * integration administrator key is never sent: an API-key identity resolves
+ * to a null user inside Jellyfin's delete handler and would skip the
+ * CanDelete policy check entirely, so the session wrapper above is the only
+ * credential this function can transmit. Pre-flight, in order, all under the
+ * same user token: non-empty effective libraries, the user policy's
+ * EnableContentDeletion (explicit denial naming the missing permission —
+ * never an admin-key retry), then the standard visibility + ancestor-grant
+ * membership proof. Outcome semantics for callers: a proven upstream 404 is
+ * "already_gone" (success), a proven 401/403 is "denied", and a timeout,
+ * network failure, or 5xx is "uncertain" — the execution state on the
+ * server is unknown and must be reconciled by identity, never retried
+ * blindly. On "removed"/"already_gone" the playable mapping and watch link
+ * for this item are invalid immediately (watchLinkInvalid is a type-level
+ * true, so callers cannot serve a stale link). */
+export async function deleteLibraryItem(
+  config: IntegrationConfig,
+  session: JellyfinUserSession,
+  account: Account,
+  id: string,
+  // Test knob; callers use the 15s default.
+  timeoutMs?: number,
+): Promise<JellyfinRemovalOutcome> {
+  requireJellyfinConfig(config);
+  const itemId = normalizeItemId(id);
+  if (effectiveLibraries(config, account).length === 0) {
+    // Empty grants deny before any upstream contact.
+    throw new AppError(
+      404,
+      "item_not_found",
+      "That item is not available to this account.",
+    );
+  }
+  const me = await requestJson<UserDto>(
+    config.jellyfin.url,
+    "/Users/Me",
+    session.token,
+    { service: "jellyfin", ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
+  );
+  if (me?.Policy?.EnableContentDeletion !== true) {
+    throw new AppError(
+      403,
+      "deletion_forbidden",
+      "Deletion denied: the Jellyfin policy for this user lacks EnableContentDeletion.",
+    );
+  }
+  const user = mapUser(me);
+  const { dto, library } = await findGrantedItem(
+    config,
+    session.token,
+    user,
+    account,
+    itemId,
+  );
+  const paths = [
+    ...new Set(
+      [dto?.Path, ...(dto?.MediaSources ?? []).map((s) => s?.Path)].filter(
+        (p): p is string => typeof p === "string" && p.length > 0,
+      ),
+    ),
+  ];
+  const sizes = (dto?.MediaSources ?? [])
+    .map((s) => s?.Size)
+    .filter((n): n is number => typeof n === "number");
+  const facts: JellyfinRemovalFacts = {
+    itemId,
+    name: String(dto?.Name ?? "").slice(0, 500),
+    libraryId: library.id,
+    libraryName: library.name,
+    paths,
+    ...(sizes.length > 0 ? { size: sizes.reduce((a, b) => a + b, 0) } : {}),
+  };
+  try {
+    // requestBytes, not requestJson: a successful Jellyfin delete is a
+    // body-less 204, which is not JSON.
+    await requestBytes(config.jellyfin.url, `/Items/${itemId}`, session.token, {
+      method: "DELETE",
+      service: "jellyfin",
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    });
+  } catch (err) {
+    if (err instanceof AppError) {
+      // Proven 404: the item is already gone — success, not failure.
+      if (err.upstreamStatus === 404) {
+        return { status: "already_gone", facts, watchLinkInvalid: true };
+      }
+      // Proven rejection by the server's own policy check.
+      if (err.upstreamStatus === 401 || err.upstreamStatus === 403) {
+        return { status: "denied", reason: err.message, facts };
+      }
+      // Timeout, network failure, or 5xx: the delete MAY have happened.
+      return { status: "uncertain", reason: err.message, facts };
+    }
+    throw err;
+  }
+  return { status: "removed", facts, watchLinkInvalid: true };
 }

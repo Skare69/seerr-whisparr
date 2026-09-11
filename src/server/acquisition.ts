@@ -91,6 +91,7 @@ const ALL_REQUESTS_VIEWER = {
   libraryIds: [],
   isOwner: false,
   autoApprove: false,
+  canRemove: false,
 } as const satisfies Account;
 
 function reasonOf(e: unknown): string {

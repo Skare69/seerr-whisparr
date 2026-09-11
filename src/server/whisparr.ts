@@ -10,6 +10,7 @@ import type {
   IntegrationConfig,
   MediaKind,
   MediaReference,
+  RemovalLevel,
 } from "../lib/contracts.ts";
 
 export interface WhisparrStatus {
@@ -180,6 +181,8 @@ interface MovieResourceDto {
   movieFile?: unknown;
   sizeOnDisk?: unknown;
   path?: unknown;
+  /** ISO-8601 stored `added` timestamp; the removal retry guard compares it. */
+  added?: unknown;
   foreignId?: unknown;
   tmdbId?: unknown;
   tpdbId?: unknown;
@@ -392,6 +395,10 @@ export interface WhisparrItem {
   sizeOnDisk?: number;
   /** Present only when the API reveals import exclusion. */
   importExcluded?: boolean;
+  /** File count from stored statistics; 0 when none is reported. */
+  fileCount?: number;
+  /** Stored ISO-8601 `added` timestamp; absent when the build omits it. */
+  added?: string;
 }
 
 function mapStoredItem(dto: MovieResourceDto): WhisparrItem {
@@ -422,6 +429,15 @@ function mapStoredItem(dto: MovieResourceDto): WhisparrItem {
     dto.movieFile != null ||
     (typeof dto.statistics?.movieFileCount === "number" &&
       dto.statistics.movieFileCount > 0);
+  const rawCount = dto.statistics?.movieFileCount;
+  const fileCount =
+    typeof rawCount === "number" && Number.isInteger(rawCount)
+      ? rawCount
+      : // No statistics on an imported item: at least one file must exist.
+        imported
+        ? 1
+        : 0;
+  const added = asString(dto.added);
   return {
     whisparrId: id as number,
     itemType: routed.itemType,
@@ -430,17 +446,20 @@ function mapStoredItem(dto: MovieResourceDto): WhisparrItem {
     monitored: dto.monitored === true,
     path,
     hasFile: imported,
+    fileCount,
+    ...(added !== undefined ? { added } : {}),
     ...(sizeOnDisk !== undefined ? { sizeOnDisk } : {}),
     ...(dto.isExcluded === true ? { importExcluded: true } : {}),
   };
 }
 
-/** Exact-identity adoption lookup: GET /api/v3/movie?tpdbId=|stashId=.
- * Returns the stored item, or null when the identity is provably absent. */
-export async function findWhisparrItem(
+/** Exact-identity stored-resource lookup: GET /api/v3/movie?tpdbId=|stashId=.
+ * Returns the raw stored resource (unmapped), or null when the identity is
+ * provably absent. Conflicting matches are a hard error. */
+async function findStoredMovieDto(
   config: IntegrationConfig,
   ref: MediaReference,
-): Promise<WhisparrItem | null> {
+): Promise<MovieResourceDto | null> {
   const whisparr = requireWhisparr(config);
   const { kind, id } = requireMediaReference(ref);
   const field = kind === "movie" ? "tpdbId" : "stashId";
@@ -472,7 +491,18 @@ export async function findWhisparrItem(
       "Whisparr returned conflicting items for the requested identity.",
     );
   }
-  return matches.length === 1 ? mapStoredItem(matches[0]!) : null;
+  const [match] = matches;
+  return match ?? null;
+}
+
+/** Exact-identity adoption lookup: GET /api/v3/movie?tpdbId=|stashId=.
+ * Returns the stored item, or null when the identity is provably absent. */
+export async function findWhisparrItem(
+  config: IntegrationConfig,
+  ref: MediaReference,
+): Promise<WhisparrItem | null> {
+  const dto = await findStoredMovieDto(config, ref);
+  return dto === null ? null : mapStoredItem(dto);
 }
 
 /** Stored item by Whisparr id. A proven 404 is authoritative absence (null);
@@ -656,4 +686,231 @@ export async function deliverToWhisparr(
     outcome: "uncertain",
     reason: "Whisparr accepted the add but did not confirm the stored item.",
   };
+}
+
+// --- removal ladder (Velvarr M7) ---
+// Explicit, separately callable destructive operations. Nothing here
+// escalates on its own: unmonitor is exactly one PUT with monitored false;
+// drop is exactly one DELETE whose query flags are the caller's explicit
+// booleans (omitted means false — Whisparr's own defaults). Every
+// destructive call gates on a configured connection and re-resolves the
+// stored item by exact identity immediately before acting; no caller-
+// supplied numeric id exists on this API, so a stale id can never select
+// the wrong item. Outcome honesty: a proven 404 is already-gone and a
+// SUCCESS; timeout, network failure, and proven 5xx are UNCERTAIN (the
+// call may or may not have taken effect); any other proven 4xx is a
+// definitive failure.
+
+/** External facts observed before a destructive call — what the audit row
+ * needs, and what a safe retry compares against. */
+export interface WhisparrRemovalFacts {
+  whisparrId: number;
+  itemType: MediaKind;
+  identity: string;
+  path: string;
+  fileCount: number;
+  sizeOnDisk?: number;
+  monitored: boolean;
+  /** ISO-8601 `added` observed at resolution time. On a retry the caller
+   * passes it back as expectAdded so freshly re-added content is never
+   * deleted. */
+  added?: string;
+}
+
+export type WhisparrRemovalResult =
+  | { outcome: "done"; facts: WhisparrRemovalFacts }
+  /** Success: the identity is provably absent, so the requested end state
+   * already holds. facts is null when absence was proven before any call. */
+  | { outcome: "already_gone"; facts: WhisparrRemovalFacts | null }
+  /** The destructive call's effect could not be proven (timeout, network
+   * failure, proven 5xx). facts was captured before the attempt; pass
+   * facts.added back as expectAdded on the retry call. */
+  | { outcome: "uncertain"; facts: WhisparrRemovalFacts; reason: string }
+  /** Retry guard: the identity now resolves to an item whose `added`
+   * differs from the captured attempt — possibly freshly re-added content.
+   * Refused; nothing was sent. */
+  | { outcome: "refused"; facts: WhisparrRemovalFacts; reason: string }
+  /** Proven non-404 4xx rejection (a generic 400 is a failure, never
+   * already-gone). */
+  | { outcome: "failed"; facts: WhisparrRemovalFacts | null; reason: string };
+
+function removalFacts(item: WhisparrItem): WhisparrRemovalFacts {
+  return {
+    whisparrId: item.whisparrId,
+    itemType: item.itemType,
+    identity: item.identity,
+    path: item.path,
+    fileCount: item.fileCount ?? (item.hasFile ? 1 : 0),
+    ...(item.sizeOnDisk !== undefined ? { sizeOnDisk: item.sizeOnDisk } : {}),
+    monitored: item.monitored,
+    ...(item.added !== undefined ? { added: item.added } : {}),
+  };
+}
+
+/** Same-instant comparison for the retry guard. A missing or unparsable
+ * current timestamp can never be proven equal to the captured one, so the
+ * guard refuses — comparison failure must never enable a delete. */
+function sameAdded(current: string | undefined, captured: string): boolean {
+  if (current === undefined) return false;
+  const a = Date.parse(current);
+  const b = Date.parse(captured);
+  if (!Number.isNaN(a) && !Number.isNaN(b)) return a === b;
+  return current === captured;
+}
+
+/** Map a ladder level to the query flags of the single Whisparr DELETE.
+ * Higher rungs carry the effects of the rungs below on the one DELETE where
+ * the API genuinely combines them: `exclude` adds addImportExclusion and
+ * `delete_files` adds deleteFiles on top. `unmonitor` is the separate PUT
+ * and `delete_jellyfin_item` is a Jellyfin-side operation, so neither maps
+ * to a Whisparr DELETE (null). */
+export function whisparrRemovalFlags(
+  level: RemovalLevel,
+): { deleteFiles: boolean; addImportExclusion: boolean } | null {
+  switch (level) {
+    case "drop":
+      return { deleteFiles: false, addImportExclusion: false };
+    case "exclude":
+      return { deleteFiles: false, addImportExclusion: true };
+    case "delete_files":
+      return { deleteFiles: true, addImportExclusion: true };
+    case "unmonitor":
+    case "delete_jellyfin_item":
+      return null;
+    default:
+      throw new AppError(400, "invalid_level", "Unknown removal level.");
+  }
+}
+
+/** Map a destructive-call failure to an honest outcome. A proven 404 means
+ * the item is already gone — SUCCESS. Any other proven 4xx is definitive
+ * rejection. A 2xx whose response payload was unreadable still proves the
+ * server accepted the call (status checks run before body parsing), so it
+ * is done. Timeout, network failure, and proven 5xx leave the effect
+ * genuinely unknown — uncertain, never guessed in either direction. */
+function removalCallOutcome(
+  err: unknown,
+  facts: WhisparrRemovalFacts,
+): WhisparrRemovalResult {
+  if (!(err instanceof AppError)) throw err;
+  if (err.upstreamStatus === 404) return { outcome: "already_gone", facts };
+  if (
+    err.code === "upstream_bad_response" &&
+    err.upstreamStatus === undefined
+  ) {
+    return { outcome: "done", facts };
+  }
+  if (err.upstreamStatus !== undefined && err.upstreamStatus < 500) {
+    return { outcome: "failed", facts, reason: err.message };
+  }
+  return { outcome: "uncertain", facts, reason: err.message };
+}
+
+/** Shared preflight for every destructive call: a configured connection,
+ * a validated reference, and an exact-identity re-resolution immediately
+ * before acting. Absent identity is already-gone. When expectAdded is
+ * supplied (a retry after an uncertain attempt), an item whose `added`
+ * differs from the captured attempt is freshly re-added content: refuse
+ * rather than act on it. Preflight failures throw — no destructive call
+ * was issued, so there is nothing to report as uncertain. */
+async function resolveForRemoval(
+  config: IntegrationConfig,
+  ref: MediaReference,
+  expectAdded: string | undefined,
+): Promise<
+  | {
+      proceed: true;
+      whisparr: WhisparrEndpoint;
+      dto: MovieResourceDto;
+      item: WhisparrItem;
+    }
+  | { proceed: false; result: WhisparrRemovalResult }
+> {
+  const whisparr = requireWhisparr(config);
+  requireMediaReference(ref);
+  const dto = await findStoredMovieDto(config, ref);
+  if (dto === null) {
+    return { proceed: false, result: { outcome: "already_gone", facts: null } };
+  }
+  const item = mapStoredItem(dto);
+  if (expectAdded !== undefined && !sameAdded(item.added, expectAdded)) {
+    return {
+      proceed: false,
+      result: {
+        outcome: "refused",
+        facts: removalFacts(item),
+        reason:
+          "The identity now resolves to an item added after the captured attempt; refusing to act on possibly re-added content.",
+      },
+    };
+  }
+  return { proceed: true, whisparr, dto, item };
+}
+
+/** Ladder rung 1: unmonitor. Exactly one PUT /api/v3/movie/{id} carrying
+ * the stored resource with monitored false. Never deletes — no DELETE is
+ * ever issued by this function. */
+export async function unmonitorWhisparrItem(
+  config: IntegrationConfig,
+  ref: MediaReference,
+  options: { expectAdded?: string; timeoutMs?: number } = {},
+): Promise<WhisparrRemovalResult> {
+  const pre = await resolveForRemoval(config, ref, options.expectAdded);
+  if (!pre.proceed) return pre.result;
+  // Round-trip the stored resource with only monitored flipped: Whisparr's
+  // PUT replaces the resource, so a partial body would wipe stored fields.
+  const body: MovieResourceDto = { ...pre.dto, monitored: false };
+  try {
+    await requestJson<unknown>(
+      pre.whisparr.url,
+      `/api/v3/movie/${pre.item.whisparrId}`,
+      pre.whisparr.apiKey,
+      {
+        service: "whisparr",
+        method: "PUT",
+        body,
+        timeoutMs: options.timeoutMs,
+      },
+    );
+  } catch (err) {
+    return removalCallOutcome(err, removalFacts(pre.item));
+  }
+  return {
+    outcome: "done",
+    facts: { ...removalFacts(pre.item), monitored: false },
+  };
+}
+
+/** Ladder rungs 2-4: drop. Exactly one DELETE /api/v3/movie/{id} whose
+ * query flags are the caller's explicit booleans; omitted flags are false,
+ * matching Whisparr's own defaults, so a plain drop never deletes files
+ * and never adds an import exclusion. Files are deleted only when
+ * deleteFiles was explicitly chosen. */
+export async function dropWhisparrItem(
+  config: IntegrationConfig,
+  ref: MediaReference,
+  options: {
+    deleteFiles?: boolean;
+    addImportExclusion?: boolean;
+    expectAdded?: string;
+    timeoutMs?: number;
+  } = {},
+): Promise<WhisparrRemovalResult> {
+  const deleteFiles = options.deleteFiles === true;
+  const addImportExclusion = options.addImportExclusion === true;
+  const pre = await resolveForRemoval(config, ref, options.expectAdded);
+  if (!pre.proceed) return pre.result;
+  const facts = removalFacts(pre.item);
+  const query = `deleteFiles=${deleteFiles}&addImportExclusion=${addImportExclusion}`;
+  try {
+    await requestJson<unknown>(
+      pre.whisparr.url,
+      `/api/v3/movie/${pre.item.whisparrId}?${query}`,
+      pre.whisparr.apiKey,
+      { service: "whisparr", method: "DELETE", timeoutMs: options.timeoutMs },
+    );
+  } catch (err) {
+    return removalCallOutcome(err, facts);
+  }
+  return { outcome: "done", facts };
 }

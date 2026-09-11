@@ -78,6 +78,89 @@ export type RequestRecord = {
   decidedAt: number | null;
 };
 
+export type RemovalLevel =
+  "unmonitor" | "drop" | "exclude" | "delete_files" | "delete_jellyfin_item";
+
+export type RemovalDecision = "pending" | "approved" | "declined" | "cancelled";
+
+/** One user's durable removal intent. The requester supplies only a reason;
+ * the level is chosen by the approver, never by the requester. */
+export type RemovalRequest = {
+  id: string;
+  accountId: string;
+  media: MediaReference;
+  reason: string;
+  decision: RemovalDecision;
+  /** Set only at approval; null while pending and after decline or cancel. */
+  level: RemovalLevel | null;
+  /** Unix milliseconds. */
+  createdAt: number;
+  decidedAt: number | null;
+};
+
+export type RemovalExecutionState =
+  "unsent" | "executing" | "uncertain" | "done" | "failed" | "blocked";
+
+/** Shared durable removal work for one resolved identity on one logical
+ * Whisparr instance; several requests attach to it. Carries no per-user
+ * history and stores the external facts observed before the call so a retry
+ * can re-resolve by identity and compare. */
+export type RemovalExecution = {
+  id: string;
+  instanceId: string;
+  media: MediaReference;
+  state: RemovalExecutionState;
+  level: RemovalLevel;
+  /** Compare-and-set tokens; stale workers holding old tokens fail writes. */
+  claimToken: string | null;
+  claimedAt: number | null;
+  attemptToken: string | null;
+  attemptAt: number | null;
+  /** External facts observed before the call: Whisparr item id, path, file
+   * count, size, and the item's added timestamp. A retry re-resolves by
+   * identity and compares these before touching anything. */
+  whisparrItemId: number | null;
+  whisparrPath: string | null;
+  whisparrFileCount: number | null;
+  whisparrSize: number | null;
+  whisparrAdded: string | null;
+  /** Parties who created this execution: the first requester and the approver
+   * whose approval attached it. Later attachments live on their own requests. */
+  requesterId: string;
+  approverId: string;
+  /** Next due attempt, unix milliseconds. */
+  dueAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type RemovalAttemptOutcome = "done" | "failed" | "uncertain";
+
+/** External facts a worker observes before any removal call. */
+export type RemovalObservedFacts = {
+  whisparrItemId?: number;
+  path?: string;
+  fileCount?: number;
+  size?: number;
+  added?: string;
+};
+
+/** Append-only evidence for one execution attempt. Never mutated, never
+ * deleted; parties and identities are denormalized so rows stand alone. */
+export type RemovalAudit = {
+  id: string;
+  executionId: string;
+  requesterId: string;
+  approverId: string;
+  media: MediaReference;
+  level: RemovalLevel;
+  attemptToken: string | null;
+  outcome: RemovalAttemptOutcome;
+  detail: string | null;
+  /** Unix milliseconds. */
+  createdAt: number;
+};
+
 export type AcquisitionState =
   | "unsent"
   | "submitting"
@@ -187,6 +270,9 @@ export type Account = {
   isOwner: boolean;
   /** Explicit auto-approve grant for requests; independent of library grants. */
   autoApprove: boolean;
+  /** Explicit removal grant, required (with the operator flag) to create or
+   * approve removal requests; default false, set by an administrator. */
+  canRemove: boolean;
 };
 
 export type ExternalUser = {

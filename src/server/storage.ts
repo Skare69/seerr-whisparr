@@ -24,6 +24,12 @@ import type {
   IntegrationConfig,
   MediaKind,
   MediaReference,
+  RemovalAttemptOutcome,
+  RemovalExecution,
+  RemovalDecision,
+  RemovalLevel,
+  RemovalObservedFacts,
+  RemovalRequest,
   RequestDecision,
   RequestRecord,
   Role,
@@ -34,7 +40,7 @@ import { AppError } from "./http.ts";
 
 // Schema identity: application_id spells 'VLVR', user_version is the schema version.
 const APP_ID = 0x564c5652;
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 // ponytail: fixed 7-day session TTL; make it an env knob only if an operator asks.
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BUSY_TIMEOUT_MS = 5000;
@@ -61,6 +67,23 @@ const SCHEDULABLE_STATES = [
   "downloading",
   "failed",
 ] as const;
+const REMOVAL_LEVELS: readonly RemovalLevel[] = [
+  "unmonitor",
+  "drop",
+  "exclude",
+  "delete_files",
+  "delete_jellyfin_item",
+];
+// Escalation ladder order: a later approval may raise an unstarted shared
+// execution to a level some approver explicitly chose, never lower it.
+const REMOVAL_LEVEL_RANK: Record<RemovalLevel, number> = {
+  unmonitor: 0,
+  drop: 1,
+  exclude: 2,
+  delete_files: 3,
+  delete_jellyfin_item: 4,
+};
+const REMOVAL_SCHEDULABLE_STATES = ["unsent", "uncertain"] as const;
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -72,6 +95,7 @@ type AccountRow = {
   library_ids: string;
   is_owner: number;
   auto_approve: number;
+  can_remove: number;
 };
 type SessionJoinRow = AccountRow & {
   jellyfin_token: Buffer;
@@ -115,6 +139,41 @@ type AcquisitionRow = {
   whisparr_id: number | null;
   whisparr_path: string | null;
   whisparr_title: string | null;
+  created_at: number;
+  updated_at: number;
+};
+type RemovalRequestRow = {
+  id: string;
+  account_id: string;
+  provider: string;
+  kind: string;
+  external_id: string;
+  reason: string;
+  decision: string;
+  level: string | null;
+  created_at: number;
+  decided_at: number | null;
+};
+type RemovalExecutionRow = {
+  id: string;
+  instance_id: string;
+  provider: string;
+  kind: string;
+  external_id: string;
+  state: string;
+  level: string;
+  claim_token: string | null;
+  claimed_at: number | null;
+  attempt_token: string | null;
+  attempt_at: number | null;
+  due_at: number | null;
+  whisparr_item_id: number | null;
+  whisparr_path: string | null;
+  whisparr_file_count: number | null;
+  whisparr_size: number | null;
+  whisparr_added: string | null;
+  requester_id: string;
+  approver_id: string;
   created_at: number;
   updated_at: number;
 };
@@ -162,6 +221,29 @@ type Statements = {
   releaseClaim: StatementSync;
   recoverSubmitting: StatementSync;
   releaseAllClaims: StatementSync;
+  insertRemovalRequest: StatementSync;
+  getRemovalRequest: StatementSync;
+  listAllRemovalRequests: StatementSync;
+  listAccountRemovalRequests: StatementSync;
+  approveRemovalRequest: StatementSync;
+  declineRemovalRequest: StatementSync;
+  cancelRemovalRequest: StatementSync;
+  cancelPendingIntents: StatementSync;
+  insertRemovalExecution: StatementSync;
+  escalateRemovalLevel: StatementSync;
+  getRemovalExecution: StatementSync;
+  getRemovalExecutionByIdentity: StatementSync;
+  listDueRemovalExecutions: StatementSync;
+  claimRemovalExecution: StatementSync;
+  beginRemovalAttempt: StatementSync;
+  completeRemovalDone: StatementSync;
+  completeRemovalUncertain: StatementSync;
+  completeRemovalFailed: StatementSync;
+  insertRemovalAudit: StatementSync;
+  listExecutingRemovals: StatementSync;
+  recoverExecutingRemovals: StatementSync;
+  releaseRemovalClaim: StatementSync;
+  releaseAllRemovalClaims: StatementSync;
 };
 
 const MIGRATIONS: Record<number, string> = {
@@ -270,6 +352,115 @@ const MIGRATIONS: Record<number, string> = {
     ALTER TABLE catalog_identities_new RENAME TO catalog_identities;
     CREATE UNIQUE INDEX catalog_identities_ref
       ON catalog_identities (provider, kind, external_id);
+  `,
+  5: `
+    ALTER TABLE accounts ADD COLUMN can_remove INTEGER NOT NULL DEFAULT 0
+      CHECK (can_remove IN (0, 1));
+    CREATE TABLE removal_executions (
+      id TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene')),
+      external_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (
+        state IN (
+          'unsent', 'executing', 'uncertain', 'done', 'failed', 'blocked'
+        )
+      ),
+      level TEXT NOT NULL CHECK (
+        level IN (
+          'unmonitor', 'drop', 'exclude', 'delete_files', 'delete_jellyfin_item'
+        )
+      ),
+      claim_token TEXT,
+      claimed_at INTEGER,
+      attempt_token TEXT,
+      attempt_at INTEGER,
+      due_at INTEGER,
+      whisparr_item_id INTEGER,
+      whisparr_path TEXT,
+      whisparr_file_count INTEGER,
+      whisparr_size INTEGER,
+      whisparr_added TEXT,
+      requester_id TEXT NOT NULL,
+      approver_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE removal_requests (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene')),
+      external_id TEXT NOT NULL,
+      reason TEXT NOT NULL CHECK (length(reason) <= 2000),
+      decision TEXT NOT NULL
+        CHECK (decision IN ('pending', 'approved', 'declined', 'cancelled')),
+      level TEXT CHECK (
+        level IN (
+          'unmonitor', 'drop', 'exclude', 'delete_files', 'delete_jellyfin_item'
+        )
+      ),
+      created_at INTEGER NOT NULL,
+      decided_at INTEGER,
+      -- A level exists only on an approved request, chosen by the approver:
+      -- no other decision ever carries one. (Table-level CHECKs must come
+      -- after every column definition in SQLite.)
+      CHECK (
+        (decision = 'approved' AND level IS NOT NULL)
+        OR (decision != 'approved' AND level IS NULL)
+      )
+    );
+    CREATE UNIQUE INDEX removal_requests_active_intent
+      ON removal_requests (account_id, provider, kind, external_id)
+      WHERE decision IN ('pending', 'approved');
+    CREATE UNIQUE INDEX removal_executions_identity
+      ON removal_executions (instance_id, provider, kind, external_id);
+    CREATE INDEX removal_executions_due ON removal_executions (due_at);
+    CREATE TABLE removal_audit (
+      id TEXT PRIMARY KEY,
+      execution_id TEXT NOT NULL,
+      requester_id TEXT NOT NULL,
+      approver_id TEXT NOT NULL,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene')),
+      external_id TEXT NOT NULL,
+      level TEXT NOT NULL CHECK (
+        level IN (
+          'unmonitor', 'drop', 'exclude', 'delete_files', 'delete_jellyfin_item'
+        )
+      ),
+      attempt_token TEXT,
+      outcome TEXT NOT NULL CHECK (outcome IN ('done', 'failed', 'uncertain')),
+      detail TEXT,
+      created_at INTEGER NOT NULL
+    );
+    -- Append-only, enforced by the database itself: any mutation aborts.
+    CREATE TRIGGER removal_audit_immutable_update
+      BEFORE UPDATE ON removal_audit BEGIN
+      SELECT RAISE(ABORT, 'removal_audit is append-only');
+    END;
+    CREATE TRIGGER removal_audit_immutable_delete
+      BEFORE DELETE ON removal_audit BEGIN
+      SELECT RAISE(ABORT, 'removal_audit is append-only');
+    END;
+    -- Shared removal work never exists without an approved removal request
+    -- carrying the chosen level for the same identity.
+    CREATE TRIGGER removal_executions_need_approval
+      BEFORE INSERT ON removal_executions BEGIN
+      SELECT RAISE(
+        ABORT,
+        'removal execution requires an approved removal request'
+      )
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM removal_requests r
+        WHERE r.provider = NEW.provider
+          AND r.kind = NEW.kind
+          AND r.external_id = NEW.external_id
+          AND r.decision = 'approved'
+      );
+    END;
   `,
 };
 
@@ -392,7 +583,7 @@ function S(): Statements {
       ),
       updateAccountName: d.prepare("UPDATE accounts SET name = ? WHERE id = ?"),
       updateAccountGrants: d.prepare(
-        "UPDATE accounts SET enabled = ?, role = ?, library_ids = ?, auto_approve = ? WHERE id = ?",
+        "UPDATE accounts SET enabled = ?, role = ?, library_ids = ?, auto_approve = ?, can_remove = ? WHERE id = ?",
       ),
       getAccount: d.prepare("SELECT * FROM accounts WHERE id = ?"),
       listAccounts: d.prepare(
@@ -498,6 +689,93 @@ function S(): Statements {
       releaseAllClaims: d.prepare(
         "UPDATE acquisitions SET claim_token = NULL, claimed_at = NULL, updated_at = ? WHERE claim_token IS NOT NULL",
       ),
+      insertRemovalRequest: d.prepare(
+        "INSERT INTO removal_requests (id, account_id, provider, kind, external_id, reason, decision, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL)",
+      ),
+      getRemovalRequest: d.prepare(
+        "SELECT * FROM removal_requests WHERE id = ?",
+      ),
+      listAllRemovalRequests: d.prepare(
+        "SELECT * FROM removal_requests ORDER BY created_at DESC, id DESC",
+      ),
+      listAccountRemovalRequests: d.prepare(
+        "SELECT * FROM removal_requests WHERE account_id = ? ORDER BY created_at DESC, id DESC",
+      ),
+      approveRemovalRequest: d.prepare(
+        "UPDATE removal_requests SET decision = 'approved', level = ?, decided_at = ? WHERE id = ? AND decision = 'pending'",
+      ),
+      declineRemovalRequest: d.prepare(
+        "UPDATE removal_requests SET decision = 'declined', level = NULL, decided_at = ? WHERE id = ? AND decision = 'pending'",
+      ),
+      cancelRemovalRequest: d.prepare(
+        "UPDATE removal_requests SET decision = 'cancelled', level = NULL, decided_at = ? WHERE id = ? AND decision IN ('pending', 'approved')",
+      ),
+      // The plan's rule: an approved removal cancels pending acquisition
+      // intents for the same identity. Decisions flip, rows never vanish.
+      cancelPendingIntents: d.prepare(
+        "UPDATE requests SET decision = 'cancelled', decided_at = ? WHERE provider = ? AND kind = ? AND external_id = ? AND decision = 'pending'",
+      ),
+      insertRemovalExecution: d.prepare(
+        `INSERT OR IGNORE INTO removal_executions
+           (id, instance_id, provider, kind, external_id, state, level, due_at,
+            requester_id, approver_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'unsent', ?, ?, ?, ?, ?, ?)`,
+      ),
+      escalateRemovalLevel: d.prepare(
+        "UPDATE removal_executions SET level = ?, updated_at = ? WHERE id = ? AND state = 'unsent' AND claim_token IS NULL",
+      ),
+      getRemovalExecution: d.prepare(
+        "SELECT * FROM removal_executions WHERE id = ?",
+      ),
+      getRemovalExecutionByIdentity: d.prepare(
+        "SELECT * FROM removal_executions WHERE instance_id = ? AND provider = ? AND kind = ? AND external_id = ?",
+      ),
+      listDueRemovalExecutions: d.prepare(
+        `SELECT * FROM removal_executions
+         WHERE state IN (${REMOVAL_SCHEDULABLE_STATES.map(() => "?").join(", ")})
+           AND due_at IS NOT NULL AND due_at <= ? AND claim_token IS NULL
+         ORDER BY due_at ASC, id ASC LIMIT ?`,
+      ),
+      claimRemovalExecution: d.prepare(
+        "UPDATE removal_executions SET claim_token = ?, claimed_at = ?, updated_at = ? WHERE id = ? AND claim_token IS NULL",
+      ),
+      beginRemovalAttempt: d.prepare(
+        `UPDATE removal_executions SET state = 'executing', attempt_token = ?,
+           attempt_at = ?, updated_at = ?,
+           whisparr_item_id = COALESCE(?, whisparr_item_id),
+           whisparr_path = COALESCE(?, whisparr_path),
+           whisparr_file_count = COALESCE(?, whisparr_file_count),
+           whisparr_size = COALESCE(?, whisparr_size),
+           whisparr_added = COALESCE(?, whisparr_added)
+         WHERE id = ? AND claim_token = ? AND state IN ('unsent', 'uncertain')`,
+      ),
+      completeRemovalDone: d.prepare(
+        "UPDATE removal_executions SET state = 'done', due_at = NULL, attempt_token = NULL, updated_at = ? WHERE id = ? AND claim_token = ? AND attempt_token = ?",
+      ),
+      completeRemovalUncertain: d.prepare(
+        "UPDATE removal_executions SET state = 'uncertain', due_at = ?, attempt_token = NULL, updated_at = ? WHERE id = ? AND claim_token = ? AND attempt_token = ?",
+      ),
+      completeRemovalFailed: d.prepare(
+        "UPDATE removal_executions SET state = 'failed', due_at = NULL, attempt_token = NULL, updated_at = ? WHERE id = ? AND claim_token = ? AND attempt_token = ?",
+      ),
+      insertRemovalAudit: d.prepare(
+        `INSERT INTO removal_audit
+           (id, execution_id, requester_id, approver_id, provider, kind,
+            external_id, level, attempt_token, outcome, detail, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      listExecutingRemovals: d.prepare(
+        "SELECT * FROM removal_executions WHERE state = 'executing'",
+      ),
+      recoverExecutingRemovals: d.prepare(
+        "UPDATE removal_executions SET state = 'uncertain', due_at = ?, attempt_token = NULL, updated_at = ? WHERE state = 'executing'",
+      ),
+      releaseRemovalClaim: d.prepare(
+        "UPDATE removal_executions SET claim_token = NULL, claimed_at = NULL, updated_at = ? WHERE id = ? AND claim_token = ?",
+      ),
+      releaseAllRemovalClaims: d.prepare(
+        "UPDATE removal_executions SET claim_token = NULL, claimed_at = NULL, updated_at = ? WHERE claim_token IS NOT NULL",
+      ),
     };
   }
   return stmts;
@@ -568,6 +846,7 @@ function rowToAccount(row: AccountRow): Account {
     libraryIds: JSON.parse(row.library_ids) as string[],
     isOwner: row.is_owner === 1,
     autoApprove: row.auto_approve === 1,
+    canRemove: row.can_remove === 1,
   };
 }
 
@@ -869,6 +1148,7 @@ export function bootstrap(
       libraryIds: [...resolved.jellyfin.libraryIds],
       isOwner: true,
       autoApprove: false,
+      canRemove: false,
     };
     S().insertAccount.run(
       account.id,
@@ -941,6 +1221,7 @@ export function updateAccount(
     role: Role;
     libraryIds: string[];
     autoApprove?: boolean;
+    canRemove?: boolean;
   },
 ): Account {
   if (
@@ -948,7 +1229,8 @@ export function updateAccount(
     !ROLES.includes(changes.role) ||
     !Array.isArray(changes.libraryIds) ||
     (changes.autoApprove !== undefined &&
-      typeof changes.autoApprove !== "boolean")
+      typeof changes.autoApprove !== "boolean") ||
+    (changes.canRemove !== undefined && typeof changes.canRemove !== "boolean")
   ) {
     throw new AppError(
       400,
@@ -986,6 +1268,7 @@ export function updateAccount(
   }
   // Preserve-on-omission PATCH: an absent autoApprove keeps the stored grant.
   const autoApprove = changes.autoApprove ?? existing.autoApprove;
+  const canRemove = changes.canRemove ?? existing.canRemove;
   const d = open();
   inTransaction(d, () => {
     S().updateAccountGrants.run(
@@ -993,12 +1276,14 @@ export function updateAccount(
       changes.role,
       JSON.stringify(changes.libraryIds),
       autoApprove ? 1 : 0,
+      canRemove ? 1 : 0,
       id,
     );
     const changed =
       existing.enabled !== changes.enabled ||
       existing.role !== changes.role ||
       existing.autoApprove !== autoApprove ||
+      existing.canRemove !== canRemove ||
       existing.libraryIds.length !== changes.libraryIds.length ||
       existing.libraryIds.some((l, i) => l !== changes.libraryIds[i]);
     if (changed) S().deleteAccountSessions.run(id);
@@ -1630,6 +1915,511 @@ export function releaseAcquisitionClaim(id: string, claimToken: string): void {
   S().releaseClaim.run(Date.now(), id, claimToken);
 }
 
+// --- M7: removal requests, shared executions, append-only audit ---
+
+function rowToRemovalRequest(row: RemovalRequestRow): RemovalRequest {
+  return {
+    id: row.id,
+    accountId: row.account_id,
+    media: {
+      provider: row.provider as CatalogProvider,
+      kind: row.kind as MediaKind,
+      id: row.external_id,
+    },
+    reason: row.reason,
+    decision: row.decision as RemovalDecision,
+    level: (row.level ?? null) as RemovalLevel | null,
+    createdAt: row.created_at,
+    decidedAt: row.decided_at,
+  };
+}
+
+function rowToRemovalExecution(row: RemovalExecutionRow): RemovalExecution {
+  return {
+    id: row.id,
+    instanceId: row.instance_id,
+    media: {
+      provider: row.provider as CatalogProvider,
+      kind: row.kind as MediaKind,
+      id: row.external_id,
+    },
+    state: row.state as RemovalExecution["state"],
+    level: row.level as RemovalLevel,
+    claimToken: row.claim_token,
+    claimedAt: row.claimed_at,
+    attemptToken: row.attempt_token,
+    attemptAt: row.attempt_at,
+    dueAt: row.due_at,
+    whisparrItemId: row.whisparr_item_id,
+    whisparrPath: row.whisparr_path,
+    whisparrFileCount: row.whisparr_file_count,
+    whisparrSize: row.whisparr_size,
+    whisparrAdded: row.whisparr_added,
+    requesterId: row.requester_id,
+    approverId: row.approver_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+// The operator opt-in is the environment flag, checked server-side: with it
+// off, removal is visibly unavailable (403), never hidden, never silent.
+function assertRemovalEnabled(): void {
+  if (process.env.VELVARR_ENABLE_REMOVAL !== "1") {
+    throw new AppError(
+      403,
+      "removal_disabled",
+      "removals are not enabled on this server",
+    );
+  }
+}
+
+// Approving a deletion requires an elevated role AND the personal removal
+// grant; either alone is not enough.
+function isRemovalApprover(actor: Account): boolean {
+  return (
+    (actor.role === "admin" || actor.role === "moderator") &&
+    actor.canRemove === true
+  );
+}
+
+/** Records one user's removal intent: a reason, never a level. Admission is
+ * read from the stored account, and both the operator flag and the personal
+ * `canRemove` grant are required. */
+export function createRemovalRequest(
+  accountId: string,
+  media: MediaReference,
+  reason: string,
+): RemovalRequest {
+  assertRemovalEnabled();
+  assertMediaReference(media);
+  if (!nonemptyString(reason, 2000)) {
+    throw new AppError(400, "invalid_reason", "a removal reason is required");
+  }
+  const d = open();
+  return inTransaction(d, () => {
+    const account = S().getAccount.get(accountId) as AccountRow | undefined;
+    if (!account || account.enabled !== 1 || account.can_remove !== 1) {
+      throw new AppError(
+        403,
+        "account_not_admitted",
+        "only admitted accounts holding the removal grant may request removals",
+      );
+    }
+    const id = randomUUID();
+    try {
+      S().insertRemovalRequest.run(
+        id,
+        accountId,
+        media.provider,
+        media.kind,
+        media.id,
+        reason,
+        Date.now(),
+      );
+    } catch (e) {
+      if (
+        isUniqueConflict(e, [
+          "removal_requests.account_id",
+          "removal_requests.external_id",
+        ])
+      ) {
+        throw new AppError(
+          409,
+          "removal_request_exists",
+          "an active removal request for this item already exists",
+        );
+      }
+      throw e;
+    }
+    return rowToRemovalRequest(
+      S().getRemovalRequest.get(id) as RemovalRequestRow,
+    );
+  });
+}
+
+/** Durable removal view with the same role filtering and privacy as
+ * acquisition requests: requesters see only their own history. */
+export function listRemovalRequests(viewer: Account): RemovalRequest[] {
+  const rows =
+    viewer.role === "requester"
+      ? (S().listAccountRemovalRequests.all(viewer.id) as RemovalRequestRow[])
+      : (S().listAllRemovalRequests.all() as RemovalRequestRow[]);
+  return rows.map(rowToRemovalRequest);
+}
+
+export function getRemovalRequest(id: string, viewer: Account): RemovalRequest {
+  const row = S().getRemovalRequest.get(id) as RemovalRequestRow | undefined;
+  if (!row || (viewer.role === "requester" && row.account_id !== viewer.id)) {
+    // A requester learns nothing about another user's removal requests.
+    throw new AppError(
+      404,
+      "removal_request_not_found",
+      "removal request not found",
+    );
+  }
+  return rowToRemovalRequest(row);
+}
+
+/** Approval chooses the level and is transactional with the shared-execution
+ * attachment: two approvers converge on one execution per instance+identity.
+ * The plan's rule runs here: approving a removal cancels every PENDING
+ * acquisition intent for the same identity — decisions flip, while history
+ * rows, the catalog record, and already-approved intents are never touched. */
+export function approveRemovalRequest(
+  actor: Account,
+  requestId: string,
+  level: RemovalLevel,
+): RemovalRequest {
+  assertRemovalEnabled();
+  if (!REMOVAL_LEVELS.includes(level)) {
+    throw new AppError(400, "invalid_level", "removal level is invalid");
+  }
+  if (!isRemovalApprover(actor)) {
+    throw new AppError(
+      403,
+      "forbidden",
+      "approving removals requires an elevated role and the removal grant",
+    );
+  }
+  const d = open();
+  return inTransaction(d, () => {
+    // Grants are re-read from storage: a revoked grant denies even a stale
+    // session account, and no caller-supplied Account can carry permission in.
+    const stored = S().getAccount.get(actor.id) as AccountRow | undefined;
+    if (
+      !stored ||
+      stored.enabled !== 1 ||
+      (stored.role !== "admin" && stored.role !== "moderator") ||
+      stored.can_remove !== 1
+    ) {
+      throw new AppError(
+        403,
+        "forbidden",
+        "approving removals requires an elevated role and the removal grant",
+      );
+    }
+    const row = S().getRemovalRequest.get(requestId) as
+      RemovalRequestRow | undefined;
+    if (!row) {
+      throw new AppError(
+        404,
+        "removal_request_not_found",
+        "removal request not found",
+      );
+    }
+    if (row.decision !== "pending") {
+      throw new AppError(
+        409,
+        "removal_request_not_pending",
+        "only pending removal requests can be decided",
+      );
+    }
+    const whisparr = getConfig()?.whisparr;
+    if (!whisparr?.instanceId) {
+      // An approval that could never execute is a lie; refuse instead.
+      throw new AppError(
+        500,
+        "instance_identity_missing",
+        "the configured Whisparr connection has no stored instance identity",
+      );
+    }
+    const now = Date.now();
+    S().approveRemovalRequest.run(level, now, requestId);
+    S().cancelPendingIntents.run(now, row.provider, row.kind, row.external_id);
+    // One shared execution per identity: the first approval creates it,
+    // later approvals converge. An unstarted execution takes the highest
+    // level some approver explicitly chose; claimed or in-flight work is
+    // never touched.
+    S().insertRemovalExecution.run(
+      randomUUID(),
+      whisparr.instanceId,
+      row.provider,
+      row.kind,
+      row.external_id,
+      level,
+      now,
+      row.account_id,
+      actor.id,
+      now,
+      now,
+    );
+    const exec = S().getRemovalExecutionByIdentity.get(
+      whisparr.instanceId,
+      row.provider,
+      row.kind,
+      row.external_id,
+    ) as RemovalExecutionRow;
+    if (
+      exec.state === "unsent" &&
+      exec.claim_token === null &&
+      REMOVAL_LEVEL_RANK[exec.level as RemovalLevel] < REMOVAL_LEVEL_RANK[level]
+    ) {
+      S().escalateRemovalLevel.run(level, now, exec.id);
+    }
+    return rowToRemovalRequest(
+      S().getRemovalRequest.get(requestId) as RemovalRequestRow,
+    );
+  });
+}
+
+/** Declining needs an elevated role only: it destroys nothing. */
+export function declineRemovalRequest(
+  actor: Account,
+  requestId: string,
+): RemovalRequest {
+  if (actor.role !== "admin" && actor.role !== "moderator") {
+    throw new AppError(403, "forbidden", "decisions require elevated role");
+  }
+  const d = open();
+  return inTransaction(d, () => {
+    const row = S().getRemovalRequest.get(requestId) as
+      RemovalRequestRow | undefined;
+    if (!row) {
+      throw new AppError(
+        404,
+        "removal_request_not_found",
+        "removal request not found",
+      );
+    }
+    if (row.decision !== "pending") {
+      throw new AppError(
+        409,
+        "removal_request_not_pending",
+        "only pending removal requests can be decided",
+      );
+    }
+    S().declineRemovalRequest.run(Date.now(), requestId);
+    return rowToRemovalRequest(
+      S().getRemovalRequest.get(requestId) as RemovalRequestRow,
+    );
+  });
+}
+
+/** Cancels only the actor's own intent; never another user's request and
+ * never any external media. Cancelling an approved request leaves the shared
+ * execution alone: it may carry another user's approval, and an approver's
+ * explicit authorization is not withdrawn by the requester. */
+export function cancelRemovalRequest(
+  actor: Account,
+  requestId: string,
+): RemovalRequest {
+  const d = open();
+  return inTransaction(d, () => {
+    const row = S().getRemovalRequest.get(requestId) as
+      RemovalRequestRow | undefined;
+    if (!row || row.account_id !== actor.id) {
+      throw new AppError(
+        404,
+        "removal_request_not_found",
+        "removal request not found",
+      );
+    }
+    if (row.decision !== "pending" && row.decision !== "approved") {
+      throw new AppError(
+        409,
+        "removal_request_not_cancellable",
+        "only pending or approved removal requests can be cancelled",
+      );
+    }
+    S().cancelRemovalRequest.run(Date.now(), requestId);
+    return rowToRemovalRequest(
+      S().getRemovalRequest.get(requestId) as RemovalRequestRow,
+    );
+  });
+}
+
+/** Shared removal execution for one identity on the configured instance, or
+ * null. Carries no per-user request history. */
+export function getRemovalExecutionByReference(
+  media: MediaReference,
+  instanceId?: string,
+): RemovalExecution | null {
+  assertMediaReference(media);
+  const instance = instanceId ?? getConfig()?.whisparr?.instanceId;
+  if (!instance) return null;
+  const row = S().getRemovalExecutionByIdentity.get(
+    instance,
+    media.provider,
+    media.kind,
+    media.id,
+  ) as RemovalExecutionRow | undefined;
+  return row ? rowToRemovalExecution(row) : null;
+}
+
+/** Schedulable work: due, unclaimed removals ordered oldest-due first. */
+export function listDueRemovalExecutions(
+  now: number,
+  limit = 20,
+): RemovalExecution[] {
+  assertRemovalEnabled();
+  return (
+    S().listDueRemovalExecutions.all(
+      ...REMOVAL_SCHEDULABLE_STATES,
+      now,
+      limit,
+    ) as RemovalExecutionRow[]
+  ).map(rowToRemovalExecution);
+}
+
+/** Transactionally claims one removal; concurrent claims lose with 409. */
+export function claimRemovalExecution(id: string): {
+  record: RemovalExecution;
+  claimToken: string;
+} {
+  assertRemovalEnabled();
+  const d = open();
+  return inTransaction(d, () => {
+    const claimToken = randomUUID();
+    const now = Date.now();
+    S().claimRemovalExecution.run(claimToken, now, now, id);
+    const row = S().getRemovalExecution.get(id) as
+      RemovalExecutionRow | undefined;
+    if (!row || row.claim_token !== claimToken) {
+      throw new AppError(
+        409,
+        "already_claimed",
+        "removal execution already claimed",
+      );
+    }
+    return { record: rowToRemovalExecution(row), claimToken };
+  });
+}
+
+/** Persists the attempt (state executing) and the externally observed facts
+ * BEFORE any removal call. A crash after this point leaves recoverable
+ * evidence and comparable facts instead of a blind retry. */
+export function beginRemovalAttempt(
+  id: string,
+  claimToken: string,
+  facts: RemovalObservedFacts,
+): { attemptToken: string; record: RemovalExecution } {
+  const whisparrItemId =
+    typeof facts?.whisparrItemId === "number" &&
+    Number.isInteger(facts.whisparrItemId)
+      ? facts.whisparrItemId
+      : null;
+  const path = nonemptyString(facts?.path, 4096) ? facts.path : null;
+  const fileCount =
+    typeof facts?.fileCount === "number" &&
+    Number.isInteger(facts.fileCount) &&
+    facts.fileCount >= 0
+      ? facts.fileCount
+      : null;
+  const size =
+    typeof facts?.size === "number" &&
+    Number.isInteger(facts.size) &&
+    facts.size >= 0
+      ? facts.size
+      : null;
+  const added = nonemptyString(facts?.added, 100) ? facts.added : null;
+  const attemptToken = randomUUID();
+  const res = S().beginRemovalAttempt.run(
+    attemptToken,
+    Date.now(),
+    Date.now(),
+    whisparrItemId,
+    path,
+    fileCount,
+    size,
+    added,
+    id,
+    claimToken,
+  );
+  if (res.changes === 0) {
+    throw new AppError(
+      409,
+      "claim_lost",
+      "claim or state changed; this worker is stale",
+    );
+  }
+  return {
+    attemptToken,
+    record: rowToRemovalExecution(
+      S().getRemovalExecution.get(id) as RemovalExecutionRow,
+    ),
+  };
+}
+
+/** Completes one attempt as done, failed or uncertain and appends the
+ * attempt's audit row in the same transaction. Failed is a definitive
+ * refusal (terminal); uncertain schedules a re-resolve by identity; the
+ * executed level stays the one approvals chose — nothing is implied here. */
+export function completeRemovalAttempt(
+  id: string,
+  claimToken: string,
+  attemptToken: string,
+  outcome: RemovalAttemptOutcome,
+  detail?: string,
+): RemovalExecution {
+  if (outcome !== "done" && outcome !== "failed" && outcome !== "uncertain") {
+    throw new AppError(400, "invalid_outcome", "removal outcome is invalid");
+  }
+  if (detail !== undefined && !nonemptyString(detail, 2000)) {
+    throw new AppError(400, "invalid_detail", "attempt detail is invalid");
+  }
+  const d = open();
+  return inTransaction(d, () => {
+    const row = S().getRemovalExecution.get(id) as
+      RemovalExecutionRow | undefined;
+    if (!row) {
+      throw new AppError(
+        404,
+        "removal_execution_not_found",
+        "removal execution not found",
+      );
+    }
+    const now = Date.now();
+    let res: { changes: number | bigint };
+    switch (outcome) {
+      case "done":
+        res = S().completeRemovalDone.run(now, id, claimToken, attemptToken);
+        break;
+      case "uncertain":
+        res = S().completeRemovalUncertain.run(
+          now + RECHECK_DELAY_MS,
+          now,
+          id,
+          claimToken,
+          attemptToken,
+        );
+        break;
+      default:
+        res = S().completeRemovalFailed.run(now, id, claimToken, attemptToken);
+    }
+    if (res.changes === 0) {
+      throw new AppError(
+        409,
+        "attempt_lost",
+        "claim or attempt changed; this worker is stale",
+      );
+    }
+    // One audit row per attempt, written transactionally with the outcome.
+    // The table is insert-only and the schema itself aborts any mutation.
+    S().insertRemovalAudit.run(
+      randomUUID(),
+      id,
+      row.requester_id,
+      row.approver_id,
+      row.provider,
+      row.kind,
+      row.external_id,
+      row.level,
+      attemptToken,
+      outcome,
+      detail ?? null,
+      now,
+    );
+    return rowToRemovalExecution(
+      S().getRemovalExecution.get(id) as RemovalExecutionRow,
+    );
+  });
+}
+
+export function releaseRemovalClaim(id: string, claimToken: string): void {
+  S().releaseRemovalClaim.run(Date.now(), id, claimToken);
+}
+
 /** Startup recovery: in-flight submissions become uncertain (reconcile by
  * identity before any re-POST); all claims die with the previous process. */
 export function recoverAbandonedWork(): void {
@@ -1638,6 +2428,30 @@ export function recoverAbandonedWork(): void {
     const now = Date.now();
     S().recoverSubmitting.run(now, now, now);
     S().releaseAllClaims.run(now);
+    // Removals: in-flight attempts become uncertain (re-resolve by identity
+    // and compare the recorded facts before any retry), every abandoned
+    // attempt leaves its audit row, and all claims die with the old process.
+    const executing = S().listExecutingRemovals.all() as RemovalExecutionRow[];
+    for (const row of executing) {
+      S().insertRemovalAudit.run(
+        randomUUID(),
+        row.id,
+        row.requester_id,
+        row.approver_id,
+        row.provider,
+        row.kind,
+        row.external_id,
+        row.level,
+        row.attempt_token,
+        "uncertain",
+        "attempt outcome unknown after restart",
+        now,
+      );
+    }
+    if (executing.length > 0) {
+      S().recoverExecutingRemovals.run(now + RECHECK_DELAY_MS, now);
+    }
+    S().releaseAllRemovalClaims.run(now);
   });
 }
 

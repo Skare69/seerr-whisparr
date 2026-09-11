@@ -355,14 +355,19 @@ export async function requestBytes(
   baseUrl: string,
   path: string,
   token: string,
-  options: { service?: Service; timeoutMs?: number; sizeLimit?: number } = {},
+  options: {
+    service?: Service;
+    timeoutMs?: number;
+    sizeLimit?: number;
+    method?: string;
+  } = {},
 ): Promise<{ bytes: Uint8Array; contentType: string }> {
   return requestBounded(
     baseUrl,
     path,
     token,
     options.service ?? "jellyfin",
-    "GET",
+    options.method ?? "GET",
     undefined,
     options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     "*/*",

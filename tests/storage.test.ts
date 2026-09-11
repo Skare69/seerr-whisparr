@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createCipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
@@ -22,6 +22,7 @@ import type {
   IntegrationConfig,
   MediaKind,
   MediaReference,
+  RemovalLevel,
 } from "../src/lib/contracts.ts";
 
 process.env.VELVARR_ORIGIN = "http://127.0.0.1:5577";
@@ -77,6 +78,7 @@ function accountFixture(): Account {
     libraryIds: [],
     isOwner: true,
     autoApprove: false,
+    canRemove: false,
   };
 }
 
@@ -726,6 +728,11 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
     false,
     "migrated accounts default to no auto-approve",
   );
+  assert.equal(
+    owner.canRemove,
+    false,
+    "migrated accounts default to no removal grant",
+  );
   assert.deepEqual(
     storage.getConfig()?.jellyfin.libraryIds,
     testConfig().jellyfin.libraryIds,
@@ -737,6 +744,16 @@ test("v1 database migrates in place preserving config, accounts, sessions, and g
   const version = (
     raw.prepare("PRAGMA user_version").get() as { user_version: number }
   ).user_version;
+  const removalTables = raw
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'removal_%'",
+    )
+    .all();
+  assert.equal(
+    removalTables.length,
+    3,
+    "requests, executions, and audit must exist after migration",
+  );
   raw.close();
   // Migrated forward, not pinned to a literal that every new migration breaks.
   assert.ok(version > 1, "v1 database must be migrated forward");
@@ -1610,7 +1627,10 @@ test("a failed migration rolls back completely: version, schema, and every row s
     user_version: number;
   };
   raw.close();
-  assert.equal(versionRow.user_version, 4);
+  assert.ok(
+    versionRow.user_version > 3,
+    "repaired database migrates forward, not pinned to a literal",
+  );
   assert.deepEqual(storage.getConfig(), testConfig());
   const owner = storage.getAccount(ownerUser().id);
   assert.ok(owner);
@@ -1774,4 +1794,456 @@ test("restored in-flight submissions reconcile to uncertain, never unsent; ident
     maxRetries: 10,
     retryDelay: 50,
   });
+});
+
+// --- M7: removal requests, shared executions, append-only audit ---
+
+function enableRemovals(on: boolean): void {
+  if (on) process.env.VELVARR_ENABLE_REMOVAL = "1";
+  else delete process.env.VELVARR_ENABLE_REMOVAL;
+}
+
+const REMOVAL_USERS = {
+  alice: "11111111-1111-4111-8111-111111111111",
+  bob: "22222222-2222-4222-8222-222222222222",
+  carol: "33333333-3333-4333-8333-333333333333",
+  mod: "44444444-4444-4444-8444-444444444444",
+};
+
+function grantRemoval(
+  id: string,
+  opts?: { role?: "admin" | "moderator" | "requester"; canRemove?: boolean },
+): Account {
+  storage.importAccounts([
+    { ...ownerUser(), id, name: `User ${id.slice(0, 2)}` },
+  ]);
+  return storage.updateAccount(id, {
+    enabled: true,
+    role: opts?.role ?? "requester",
+    libraryIds: [],
+    ...(opts?.canRemove === undefined ? {} : { canRemove: opts.canRemove }),
+  });
+}
+
+function removalSetup(): { owner: Account } {
+  freshDir();
+  storage.bootstrap(testConfig(), ownerUser(), "jf-owner-token");
+  storage.saveConfig(deliveryConfig(true));
+  enableRemovals(true);
+  return {
+    owner: storage.updateAccount(ownerUser().id, {
+      enabled: true,
+      role: "admin",
+      libraryIds: testConfig().jellyfin.libraryIds,
+      canRemove: true,
+    }),
+  };
+}
+
+test("removals require both the operator flag and the account grant", () => {
+  const { owner } = removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  const bob = grantRemoval(REMOVAL_USERS.bob);
+
+  // Flag off, grant held: visibly unavailable, never hidden.
+  enableRemovals(false);
+  assert.throws(
+    () => storage.createRemovalRequest(alice.id, MOVIE, "reason"),
+    (e: { code: string }) => e.code === "removal_disabled",
+  );
+  // Flag on, grant missing: refused, never silently ignored.
+  enableRemovals(true);
+  assert.throws(
+    () => storage.createRemovalRequest(bob.id, MOVIE, "reason"),
+    (e: { code: string }) => e.code === "account_not_admitted",
+  );
+
+  const request = storage.createRemovalRequest(alice.id, MOVIE, "gone");
+  assert.equal(request.decision, "pending");
+  assert.equal(request.level, null, "a request never carries a level");
+  assert.throws(
+    () => storage.createRemovalRequest(alice.id, MOVIE, "duplicate"),
+    (e: { code: string }) => e.code === "removal_request_exists",
+  );
+
+  // Approving with the flag off is likewise refused.
+  enableRemovals(false);
+  assert.throws(
+    () => storage.approveRemovalRequest(owner, request.id, "drop"),
+    (e: { code: string }) => e.code === "removal_disabled",
+  );
+  enableRemovals(true);
+  const approved = storage.approveRemovalRequest(owner, request.id, "drop");
+  assert.equal(approved.decision, "approved");
+  assert.equal(approved.level, "drop");
+  assert.ok(approved.decidedAt !== null);
+  enableRemovals(false);
+});
+
+test("a requester cannot choose a level and cannot approve; the approver must hold the grant", () => {
+  const { owner } = removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  const mod = grantRemoval(REMOVAL_USERS.mod, { role: "moderator" });
+  const request = storage.createRemovalRequest(alice.id, MOVIE, "remove");
+
+  // Granted requester: still not an approver.
+  assert.throws(
+    () => storage.approveRemovalRequest(alice, request.id, "drop"),
+    (e: { code: string }) => e.code === "forbidden",
+  );
+  // Elevated without the grant: refused.
+  assert.throws(
+    () => storage.approveRemovalRequest(mod, request.id, "drop"),
+    (e: { code: string }) => e.code === "forbidden",
+  );
+  // A level outside the ladder is refused.
+  const badLevel: string = "detonate";
+  assert.throws(
+    () =>
+      storage.approveRemovalRequest(
+        owner,
+        request.id,
+        badLevel as RemovalLevel,
+      ),
+    (e: { code: string }) => e.code === "invalid_level",
+  );
+  // Declining needs only an elevated role, and never carries a level.
+  const declined = storage.declineRemovalRequest(mod, request.id);
+  assert.equal(declined.decision, "declined");
+  assert.equal(declined.level, null);
+});
+
+test("two requesters converge on one shared execution; an unstarted one takes the highest approved level", () => {
+  const { owner } = removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  const bob = grantRemoval(REMOVAL_USERS.bob, { canRemove: true });
+  const carol = grantRemoval(REMOVAL_USERS.carol, { canRemove: true });
+
+  const r1 = storage.createRemovalRequest(alice.id, MOVIE, "dup a");
+  const r2 = storage.createRemovalRequest(bob.id, MOVIE, "dup b");
+  storage.approveRemovalRequest(owner, r1.id, "drop");
+  storage.approveRemovalRequest(owner, r2.id, "delete_files");
+
+  const exec = storage.getRemovalExecutionByReference(MOVIE);
+  assert.ok(exec);
+  assert.equal(exec.state, "unsent");
+  assert.equal(
+    exec.level,
+    "delete_files",
+    "an explicit approval escalates an unstarted execution",
+  );
+  assert.equal(exec.requesterId, alice.id, "the first requester is recorded");
+  assert.equal(exec.approverId, owner.id);
+
+  // A later lower approval never de-escalates the shared execution.
+  const r3 = storage.createRemovalRequest(carol.id, MOVIE, "dup c");
+  storage.approveRemovalRequest(owner, r3.id, "unmonitor");
+  assert.equal(
+    storage.getRemovalExecutionByReference(MOVIE)?.level,
+    "delete_files",
+  );
+
+  // Exactly one shared execution row exists for the identity.
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  const rows = raw
+    .prepare("SELECT COUNT(*) AS n FROM removal_executions")
+    .all();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.n, 1);
+  raw.close();
+
+  // Same role filtering and privacy as acquisition requests.
+  const mine = storage.listRemovalRequests(alice);
+  assert.equal(mine.length, 1, "requesters see only their own requests");
+  assert.equal(mine[0]?.id, r1.id);
+  assert.ok(mine.every((r) => r.accountId === alice.id));
+  assert.throws(
+    () => storage.getRemovalRequest(r2.id, alice),
+    (e: { code: string }) => e.code === "removal_request_not_found",
+  );
+});
+
+test("cancellation is requester-only and never touches the shared execution", () => {
+  const { owner } = removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  const bob = grantRemoval(REMOVAL_USERS.bob, { canRemove: true });
+  const request = storage.createRemovalRequest(alice.id, MOVIE, "remove");
+  storage.approveRemovalRequest(owner, request.id, "unmonitor");
+
+  // Another user cannot even see, let alone cancel, the request.
+  assert.throws(
+    () => storage.cancelRemovalRequest(bob, request.id),
+    (e: { code: string }) => e.code === "removal_request_not_found",
+  );
+  const cancelled = storage.cancelRemovalRequest(alice, request.id);
+  assert.equal(cancelled.decision, "cancelled");
+  assert.equal(
+    cancelled.level,
+    null,
+    "a cancelled request no longer carries a level",
+  );
+  assert.ok(cancelled.decidedAt !== null);
+
+  // The shared execution survives: an approver's authorization is not the
+  // requester's to withdraw.
+  const exec = storage.getRemovalExecutionByReference(MOVIE);
+  assert.ok(exec);
+  assert.equal(exec.level, "unmonitor");
+
+  // Terminal requests are not cancellable.
+  assert.throws(
+    () => storage.cancelRemovalRequest(alice, request.id),
+    (e: { code: string }) => e.code === "removal_request_not_cancellable",
+  );
+});
+
+test("an approved removal cancels pending acquisition intents for the identity and touches nothing else", () => {
+  const { owner } = removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  storage.importAccounts([otherUser()]);
+  const bob = otherUser().id;
+  admit(bob);
+
+  // Acquisition intents: two pending on SCENE, one approved on MOVIE, one
+  // pending on MOVIE.
+  const p1 = storage.createRequest(alice.id, SCENE);
+  const p2 = storage.createRequest(bob, SCENE);
+  const p3 = storage.createRequest(bob, MOVIE);
+  storage.decideRequest(owner, p3.id, "approved");
+  const p4 = storage.createRequest(alice.id, MOVIE);
+  storage.upsertCatalogRecord(movieDetail());
+
+  const removal = storage.createRemovalRequest(alice.id, SCENE, "gone");
+  storage.approveRemovalRequest(owner, removal.id, "exclude");
+
+  assert.equal(storage.getRequest(p1.id, owner).decision, "cancelled");
+  assert.equal(storage.getRequest(p2.id, owner).decision, "cancelled");
+  assert.ok(storage.getRequest(p1.id, owner).decidedAt !== null);
+  // History survives: cancelled is a decision, never a deletion.
+  assert.equal(storage.getRequest(p3.id, owner).decision, "approved");
+  assert.equal(storage.getRequest(p4.id, owner).decision, "pending");
+  // The shared acquisition row and catalog record are untouched; only
+  // pending intents cancel.
+  const movie = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(movie);
+  assert.equal(movie.state, "unsent");
+  assert.ok(storage.getCatalogRecordByReference(movieDetail().reference));
+  // The removal produced its own shared execution work for SCENE.
+  assert.ok(storage.getRemovalExecutionByReference(SCENE));
+});
+
+test("removal attempts are CAS-safe, persist observed facts, and append one audit row each", () => {
+  const { owner } = removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  const request = storage.createRemovalRequest(alice.id, MOVIE, "remove");
+  storage.approveRemovalRequest(owner, request.id, "delete_files");
+
+  const due = storage.listDueRemovalExecutions(Date.now() + 1000);
+  const [first] = due;
+  assert.ok(first);
+  const claimed = storage.claimRemovalExecution(first.id);
+  assert.equal(claimed.record.state, "unsent");
+  // A concurrent claim of the same execution loses.
+  assert.throws(
+    () => storage.claimRemovalExecution(first.id),
+    (e: { code: string }) => e.code === "already_claimed",
+  );
+
+  // The attempt and the externally observed facts persist BEFORE any call.
+  const facts = {
+    whisparrItemId: 7,
+    path: "/data/xxx/pirates.mkv",
+    fileCount: 1,
+    size: 1234,
+    added: "2026-01-01T00:00:00.0000000Z",
+  };
+  const begun = storage.beginRemovalAttempt(
+    first.id,
+    claimed.claimToken,
+    facts,
+  );
+  assert.equal(begun.record.state, "executing");
+  assert.equal(begun.record.whisparrItemId, 7);
+  assert.equal(begun.record.whisparrAdded, "2026-01-01T00:00:00.0000000Z");
+  // A stale claim cannot begin again.
+  assert.throws(
+    () => storage.beginRemovalAttempt(first.id, claimed.claimToken, {}),
+    (e: { code: string }) => e.code === "claim_lost",
+  );
+  // A wrong attempt token cannot complete.
+  assert.throws(
+    () =>
+      storage.completeRemovalAttempt(
+        first.id,
+        claimed.claimToken,
+        randomUUID(),
+        "done",
+      ),
+    (e: { code: string }) => e.code === "attempt_lost",
+  );
+
+  // A timeout leaves the attempt uncertain and the work due again.
+  const uncertain = storage.completeRemovalAttempt(
+    first.id,
+    claimed.claimToken,
+    begun.attemptToken,
+    "uncertain",
+    "whisparr timed out",
+  );
+  assert.equal(uncertain.state, "uncertain");
+  assert.ok(uncertain.dueAt !== null);
+  storage.releaseRemovalClaim(first.id, claimed.claimToken);
+
+  // The retry re-claims and can compare the previously observed facts.
+  const retry = storage.claimRemovalExecution(first.id);
+  assert.equal(retry.record.whisparrPath, "/data/xxx/pirates.mkv");
+  assert.equal(retry.record.whisparrItemId, 7);
+  const rebegun = storage.beginRemovalAttempt(
+    first.id,
+    retry.claimToken,
+    facts,
+  );
+  const done = storage.completeRemovalAttempt(
+    first.id,
+    retry.claimToken,
+    rebegun.attemptToken,
+    "done",
+  );
+  assert.equal(done.state, "done");
+  assert.equal(done.dueAt, null);
+
+  // One audit row per attempt: uncertain, then done.
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  const audit = raw
+    .prepare(
+      "SELECT outcome, level, detail FROM removal_audit ORDER BY created_at ASC",
+    )
+    .all();
+  assert.equal(audit.length, 2);
+  assert.equal(audit[0]?.outcome, "uncertain");
+  assert.equal(audit[0]?.detail, "whisparr timed out");
+  assert.equal(audit[1]?.outcome, "done");
+  assert.equal(audit[1]?.level, "delete_files");
+  raw.close();
+});
+
+test("audit rows survive every subsequent state change and are physically append-only", () => {
+  const { owner } = removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  const r1 = storage.createRemovalRequest(alice.id, MOVIE, "first");
+  storage.approveRemovalRequest(owner, r1.id, "drop");
+  const exec = storage.getRemovalExecutionByReference(MOVIE);
+  assert.ok(exec);
+  const claimed = storage.claimRemovalExecution(exec.id);
+  const begun = storage.beginRemovalAttempt(exec.id, claimed.claimToken, {
+    whisparrItemId: 3,
+  });
+  storage.completeRemovalAttempt(
+    exec.id,
+    claimed.claimToken,
+    begun.attemptToken,
+    "failed",
+    "jellyfin denied",
+  );
+  // Subsequent state churn elsewhere leaves the audit row untouched.
+  const r2 = storage.createRemovalRequest(alice.id, SCENE, "second");
+  storage.declineRemovalRequest(owner, r2.id);
+  const r3 = storage.createRemovalRequest(alice.id, SCENE, "third");
+  storage.approveRemovalRequest(owner, r3.id, "unmonitor");
+  storage.cancelRemovalRequest(alice, r3.id);
+
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  const audit = raw.prepare("SELECT * FROM removal_audit").all();
+  assert.equal(audit.length, 1, "exactly the one attempt, appended once");
+  assert.equal(audit[0]?.outcome, "failed");
+  assert.equal(audit[0]?.level, "drop");
+  assert.equal(audit[0]?.requester_id, alice.id);
+  assert.equal(audit[0]?.approver_id, owner.id);
+  assert.equal(audit[0]?.external_id, MOVIE.id);
+  // The database itself aborts mutation and deletion.
+  assert.throws(
+    () => raw.prepare("UPDATE removal_audit SET outcome = 'done'").run(),
+    /append-only/,
+  );
+  assert.throws(
+    () => raw.prepare("DELETE FROM removal_audit").run(),
+    /append-only/,
+  );
+  // No execution can exist without an approved removal request.
+  assert.throws(
+    () =>
+      raw
+        .prepare(
+          "INSERT INTO removal_executions (id, instance_id, provider, kind, external_id, state, level, due_at, requester_id, approver_id, created_at, updated_at) VALUES ('x', 'i', 'tpdb', 'movie', 'e', 'unsent', 'drop', 1, 'r', 'a', 1, 1)",
+        )
+        .run(),
+    /requires an approved removal request/,
+  );
+  // And a request can never smuggle a level without approval.
+  assert.throws(
+    () =>
+      raw
+        .prepare(
+          "INSERT INTO removal_requests (id, account_id, provider, kind, external_id, reason, decision, level, created_at) VALUES ('y', ?, 'tpdb', 'movie', 'e2', 'r', 'pending', 'drop', 1)",
+        )
+        .run(alice.id),
+    /CHECK/,
+  );
+  raw.close();
+});
+
+test("restart recovery flips in-flight removals to uncertain and leaves an audit row", () => {
+  const { owner } = removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  const request = storage.createRemovalRequest(alice.id, MOVIE, "remove");
+  storage.approveRemovalRequest(owner, request.id, "drop");
+  const exec = storage.getRemovalExecutionByReference(MOVIE);
+  assert.ok(exec);
+  const claimed = storage.claimRemovalExecution(exec.id);
+  storage.beginRemovalAttempt(exec.id, claimed.claimToken, {
+    whisparrItemId: 9,
+    path: "/data/xxx/x.mkv",
+  });
+
+  storage.recoverAbandonedWork();
+
+  const after = storage.getRemovalExecutionByReference(MOVIE);
+  assert.ok(after);
+  assert.equal(after.state, "uncertain");
+  assert.equal(after.claimToken, null, "claims die with the old process");
+  assert.equal(
+    after.whisparrItemId,
+    9,
+    "observed facts survive for retry comparison",
+  );
+  assert.ok(after.dueAt !== null);
+  const raw = new DatabaseSync(join(currentDir, "velvarr.sqlite"));
+  const audit = raw.prepare("SELECT outcome, detail FROM removal_audit").all();
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0]?.outcome, "uncertain");
+  assert.equal(audit[0]?.detail, "attempt outcome unknown after restart");
+  raw.close();
+  assert.ok(
+    storage.listDueRemovalExecutions(Date.now() + 60_000).length >= 1,
+    "recovered removals are due again",
+  );
+});
+
+test("a non-media kind is refused for removals exactly as for acquisitions", () => {
+  removalSetup();
+  const alice = grantRemoval(REMOVAL_USERS.alice, { canRemove: true });
+  const performer: CatalogReference = {
+    provider: "tpdb",
+    kind: "performer",
+    id: "b6fd4f84-8961-4b8a-9194-e357628dea20",
+  };
+  assert.throws(
+    () =>
+      storage.createRemovalRequest(alice.id, performer as MediaReference, "x"),
+    (e: { code: string }) => e.code === "invalid_reference",
+  );
+  assert.throws(
+    () => storage.getRemovalExecutionByReference(performer as MediaReference),
+    (e: { code: string }) => e.code === "invalid_reference",
+  );
 });
