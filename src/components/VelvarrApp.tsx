@@ -31,12 +31,9 @@ import {
   useParamsSetter,
   useSession,
 } from "./shared.tsx";
-import {
-  DiscoverView,
-  MoviesView,
-  PerformersView,
-  ScenesView,
-} from "./catalog.tsx";
+import { MoviesView, PerformersView, ScenesView } from "./catalog.tsx";
+import { DiscoverShelves } from "./discover.tsx";
+import { SearchView } from "./search.tsx";
 import { RequestsView } from "./requests.tsx";
 
 /* ---------- App-local API view records (not in contracts.ts) ---------- */
@@ -634,6 +631,7 @@ const VIEWS = [
   "movies",
   "scenes",
   "performers",
+  "search",
   "requests",
   "library",
   "admin",
@@ -650,6 +648,70 @@ const PROVIDER_VIEWS = {
 } as const;
 type ProviderView = keyof typeof PROVIDER_VIEWS;
 
+/* ---------- Global search entry (desktop sidebar + mobile header) ---------- */
+
+// Submit-on-Enter only: no debounced keystroke requests. The input resyncs
+// when the URL q changes from outside (Back, chip removal) and never steals
+// focus on render.
+function GlobalSearchForm({
+  id,
+  className,
+}: {
+  id: string;
+  className?: string;
+}) {
+  const params = useSearchParams();
+  const setP = useParamsSetter();
+  const urlQ = params.get("q") ?? "";
+  const [input, setInput] = useState(urlQ);
+  const committed = useRef(urlQ);
+  useEffect(() => {
+    if (urlQ !== committed.current) {
+      committed.current = urlQ;
+      setInput(urlQ);
+    }
+  });
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    const t = input.trim();
+    committed.current = t;
+    setP({
+      view: "search",
+      q: t || null,
+      provider: null,
+      kind: null,
+      id: null,
+      tab: null,
+      year: null,
+      performer: null,
+      studio: null,
+      tags: null,
+      tagsAll: null,
+      tagsExclude: null,
+      sort: null,
+      direction: null,
+      page: null,
+      perPage: null,
+    });
+  };
+  return (
+    <form role="search" onSubmit={submit} className={className}>
+      <label htmlFor={id} className="sr-only">
+        Search all sources
+      </label>
+      <input
+        id={id}
+        type="search"
+        className="input"
+        maxLength={200}
+        placeholder="Search all sources…"
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+      />
+    </form>
+  );
+}
+
 function Shell() {
   const session = useSession();
   const params = useSearchParams();
@@ -663,6 +725,7 @@ function Shell() {
     { id: "movies" as View, label: "Movies", show: true },
     { id: "scenes" as View, label: "Scenes", show: true },
     { id: "performers" as View, label: "Performers", show: true },
+    { id: "search" as View, label: "Search", show: true },
     { id: "requests" as View, label: "Requests", show: true },
     { id: "library" as View, label: "Library", show: true },
     { id: "admin" as View, label: "Admin", show: isAdmin },
@@ -686,6 +749,7 @@ function Shell() {
     <div className="min-h-screen md:flex">
       <aside className="fixed inset-y-0 left-0 z-10 hidden w-56 shrink-0 flex-col border-r border-edge bg-panel p-4 md:flex">
         <div className="mb-6 text-lg font-semibold tracking-tight">Velvarr</div>
+        <GlobalSearchForm id="global-search-desktop" className="mb-4" />
         <nav className="space-y-1" aria-label="Main">
           {navBtns}
         </nav>
@@ -725,6 +789,7 @@ function Shell() {
               </button>
             </div>
           </div>
+          <GlobalSearchForm id="global-search-mobile" className="mt-2" />
           <nav className="mt-2 flex flex-wrap gap-1" aria-label="Main">
             {nav.map((n) => (
               <button
@@ -746,9 +811,13 @@ function Shell() {
           {view === "admin" && (isAdmin ? <AdminView /> : <ForbiddenPanel />)}
           {view === "settings" &&
             (isAdmin ? <SettingsView /> : <ForbiddenPanel />)}
-          {view !== "library" && view !== "admin" && view !== "settings" && (
-            <ProviderSurface view={view} onLibrary={() => go("library")} />
-          )}
+          {view === "search" && <SearchView />}
+          {view !== "library" &&
+            view !== "admin" &&
+            view !== "settings" &&
+            view !== "search" && (
+              <ProviderSurface view={view} onLibrary={() => go("library")} />
+            )}
         </main>
       </div>
     </div>
@@ -774,7 +843,7 @@ function ProviderSurface({
         onLibrary={onLibrary}
       />
     );
-  if (view === "discover") return <DiscoverView />;
+  if (view === "discover") return <DiscoverShelves />;
   if (view === "movies") return <MoviesView />;
   if (view === "scenes") return <ScenesView />;
   if (view === "performers") return <PerformersView />;

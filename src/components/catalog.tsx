@@ -12,6 +12,7 @@ import {
   useParamsSetter,
   useSession,
 } from "./shared";
+import { PerformerView } from "./performer";
 import type {
   AcquisitionState,
   CatalogDetail,
@@ -69,12 +70,6 @@ function providerLabel(p: CatalogProvider): string {
   return p === "tpdb" ? "TPDB" : "StashDB";
 }
 
-function providerStateLabel(s: "not_configured" | "not_verified"): string {
-  return s === "not_configured"
-    ? "not configured"
-    : "API key present — not verified";
-}
-
 function providerOf(v: string | null): CatalogProvider {
   return v === "stashdb" ? "stashdb" : "tpdb";
 }
@@ -97,6 +92,142 @@ function duration(seconds: number | undefined): string | null {
   const h = Math.floor(seconds / 3600);
   const m = Math.round((seconds % 3600) / 60);
   return h > 0 ? `${h} h ${m} min` : `${m} min`;
+}
+
+/* ---------- Browse-context helpers ---------- */
+
+/** Sorts each provider+kind genuinely supports, mirroring the route's
+ * SORT_SUPPORT: TPDB movie/scene has relevance|recency|duration, StashDB
+ * scene has title|date|duration|trending|popularity|created|updated.
+ * Unsupported options are never offered, and trending/popularity are
+ * labeled as StashDB's own ordering — recency is never called trending. */
+type SortKey =
+  | "relevance"
+  | "recency"
+  | "duration"
+  | "title"
+  | "date"
+  | "trending"
+  | "popularity"
+  | "created"
+  | "updated";
+
+const SORT_LABELS: Record<SortKey, string> = {
+  relevance: "Best match",
+  recency: "Release recency",
+  duration: "Duration",
+  title: "Title",
+  date: "Release date",
+  trending: "Trending (StashDB ordering)",
+  popularity: "Popularity (StashDB ordering)",
+  created: "Recently added (StashDB)",
+  updated: "Last updated (StashDB)",
+};
+
+function sortsFor(
+  provider: CatalogProvider,
+  kind: CatalogKind,
+): readonly SortKey[] {
+  if (provider === "tpdb" && (kind === "movie" || kind === "scene"))
+    return ["relevance", "recency", "duration"];
+  if (provider === "stashdb" && kind === "scene")
+    return [
+      "title",
+      "date",
+      "duration",
+      "trending",
+      "popularity",
+      "created",
+      "updated",
+    ];
+  return [];
+}
+
+/** The browse state behind an open detail: the URL minus the detail params
+ * (provider/kind/id) and the performer tab. Keys the scroll store. */
+function browseKeyOf(params: URLSearchParams): string {
+  const p = new URLSearchParams(params);
+  for (const k of ["provider", "kind", "id", "tab"]) p.delete(k);
+  p.sort();
+  return p.toString();
+}
+
+/** Session-scoped scroll positions keyed by browse state. Deliberate
+ * filter changes never write it, so they never cause a scroll jump. */
+const scrollPositions = new Map<string, number>();
+
+function saveScroll(key: string) {
+  if (window.scrollY > 0) scrollPositions.set(key, window.scrollY);
+}
+
+function restoreScroll(key: string) {
+  const y = scrollPositions.get(key);
+  if (y === undefined) return;
+  scrollPositions.delete(key);
+  window.scrollTo(0, y);
+}
+
+/** Names for studio/tag filter ids, captured from details at navigation
+ * time — the URL carries only provider-native ids, chips still get labels. */
+const filterNames = new Map<string, string>();
+
+function filterName(provider: string, kind: string, id: string): string {
+  return filterNames.get(`${provider}:${kind}:${id}`) ?? `${id.slice(0, 8)}…`;
+}
+
+/** Sort control offering only what the provider+kind genuinely supports;
+ * direction appears only with an explicit sort (the route 400s otherwise). */
+function SortSelect({
+  id,
+  provider,
+  kind,
+  sort,
+  direction,
+  onSort,
+  onDirection,
+}: {
+  id: string;
+  provider: CatalogProvider;
+  kind: CatalogKind;
+  sort: string;
+  direction: string;
+  onSort: (v: string) => void;
+  onDirection: (v: "asc" | "desc") => void;
+}) {
+  const sorts = sortsFor(provider, kind);
+  if (sorts.length === 0) return null;
+  return (
+    <div>
+      <label className="label" htmlFor={id}>
+        Sort
+      </label>
+      <div className="mt-1 flex gap-2">
+        <select
+          id={id}
+          className="input"
+          value={sort}
+          onChange={(e) => onSort(e.target.value)}
+        >
+          <option value="">Provider default</option>
+          {sorts.map((s) => (
+            <option key={s} value={s}>
+              {SORT_LABELS[s]}
+            </option>
+          ))}
+        </select>
+        {sort && (
+          <button
+            type="button"
+            className="btn shrink-0"
+            aria-label="Sort direction"
+            onClick={() => onDirection(direction === "asc" ? "desc" : "asc")}
+          >
+            {direction === "asc" ? "Sort descending" : "Sort ascending"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
 }
 
 /** Local input that resyncs when the URL value changes from the outside
@@ -345,34 +476,50 @@ function SourcePicker({
 
 /* ---------- Search hook ---------- */
 
-function useCatalogSearch(
-  provider: CatalogProvider,
-  kind: CatalogKind,
-  q: string,
-  year: string,
-  performer: string,
-  page: number,
-  perPage: number,
-  paged: boolean,
-  enabled: boolean,
-  reload: number,
-): { data: CatalogSearchPage | null; error: string | null; loading: boolean } {
+type CatalogQuery = {
+  provider: CatalogProvider;
+  kind: CatalogKind;
+  q: string;
+  year: string;
+  performer: string;
+  studio: string;
+  tags: string;
+  sort: string;
+  direction: string;
+  page: number;
+  perPage: number;
+  paged: boolean;
+  enabled: boolean;
+  reload: number;
+};
+
+function useCatalogSearch(f: CatalogQuery): {
+  data: CatalogSearchPage | null;
+  error: string | null;
+  loading: boolean;
+} {
   const [data, setData] = useState<CatalogSearchPage | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(enabled);
+  const [loading, setLoading] = useState(f.enabled);
   useEffect(() => {
-    if (!enabled) return;
+    if (!f.enabled) return;
     let live = true;
     setError(null);
     setLoading(true);
-    const qs = new URLSearchParams({ provider, kind });
-    if (paged) {
-      qs.set("page", String(page));
-      qs.set("perPage", String(perPage));
+    const qs = new URLSearchParams({ provider: f.provider, kind: f.kind });
+    if (f.paged) {
+      qs.set("page", String(f.page));
+      qs.set("perPage", String(f.perPage));
     }
-    if (q) qs.set("q", q);
-    if (year) qs.set("year", year);
-    if (performer) qs.set("performer", performer);
+    if (f.q) qs.set("q", f.q);
+    if (f.year) qs.set("year", f.year);
+    if (f.performer) qs.set("performer", f.performer);
+    if (f.studio) qs.set("studio", f.studio);
+    if (f.tags) qs.set("tags", f.tags);
+    if (f.sort) {
+      qs.set("sort", f.sort);
+      if (f.direction) qs.set("direction", f.direction);
+    }
     api<CatalogSearchPage>(`/api/catalog/search?${qs.toString()}`)
       .then((d) => {
         if (live) {
@@ -391,16 +538,20 @@ function useCatalogSearch(
       live = false; // stale in-flight responses are ignored
     };
   }, [
-    provider,
-    kind,
-    q,
-    year,
-    performer,
-    page,
-    perPage,
-    paged,
-    enabled,
-    reload,
+    f.provider,
+    f.kind,
+    f.q,
+    f.year,
+    f.performer,
+    f.studio,
+    f.tags,
+    f.sort,
+    f.direction,
+    f.page,
+    f.perPage,
+    f.paged,
+    f.enabled,
+    f.reload,
   ]);
   return { data, error, loading };
 }
@@ -735,20 +886,34 @@ function DetailBody({
   payload,
   target,
   onNavigate,
+  onBrowse,
   onRefetch,
 }: {
   payload: DetailPayload;
   target: DetailTarget;
   onNavigate: (r: CatalogReference) => void;
+  onBrowse: (
+    view: "movies" | "scenes",
+    filter: {
+      param: "studio" | "tags";
+      provider: CatalogProvider;
+      id: string;
+    },
+  ) => void;
   onRefetch: () => void;
 }) {
   const d = payload.detail;
   const mediaKind = asMediaKind(target.kind);
   const linked = "linked" in payload.link ? payload.link.linked : undefined;
+  // A provider-supplied studio reference (kind "studio") becomes a real
+  // control; without one the studio stays plain text.
   const studioRef =
-    d.studio?.reference && asMediaKind(d.studio.reference.kind) !== null
+    d.studio?.reference && d.studio.reference.kind === "studio"
       ? d.studio.reference
       : null;
+  // Tag-filtered search exists for movie/scene only; performer and studio
+  // details keep their tags as plain text rather than dead controls.
+  const tagBrowse = target.kind === "movie" || target.kind === "scene";
   const aspect =
     target.kind === "scene"
       ? "aspect-video w-full sm:w-72"
@@ -759,6 +924,18 @@ function DetailBody({
     d.sourceUrl && !d.links.some((l) => l.url === d.sourceUrl)
       ? d.sourceUrl
       : null;
+  // Remember studio/tag names so browse chips can label the ids the URL
+  // carries — details are where names are known.
+  useEffect(() => {
+    if (studioRef)
+      filterNames.set(
+        `${studioRef.provider}:studio:${studioRef.id}`,
+        d.studio?.name ?? studioRef.id,
+      );
+    if (tagBrowse)
+      for (const t of d.tags)
+        filterNames.set(`${target.provider}:tag:${t.id}`, t.name);
+  }, [studioRef, tagBrowse, d, target.provider]);
   return (
     <div className="flex flex-col gap-4 sm:flex-row">
       <div
@@ -777,7 +954,9 @@ function DetailBody({
           {duration(d.durationSeconds) && (
             <span className="chip">{duration(d.durationSeconds)}</span>
           )}
-          {d.studio && <span className="chip">{d.studio.name}</span>}
+          {d.studio && !studioRef && (
+            <span className="chip">{d.studio.name}</span>
+          )}
         </div>
         {d.description ? (
           <p className="mt-3 text-sm leading-relaxed text-muted">
@@ -823,7 +1002,13 @@ function DetailBody({
             <button
               type="button"
               className="chip mt-1"
-              onClick={() => onNavigate(studioRef)}
+              onClick={() =>
+                onBrowse(target.kind === "movie" ? "movies" : "scenes", {
+                  param: "studio",
+                  provider: studioRef.provider,
+                  id: studioRef.id,
+                })
+              }
             >
               {d.studio?.name}
             </button>
@@ -834,11 +1019,28 @@ function DetailBody({
           <div className="mt-3">
             <div className="label">Tags</div>
             <div className="mt-1 flex flex-wrap gap-1">
-              {d.tags.map((t) => (
-                <span key={t.id} className="chip">
-                  {t.name}
-                </span>
-              ))}
+              {d.tags.map((t) =>
+                tagBrowse ? (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className="chip"
+                    onClick={() =>
+                      onBrowse(target.kind === "movie" ? "movies" : "scenes", {
+                        param: "tags",
+                        provider: target.provider,
+                        id: t.id,
+                      })
+                    }
+                  >
+                    {t.name}
+                  </button>
+                ) : (
+                  <span key={t.id} className="chip">
+                    {t.name}
+                  </span>
+                ),
+              )}
             </div>
           </div>
         )}
@@ -938,6 +1140,7 @@ function CatalogDetail() {
   const target = detailTarget(params);
   const panelRef = useRef<HTMLDivElement>(null);
   const prevFocus = useRef<HTMLElement | null>(null);
+  const wasOpen = useRef(false);
   const [payload, setPayload] = useState<DetailPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
@@ -949,6 +1152,39 @@ function CatalogDetail() {
 
   const close = useCallback(
     () => setP({ provider: null, kind: null, id: null }),
+    [setP],
+  );
+  // Studio/tag navigation leaves the dialog for a fresh browse on the
+  // matching surface: same provider, provider-native id, the other
+  // provider's filter ids never carried across.
+  const browseTo = useCallback(
+    (
+      view: "movies" | "scenes",
+      filter: {
+        param: "studio" | "tags";
+        provider: CatalogProvider;
+        id: string;
+      },
+    ) => {
+      const patch: Record<string, string | null> = {
+        view,
+        provider: filter.provider,
+        q: null,
+        year: null,
+        performer: null,
+        tagsAll: null,
+        tagsExclude: null,
+        sort: null,
+        direction: null,
+        page: null,
+        tab: null,
+        kind: null,
+        id: null,
+      };
+      patch[filter.param] = filter.id;
+      patch[filter.param === "studio" ? "tags" : "studio"] = null;
+      setP(patch);
+    },
     [setP],
   );
 
@@ -973,6 +1209,23 @@ function CatalogDetail() {
   useEffect(() => {
     if (open) panelRef.current?.focus();
   }, [open, refKey]);
+  // Scroll restoration: the position behind the dialog is saved under the
+  // browse state (URL minus provider/kind/id/tab) when the dialog opens and
+  // restored when it closes — Escape, Close and Back all close it. Deliberate
+  // filter changes never open the dialog, so they never cause a jump.
+  useEffect(() => {
+    if (refKey === null) {
+      if (wasOpen.current) {
+        wasOpen.current = false;
+        restoreScroll(browseKeyOf(params));
+      }
+      return;
+    }
+    if (!wasOpen.current) {
+      wasOpen.current = true;
+      saveScroll(browseKeyOf(params));
+    }
+  });
 
   useEffect(() => {
     if (!provider || !kind || !id) return;
@@ -1051,6 +1304,7 @@ function CatalogDetail() {
             onNavigate={(r) =>
               setP({ provider: r.provider, kind: r.kind, id: r.id })
             }
+            onBrowse={browseTo}
             onRefetch={() => setReload((n) => n + 1)}
           />
         )}
@@ -1061,63 +1315,6 @@ function CatalogDetail() {
 
 /* ---------- Views ---------- */
 
-export function DiscoverView() {
-  const setP = useParamsSetter();
-  const { providers } = useSession();
-  const shelves = [
-    {
-      view: "movies",
-      title: "Movies",
-      blurb:
-        "Browse TPDB movies by title, year or performer. StashDB has no movies.",
-    },
-    {
-      view: "scenes",
-      title: "Scenes",
-      blurb:
-        "Browse scenes from TPDB and StashDB — kept separate by source, never merged.",
-    },
-    {
-      view: "performers",
-      title: "Performers",
-      blurb: "Look up performers on TPDB and StashDB.",
-    },
-  ] as const;
-  return (
-    <section aria-label="Discover">
-      <h2 className="text-xl font-semibold">Discover</h2>
-      <p className="mt-1 text-sm text-muted">
-        Jump into the catalog. Requesting and playback live on each title’s
-        page.
-      </p>
-      <div className="mt-4 grid gap-4 sm:grid-cols-3">
-        {shelves.map((s) => (
-          <button
-            key={s.view}
-            type="button"
-            className="card p-4 text-left"
-            onClick={() => setP({ view: s.view })}
-          >
-            <div className="font-medium">{s.title}</div>
-            <div className="mt-1 text-sm text-muted">{s.blurb}</div>
-          </button>
-        ))}
-      </div>
-      <div className="panel mt-4 p-4 text-sm text-muted">
-        {providers ? (
-          <>
-            TPDB: {providerStateLabel(providers.tpdb)} · StashDB:{" "}
-            {providerStateLabel(providers.stashdb)}
-          </>
-        ) : (
-          "Provider status is still loading."
-        )}
-      </div>
-      <CatalogDetail />
-    </section>
-  );
-}
-
 export function MoviesView() {
   const params = useSearchParams();
   const setP = useParamsSetter();
@@ -1125,22 +1322,36 @@ export function MoviesView() {
   const q = params.get("q") ?? "";
   const year = params.get("year") ?? "";
   const performer = params.get("performer") ?? "";
+  const studio = params.get("studio") ?? "";
+  const tags = params.get("tags") ?? "";
+  // A sort from another provider, or one no longer supported, in the URL is
+  // ignored rather than sent upstream for an explicit 400.
+  const sortParam = params.get("sort");
+  const sortKey = sortsFor("tpdb", "movie").some((s) => s === sortParam)
+    ? (sortParam as SortKey)
+    : null;
+  const dirRaw = params.get("direction");
+  const direction = dirRaw === "asc" || dirRaw === "desc" ? dirRaw : "";
   const page = Math.max(1, intOr(params.get("page"), 1));
   const perPage = Math.min(100, Math.max(1, intOr(params.get("perPage"), 24)));
   const [reload, setReload] = useState(0);
   const notConfigured = providers?.tpdb === "not_configured";
-  const { data, error } = useCatalogSearch(
-    "tpdb",
-    "movie",
+  const { data, error } = useCatalogSearch({
+    provider: "tpdb",
+    kind: "movie",
     q,
     year,
     performer,
+    studio,
+    tags,
+    sort: sortKey ?? "",
+    direction,
     page,
     perPage,
-    true,
-    !notConfigured,
+    paged: true,
+    enabled: !notConfigured,
     reload,
-  );
+  });
   const open = useCallback(
     (r: CatalogReference) =>
       setP({ provider: r.provider, kind: r.kind, id: r.id }),
@@ -1161,6 +1372,29 @@ export function MoviesView() {
   const onPerformer = useCallback(
     (v: string) => setP({ performer: v || null, page: null }),
     [setP],
+  );
+  const onSort = useCallback(
+    (v: string) => setP({ sort: v || null, direction: null, page: null }),
+    [setP],
+  );
+  const onDirection = useCallback(
+    (v: "asc" | "desc") => setP({ direction: v, page: null }),
+    [setP],
+  );
+  const onStudio = useCallback(
+    (v: string) => setP({ studio: v || null, page: null }),
+    [setP],
+  );
+  const removeTag = useCallback(
+    (id: string) =>
+      setP({
+        tags:
+          [...new Set(tags.split(",").filter(Boolean))]
+            .filter((t) => t !== id)
+            .join(",") || null,
+        page: null,
+      }),
+    [setP, tags],
   );
   const retry = useCallback(() => setReload((n) => n + 1), []);
   return (
@@ -1186,8 +1420,19 @@ export function MoviesView() {
             placeholder="Performer name…"
           />
         </div>
+        <div className="sm:w-64">
+          <SortSelect
+            id="movie-sort"
+            provider="tpdb"
+            kind="movie"
+            sort={sortKey ?? ""}
+            direction={direction}
+            onSort={onSort}
+            onDirection={onDirection}
+          />
+        </div>
       </div>
-      {(q || year || performer) && (
+      {(q || year || performer || studio || tags || sortKey) && (
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted">Filters:</span>
           {q && <FilterChip label={`“${q}”`} onRemove={() => onQ("")} />}
@@ -1198,6 +1443,25 @@ export function MoviesView() {
             <FilterChip
               label={`Performer: ${performer}`}
               onRemove={() => onPerformer("")}
+            />
+          )}
+          {studio && (
+            <FilterChip
+              label={`Studio: ${filterName("tpdb", "studio", studio)}`}
+              onRemove={() => onStudio("")}
+            />
+          )}
+          {[...new Set(tags.split(",").filter(Boolean))].map((id) => (
+            <FilterChip
+              key={id}
+              label={`Tag: ${filterName("tpdb", "tag", id)}`}
+              onRemove={() => removeTag(id)}
+            />
+          ))}
+          {sortKey && (
+            <FilterChip
+              label={`Sort: ${SORT_LABELS[sortKey]}${direction ? ` (${direction})` : ""}`}
+              onRemove={() => onSort("")}
             />
           )}
         </div>
@@ -1215,7 +1479,7 @@ export function MoviesView() {
           <GridSkeleton aspect="aspect-[2/3]" cols={PORTRAIT_COLS} count={10} />
         ) : data.items.length === 0 ? (
           <div className="panel p-8 text-center text-sm text-muted">
-            {q || year || performer
+            {q || year || performer || studio || tags
               ? "No movies match your filters."
               : "No movies found."}
           </div>
@@ -1251,22 +1515,37 @@ export function ScenesView() {
   // and cleared on switch, never silently sent to StashDB.
   const year = provider === "tpdb" ? (params.get("year") ?? "") : "";
   const performer = params.get("performer") ?? "";
+  const studio = params.get("studio") ?? "";
+  const tags = params.get("tags") ?? "";
+  // A sort from the other provider, or one no longer supported, is ignored
+  // rather than sent upstream for an explicit 400.
+  const sortParam = params.get("sort");
+  const sorts = sortsFor(provider, "scene");
+  const sortKey = sorts.some((s) => s === sortParam)
+    ? (sortParam as SortKey)
+    : null;
+  const dirRaw = params.get("direction");
+  const direction = dirRaw === "asc" || dirRaw === "desc" ? dirRaw : "";
   const page = Math.max(1, intOr(params.get("page"), 1));
   const perPage = Math.min(100, Math.max(1, intOr(params.get("perPage"), 24)));
   const [reload, setReload] = useState(0);
   const notConfigured = providers?.[provider] === "not_configured";
-  const { data, error } = useCatalogSearch(
+  const { data, error } = useCatalogSearch({
     provider,
-    "scene",
+    kind: "scene",
     q,
     year,
     performer,
+    studio,
+    tags,
+    sort: sortKey ?? "",
+    direction,
     page,
     perPage,
-    true,
-    !notConfigured,
+    paged: true,
+    enabled: !notConfigured,
     reload,
-  );
+  });
   const open = useCallback(
     (r: CatalogReference) =>
       setP({ provider: r.provider, kind: r.kind, id: r.id }),
@@ -1293,9 +1572,38 @@ export function ScenesView() {
       setP({
         provider: p,
         page: null,
-        ...(p === "stashdb" ? { year: null } : {}),
+        // Year, sort, studio and tag filters are provider-scoped; none of
+        // them is carried into the other provider's query.
+        year: p === "stashdb" ? null : year || null,
+        sort: null,
+        direction: null,
+        studio: null,
+        tags: null,
       }),
+    [setP, year],
+  );
+  const onSort = useCallback(
+    (v: string) => setP({ sort: v || null, direction: null, page: null }),
     [setP],
+  );
+  const onDirection = useCallback(
+    (v: "asc" | "desc") => setP({ direction: v, page: null }),
+    [setP],
+  );
+  const onStudio = useCallback(
+    (v: string) => setP({ studio: v || null, page: null }),
+    [setP],
+  );
+  const removeTag = useCallback(
+    (id: string) =>
+      setP({
+        tags:
+          [...new Set(tags.split(",").filter(Boolean))]
+            .filter((t) => t !== id)
+            .join(",") || null,
+        page: null,
+      }),
+    [setP, tags],
   );
   const retry = useCallback(() => setReload((n) => n + 1), []);
   return (
@@ -1325,6 +1633,17 @@ export function ScenesView() {
             />
           </div>
         )}
+        <div className="sm:w-64">
+          <SortSelect
+            id="scene-sort"
+            provider={provider}
+            kind="scene"
+            sort={sortKey ?? ""}
+            direction={direction}
+            onSort={onSort}
+            onDirection={onDirection}
+          />
+        </div>
         <div className="sm:w-56">
           <SearchBox
             id="scene-performer"
@@ -1335,7 +1654,12 @@ export function ScenesView() {
           />
         </div>
       </div>
-      {(q || (provider === "tpdb" && year) || performer) && (
+      {(q ||
+        (provider === "tpdb" && year) ||
+        performer ||
+        studio ||
+        tags ||
+        sortKey) && (
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted">Filters:</span>
           {q && <FilterChip label={`“${q}”`} onRemove={() => onQ("")} />}
@@ -1346,6 +1670,25 @@ export function ScenesView() {
             <FilterChip
               label={`Performer: ${performer}`}
               onRemove={() => onPerformer("")}
+            />
+          )}
+          {studio && (
+            <FilterChip
+              label={`Studio: ${filterName(provider, "studio", studio)}`}
+              onRemove={() => onStudio("")}
+            />
+          )}
+          {[...new Set(tags.split(",").filter(Boolean))].map((id) => (
+            <FilterChip
+              key={id}
+              label={`Tag: ${filterName(provider, "tag", id)}`}
+              onRemove={() => removeTag(id)}
+            />
+          ))}
+          {sortKey && (
+            <FilterChip
+              label={`Sort: ${SORT_LABELS[sortKey]}${direction ? ` (${direction})` : ""}`}
+              onRemove={() => onSort("")}
             />
           )}
         </div>
@@ -1363,7 +1706,7 @@ export function ScenesView() {
           <GridSkeleton aspect="aspect-video" cols={LANDSCAPE_COLS} count={6} />
         ) : data.items.length === 0 ? (
           <div className="panel p-8 text-center text-sm text-muted">
-            {q || year || performer
+            {q || year || performer || studio || tags
               ? `No ${providerLabel(provider)} scenes match your filters.`
               : `No ${providerLabel(provider)} scenes found.`}
           </div>
@@ -1392,6 +1735,30 @@ export function ScenesView() {
 export function PerformersView() {
   const params = useSearchParams();
   const setP = useParamsSetter();
+  // A performer target in the URL is the performer page, not the dialog:
+  // kind=performer renders PerformerView; other kinds keep the dialog.
+  const target = detailTarget(params);
+  const performerTarget =
+    target?.kind === "performer"
+      ? { provider: target.provider, kind: "performer" as const, id: target.id }
+      : null;
+  const hadPerformer = useRef(false);
+  // Scroll save/restore around the performer page: saved on entry, restored
+  // when it closes (Escape/Close/Back). Filter changes never touch the
+  // store, so they never cause a jump.
+  useEffect(() => {
+    if (performerTarget) {
+      if (!hadPerformer.current) {
+        hadPerformer.current = true;
+        saveScroll(browseKeyOf(params));
+      }
+      return;
+    }
+    if (hadPerformer.current) {
+      hadPerformer.current = false;
+      restoreScroll(browseKeyOf(params));
+    }
+  });
   const { providers } = useSession();
   const provider = providerOf(params.get("provider"));
   const q = params.get("q") ?? "";
@@ -1404,18 +1771,22 @@ export function PerformersView() {
   const notConfigured = providers?.[provider] === "not_configured";
   const needsQuery = q.trim() === "";
   const enabled = !notConfigured && !needsQuery;
-  const { data, error } = useCatalogSearch(
+  const { data, error } = useCatalogSearch({
     provider,
-    "performer",
+    kind: "performer",
     q,
-    "",
-    "",
+    year: "",
+    performer: "",
+    studio: "",
+    tags: "",
+    sort: "",
+    direction: "",
     page,
     perPage,
-    !unpaged,
+    paged: !unpaged,
     enabled,
     reload,
-  );
+  });
   const open = useCallback(
     (r: CatalogReference) =>
       setP({ provider: r.provider, kind: r.kind, id: r.id }),
@@ -1434,6 +1805,13 @@ export function PerformersView() {
     [setP],
   );
   const retry = useCallback(() => setReload((n) => n + 1), []);
+  if (performerTarget) {
+    return (
+      <section aria-label="Performers">
+        <PerformerView reference={performerTarget} />
+      </section>
+    );
+  }
   return (
     <section aria-label="Performers">
       <h2 className="text-xl font-semibold">Performers</h2>
