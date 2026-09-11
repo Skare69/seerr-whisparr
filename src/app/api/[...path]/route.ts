@@ -154,9 +154,6 @@ function fieldText(
 ): string {
   const value = body[key];
   if (typeof value !== "string" || value.length === 0 || value.length > max) {
-    // ponytail-diag: temporary CI diagnostics, remove after triage.
-    if (key === "password")
-      console.error("PWSTACK", new Error("trace").stack);
     throw new AppError(400, "invalid_field", `Invalid ${key}.`);
   }
   return value;
