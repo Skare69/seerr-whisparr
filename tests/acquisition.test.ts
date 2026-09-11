@@ -23,10 +23,14 @@ import type {
   ExternalUser,
   IntegrationConfig,
   MediaReference,
+  RemovalLevel,
 } from "../src/lib/contracts.ts";
 // Imported after env setup because storage reads VELVARR_* at open time —
 // the same module-load boundary storage.test.ts exercises.
 process.env.VELVARR_SECRET_KEY = "33".repeat(32);
+// The removal ladder runs its destructive paths only against this file's
+// loopback fixture; the flag gates the storage APIs the tests use.
+process.env.VELVARR_ENABLE_REMOVAL = "1";
 // storage opens lazily but reads VELVARR_DATA_DIR at each open: pin even the
 // pre-freshDb window to a throwaway dir so no code path can fall back to the
 // repo's ./data default while tests run in parallel with other files.
@@ -54,13 +58,17 @@ let knobs = {
   addStatus: 201,
   failFindAfterAdd: false,
   failFindOnce: 0,
-  pathOverride: null as string | null,
   holdAdd: null as Promise<void> | null,
+  added: null as string | null,
+  mutateStatus: 200,
+  holdDelete: null as Promise<void> | null,
+  pathOverride: null as string | null,
 };
+let onAdd: (() => void) | null = null;
+let onDelete: (() => void) | null = null;
 let storedItems = new Map<string, number>();
 let nextId = 1;
 let calls: { method: string; path: string }[] = [];
-let onAdd: (() => void) | null = null;
 
 function dtoFor(ext: string, id: number) {
   return {
@@ -71,9 +79,9 @@ function dtoFor(ext: string, id: number) {
     hasFile: knobs.hasFile && ext === EXT_A,
     path: knobs.pathOverride ?? `/data/whisparr/${ext.slice(0, 8)}`,
     foreignId: `tpdbId:${ext}`,
-    tmdbId: 0,
-    tpdbId: ext,
     sizeOnDisk: 0,
+    ...(knobs.added ? { added: knobs.added } : {}),
+    tpdbId: ext,
   };
 }
 
@@ -126,6 +134,24 @@ async function handle(
     );
     return;
   }
+  if (
+    (req.method === "DELETE" || req.method === "PUT") &&
+    /^\/api\/v3\/movie\/\d+/.test(path)
+  ) {
+    if (knobs.mutateStatus !== 200) {
+      return json(knobs.mutateStatus, { message: "mutate rejected" });
+    }
+    const wid = Number(/\/api\/v3\/movie\/(\d+)/.exec(path)?.[1]);
+    if (knobs.holdDelete) await knobs.holdDelete;
+    if (req.method === "DELETE") {
+      for (const [ext, id] of storedItems) {
+        if (id === wid) storedItems.delete(ext);
+      }
+    }
+    onDelete?.();
+    onDelete = null;
+    return json(200, {});
+  }
   json(404, { message: "not found" });
 }
 
@@ -133,6 +159,10 @@ const server: Server = createServer((req, res) => {
   void handle(req, res);
 });
 await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+// The default 5s server-side idle close races undici's pooled keep-alive
+// sockets under suite load, surfacing as a transient "could not be
+// reached"; keep the loopback fixture's sockets open for the whole run.
+server.keepAliveTimeout = 300_000;
 const FIXTURE_URL = `http://127.0.0.1:${
   (server.address() as AddressInfo).port
 }`;
@@ -161,7 +191,6 @@ function freshDb(): void {
   if (dir)
     rmSync(dir, {
       recursive: true,
-      force: true,
       maxRetries: 10,
       retryDelay: 50,
     });
@@ -177,11 +206,15 @@ function freshDb(): void {
     failFindOnce: 0,
     pathOverride: null,
     holdAdd: null,
+    added: null,
+    holdDelete: null,
+    mutateStatus: 200,
   };
   storedItems = new Map();
   nextId = 1;
   calls = [];
   onAdd = null;
+  onDelete = null;
 }
 
 function config(delivery: boolean): IntegrationConfig {
@@ -945,6 +978,359 @@ test("a hanging or rejecting notifier neither fails nor delays the pass", async 
       1,
       "rejecting notifier never fails the work",
     );
+  } finally {
+    delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    webhook.closeAllConnections();
+    webhook.close();
+  }
+});
+
+// --- removals ---------------------------------------------------------
+
+// Removal approvals need an elevated actor with the grant and a requester
+// with the grant; both accounts live in this file's loopback-only DB.
+function grantRemoval(): Account {
+  storage.updateAccount(OWNER.id, {
+    enabled: true,
+    role: "admin",
+    libraryIds: [],
+    canRemove: true,
+  });
+  storage.updateAccount(FRIEND_ID, {
+    enabled: true,
+    role: "requester",
+    libraryIds: [],
+    canRemove: true,
+  });
+  return storage.getAccount(OWNER.id) as Account;
+}
+
+function removalApprove(media: MediaReference, level: RemovalLevel): string {
+  storage.approveRemovalRequest(
+    storage.getAccount(OWNER.id) as Account,
+    storage.createRemovalRequest(FRIEND_ID, media, "household asked").id,
+    level,
+  );
+  const exec = storage.getRemovalExecutionByReference(media);
+  assert.ok(exec, `no removal execution created for ${media.id}`);
+  return exec.id;
+}
+
+/** Raw removal row straight from SQLite, readable from inside the fixture's
+ * DELETE handler to observe what the worker persisted before the call. */
+type RemovalRow = {
+  state: string;
+  attempt: number;
+  item: number | null;
+  added: string | null;
+};
+
+function rawRemoval(id: string): RemovalRow {
+  probeDb ??= new DatabaseSync(join(dir, "velvarr.sqlite"));
+  return probeDb
+    .prepare(
+      "SELECT state, attempt_token IS NOT NULL AS attempt, whisparr_item_id AS item, whisparr_added AS added FROM removal_executions WHERE id = ?",
+    )
+    .get(id) as RemovalRow;
+}
+
+function removalAudits(
+  execId: string,
+): { outcome: string; detail: string | null }[] {
+  probeDb ??= new DatabaseSync(join(dir, "velvarr.sqlite"));
+  return probeDb
+    .prepare(
+      "SELECT outcome, detail FROM removal_audit WHERE execution_id = ? ORDER BY created_at, id",
+    )
+    .all(execId) as { outcome: string; detail: string | null }[];
+}
+
+function callPaths(): string[] {
+  return calls.map((c) => `${c.method} ${c.path}`);
+}
+
+function deleteCount(): number {
+  return callPaths().filter((p) => p.startsWith("DELETE")).length;
+}
+
+test("each Whisparr level issues exactly its own calls and nothing more", async () => {
+  const levels: [RemovalLevel, string][] = [
+    ["unmonitor", `PUT /api/v3/movie/1`],
+    [
+      "drop",
+      `DELETE /api/v3/movie/1?deleteFiles=false&addImportExclusion=false`,
+    ],
+    [
+      "exclude",
+      `DELETE /api/v3/movie/1?deleteFiles=false&addImportExclusion=true`,
+    ],
+    [
+      "delete_files",
+      `DELETE /api/v3/movie/1?deleteFiles=true&addImportExclusion=true`,
+    ],
+  ];
+  for (const [level, expected] of levels) {
+    boot();
+    grantRemoval();
+    storedItems.set(EXT_A, 1);
+    removalApprove(MOVIE_A, level);
+    const summary = await acquisition.runDueWork();
+    assert.deepEqual(
+      callPaths(),
+      [
+        `GET /api/v3/movie?tpdbId=${EXT_A}`,
+        `GET /api/v3/movie?tpdbId=${EXT_A}`,
+        expected,
+      ],
+      `${level} call matrix`,
+    );
+    const exec = storage.getRemovalExecutionByReference(MOVIE_A);
+    assert.equal(exec?.state, "done", `${level} completes as done`);
+    assert.equal(summary.removed, 1, level);
+    assert.equal(summary.errors, 0, level);
+  }
+});
+
+test("the attempt row carries the observed facts before the destructive call", async () => {
+  boot();
+  grantRemoval();
+  knobs.added = "2026-01-01T00:00:00.000Z";
+  storedItems.set(EXT_A, 7);
+  const execId = removalApprove(MOVIE_A, "delete_files");
+  const atCall: { row: RemovalRow | null } = { row: null };
+  onDelete = () => {
+    atCall.row = rawRemoval(execId);
+  };
+  const summary = await acquisition.runDueWork();
+  assert.ok(atCall.row, "the destructive DELETE ran");
+  assert.equal(atCall.row.state, "executing", "attempt durable at call time");
+  assert.equal(atCall.row.attempt, 1, "attempt token persisted pre-call");
+  assert.equal(atCall.row.item, 7, "observed item id persisted pre-call");
+  assert.equal(atCall.row.added, knobs.added, "observed added persisted");
+  assert.equal(summary.removed, 1);
+  assert.equal(summary.errors, 0);
+});
+
+test("a proven 404 on the destructive call completes as success", async () => {
+  boot();
+  grantRemoval();
+  storedItems.set(EXT_A, 3);
+  knobs.mutateStatus = 404;
+  const execId = removalApprove(MOVIE_A, "drop");
+  const summary = await acquisition.runDueWork();
+  assert.equal(summary.removed, 1, "already gone is success");
+  assert.equal(summary.failed, 0);
+  assert.equal(storage.getRemovalExecutionByReference(MOVIE_A)?.state, "done");
+  assert.equal(removalAudits(execId)[0]?.outcome, "done");
+  // A completed execution never schedules again.
+  await acquisition.runDueWork(later());
+  assert.equal(deleteCount(), 1, "done removals are never re-executed");
+});
+
+test("an outage leaves it uncertain; the retry re-resolves and refuses re-added content", async () => {
+  boot();
+  grantRemoval();
+  knobs.added = "2026-01-01T00:00:00.000Z";
+  storedItems.set(EXT_A, 1);
+  const execId = removalApprove(MOVIE_A, "drop");
+
+  knobs.mutateStatus = 503;
+  const first = await acquisition.runDueWork();
+  assert.equal(first.uncertain, 1, "proven 5xx leaves the effect unknown");
+  const afterFirst = storage.getRemovalExecutionByReference(MOVIE_A);
+  assert.equal(afterFirst?.state, "uncertain");
+  assert.equal(
+    afterFirst?.whisparrAdded,
+    "2026-01-01T00:00:00.000Z",
+    "the captured added timestamp is durable",
+  );
+
+  // The identity is re-added under a newer added timestamp before the
+  // bounded recheck: the retry must re-resolve, compare, and refuse.
+  knobs.added = "2026-02-02T00:00:00.000Z";
+  storedItems.set(EXT_A, 2);
+  knobs.mutateStatus = 200;
+  const seen = calls.length;
+  const second = await acquisition.runDueWork(later());
+  assert.deepEqual(
+    callPaths().slice(seen),
+    [`GET /api/v3/movie?tpdbId=${EXT_A}`, `GET /api/v3/movie?tpdbId=${EXT_A}`],
+    "the refused retry resolves by identity and never DELETEs",
+  );
+  assert.equal(second.refused, 1);
+  assert.equal(second.uncertain, 0);
+  const exec = storage.getRemovalExecutionByReference(MOVIE_A);
+  assert.equal(exec?.state, "failed", "a refusal is terminal, never retried");
+  const audits = removalAudits(execId);
+  const last = audits[audits.length - 1];
+  assert.equal(last?.outcome, "failed");
+  assert.match(last?.detail ?? "", /refus/i);
+  assert.equal(deleteCount(), 1, "exactly one DELETE ever left the building");
+});
+
+test("a Jellyfin-level removal never executes in the loop and explains why", async () => {
+  boot();
+  grantRemoval();
+  storedItems.set(EXT_A, 1);
+  const execId = removalApprove(MOVIE_A, "delete_jellyfin_item");
+
+  const first = await acquisition.runDueWork();
+  assert.equal(first.removed, 0);
+  assert.equal(first.blocked, 1);
+  assert.equal(
+    callPaths().length,
+    0,
+    "no user token means no calls of any kind — no downgrade, no admin key",
+  );
+  const exec = storage.getRemovalExecutionByReference(MOVIE_A);
+  assert.ok(exec);
+  assert.equal(exec.state, "uncertain");
+  const audits = removalAudits(execId);
+  assert.equal(audits.length, 1, "the reason is recorded exactly once");
+  assert.equal(audits[0]?.outcome, "uncertain");
+  assert.match(audits[0]?.detail ?? "", /Jellyfin user token/);
+
+  // Later passes neither execute it nor append more evidence.
+  const second = await acquisition.runDueWork(later());
+  assert.equal(second.blocked, 1);
+  assert.equal(callPaths().length, 0);
+  assert.equal(removalAudits(execId).length, 1);
+});
+
+test("claim contention skips the removal instead of double-acting", async () => {
+  boot();
+  grantRemoval();
+  storedItems.set(EXT_A, 1);
+  storedItems.set(EXT_B, 2);
+  const execA = removalApprove(MOVIE_A, "drop");
+  const execB = removalApprove(MOVIE_B, "drop");
+
+  // Hold the first DELETE open so a second execution can be claimed
+  // externally while the pass is mid-flight: a genuine list/claim race.
+  const hold = Promise.withResolvers<void>();
+  knobs.holdDelete = hold.promise;
+  const pass = acquisition.runDueWork();
+  await until(() => deleteCount() === 1);
+  const inFlight = calls[calls.length - 1]?.path ?? "";
+  const other = inFlight.includes("/1") ? execB : execA;
+  const raced = storage.claimRemovalExecution(other);
+  hold.resolve();
+  const summary = await pass;
+  assert.equal(summary.removed, 1, "the in-flight removal lands");
+  assert.equal(summary.contention, 1, "the raced claim is skipped");
+  assert.equal(deleteCount(), 1, "a lost claim never double-acts");
+
+  // Once the external claim is gone the skipped execution proceeds.
+  storage.releaseRemovalClaim(other, raced.claimToken);
+  const next = await acquisition.runDueWork();
+  assert.equal(next.removed, 1);
+  assert.equal(deleteCount(), 2);
+});
+
+test("removal and acquisition work coexist; a removal identity is never re-added", async () => {
+  const owner = boot();
+  grantRemoval();
+  storedItems.set(EXT_A, 1);
+  approve(owner.id, MOVIE_B);
+  approve(owner.id, MOVIE_A);
+  removalApprove(MOVIE_A, "drop");
+
+  const summary = await acquisition.runDueWork();
+  assert.equal(summary.removed, 1, "the removal lands");
+  assert.equal(summary.delivered, 1, "the unrelated acquisition lands too");
+  assert.equal(summary.blocked, 1, "the same-identity acquisition is held");
+  assert.equal(postCount(), 1, "only movie B was ever added");
+  assert.equal(deleteCount(), 1);
+  assert.equal(storage.getAcquisitionByReference(MOVIE_B)?.state, "monitoring");
+  assert.equal(
+    storage.getAcquisitionByReference(MOVIE_A)?.state,
+    "unsent",
+    "the suppressed acquisition keeps its honest state",
+  );
+  // A completed removal keeps suppressing its identity on later passes.
+  const second = await acquisition.runDueWork(later());
+  assert.equal(second.blocked, 1);
+  assert.equal(postCount(), 1, "a removed identity is never re-acquired");
+});
+
+test("the operator flag off leaves acquisition delivery untouched", async () => {
+  const owner = boot();
+  grantRemoval();
+  approve(owner.id, MOVIE_A);
+  delete process.env.VELVARR_ENABLE_REMOVAL;
+  try {
+    const summary = await acquisition.runDueWork();
+    assert.equal(summary.delivered, 1, "acquisition work continues");
+    assert.equal(summary.errors, 0, "the disabled flag is not an error");
+  } finally {
+    process.env.VELVARR_ENABLE_REMOVAL = "1";
+  }
+});
+
+test("a settled removal notifies once; unsettled outcomes stay silent", async () => {
+  boot();
+  grantRemoval();
+  const bodies: string[] = [];
+  const webhook = createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
+      raw += chunk;
+    });
+    req.on("end", () => {
+      bodies.push(raw);
+      res.writeHead(200);
+      res.end("{}");
+    });
+  });
+  const listening = Promise.withResolvers<void>();
+  webhook.listen(0, "127.0.0.1", listening.resolve);
+  await listening.promise;
+  process.env.VELVARR_DISCORD_WEBHOOK_URL = `http://127.0.0.1:${
+    (webhook.address() as AddressInfo).port
+  }/api/webhooks/1/fixture-token`;
+  try {
+    storedItems.set(EXT_A, 1);
+    removalApprove(MOVIE_A, "drop");
+    await acquisition.runDueWork();
+    await eventually(() => bodies.length >= 1);
+    assert.equal(bodies.length, 1, "one notification for the removal");
+    const landed = bodies.join("\n");
+    assert.ok(landed.includes("removed"), "names the removal transition");
+    assert.ok(landed.includes(EXT_A), "identity-only message names the media");
+
+    // A proven upstream rejection is a settled failure the household hears.
+    storedItems.set(EXT_C, 3);
+    knobs.mutateStatus = 400;
+    removalApprove(MOVIE_C, "drop");
+    await acquisition.runDueWork();
+    await eventually(() => bodies.length >= 2);
+    assert.ok(bodies[1]?.includes("failed"));
+
+    // Uncertain then refused settles silently: a retry guard must not cry
+    // wolf on an outcome that a later pass may still resolve. A transient
+    // loopback hiccup can skip the pre-attempt lookup (nothing attempted,
+    // state untouched); retry until the attempt is durable, then re-add the
+    // content before the bounded recheck.
+    knobs.mutateStatus = 503;
+    knobs.added = "2026-01-01T00:00:00.000Z";
+    storedItems.set(EXT_B, 2);
+    removalApprove(MOVIE_B, "drop");
+    let b1 = await acquisition.runDueWork();
+    for (let i = 0; b1.unavailable > 0 && i < 5; i++) {
+      b1 = await acquisition.runDueWork(later());
+    }
+    assert.equal(b1.uncertain, 1, "the outage leaves the attempt uncertain");
+    assert.equal(
+      storage.getRemovalExecutionByReference(MOVIE_B)?.whisparrAdded,
+      "2026-01-01T00:00:00.000Z",
+    );
+    knobs.added = "2026-02-02T00:00:00.000Z";
+    storedItems.set(EXT_B, 9);
+    knobs.mutateStatus = 200;
+    await acquisition.runDueWork(later());
+    await eventually(() => false);
+    assert.equal(bodies.length, 2, "unsettled outcomes never notify");
   } finally {
     delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
     webhook.closeAllConnections();

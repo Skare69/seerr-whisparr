@@ -116,6 +116,10 @@ const fx = {
   impersonate: null as string | null, // force /Users/Me identity for regression testing
 
   fail: { items: 0, views: 0, me401: 0 },
+  // Wired only inside the removal impact test: every request either fixture
+  // server sees while it is on, so the test can prove the preview is GET-only.
+  journalOn: false,
+  journal: [] as { method: string; path: string }[],
   libraries: [
     { id: MOVIES_LIB, name: "Movies", type: "movies" },
     { id: SHOWS_LIB, name: "Shows", type: "homevideos" },
@@ -206,6 +210,7 @@ async function jellyfinHandler(
     String(req.headers.authorization ?? ""),
   )?.[1];
   const userId = token ? (fx.tokens.get(token) ?? null) : null;
+  if (fx.journalOn) fx.journal.push({ method: req.method ?? "", path: p });
 
   if (p === "/System/Info/Public")
     return json(res, 200, { Id: fx.serverId, ServerName: "FixtureJF" });
@@ -319,6 +324,41 @@ async function jellyfinHandler(
 
 const whisparrKey = "wh-fixture-key";
 
+// Stored Whisparr movie backing the removal impact preview. Its path runs
+// through the configured "/data/whisparr" -> "/media" mapping onto ITEM_MOVIE.
+const whisparrMovies: {
+  id: number;
+  title: string;
+  monitored: boolean;
+  path: string;
+  hasFile: boolean;
+  movieFileId: number;
+  sizeOnDisk: number;
+  added: string;
+  tmdbId: number;
+  tpdbId: string;
+  stashId?: string;
+  foreignId: string;
+  itemType: string;
+  statistics: { movieFileCount: number; sizeOnDisk: number };
+}[] = [
+  {
+    id: 411,
+    title: "Alpha Movie",
+    monitored: true,
+    path: `/data/whisparr/${ITEM_MOVIE}.mkv`,
+    hasFile: true,
+    movieFileId: 5,
+    sizeOnDisk: 741_234_567,
+    added: "2026-09-10T12:00:00Z",
+    tmdbId: 0,
+    tpdbId: TPDB_MOVIE,
+    foreignId: `tpdbId:${TPDB_MOVIE}`,
+    itemType: "movie",
+    statistics: { movieFileCount: 2, sizeOnDisk: 741_234_567 },
+  },
+];
+
 async function whisparrHandler(
   req: IncomingMessage,
   res: ServerResponse,
@@ -331,6 +371,23 @@ async function whisparrHandler(
     return json(res, 200, [{ id: 1, path: "/movies" }]);
   if (url.pathname === "/api/v3/qualityprofile")
     return json(res, 200, [{ id: 1, name: "HD" }]);
+  if (fx.journalOn)
+    fx.journal.push({ method: req.method ?? "", path: url.pathname });
+  // Exact-identity stored-item read (GET): the removal impact preview's only
+  // Whisparr contact.
+  if (url.pathname === "/api/v3/movie") {
+    const tpdbId = url.searchParams.get("tpdbId");
+    const stashId = url.searchParams.get("stashId");
+    return json(
+      res,
+      200,
+      whisparrMovies.filter(
+        (m) =>
+          (tpdbId !== null && m.tpdbId === tpdbId) ||
+          (stashId !== null && m.stashId === stashId),
+      ),
+    );
+  }
   json(res, 404, {});
 }
 
@@ -2541,4 +2598,414 @@ test("warmed library artwork and detail refuse anonymous, library-denied and rev
     cookie: member,
   });
   assert.equal(revokedItem.status, 401);
+});
+
+// --- M7: removal endpoints — gates, authority, privacy, origin, impact ---
+
+// Bucket-safe casting: "wrecked" is the granted requester, "member" is
+// promoted to moderator+grant, and the owner keeps the un-revoked setup
+// session as the elevated-but-ungranted approver. No identity is logged in
+// more than twice, so the login limiter's five-per-window budget holds.
+test("removals: gates, level authority, decline/cancel, privacy, origin", async () => {
+  // The suite never sets the flag; restore that state no matter how we exit.
+  try {
+    const removalMedia = {
+      provider: "tpdb",
+      kind: "movie",
+      id: TPDB_MOVIE,
+    } as const;
+
+    // Admit the fixture user first (no grant yet).
+    const admit = await call("PATCH", `/api/admin/users/${DISABLED_ID}`, {
+      cookie: owner,
+      body: { enabled: true, role: "requester", libraryIds: [] },
+    });
+    assert.equal(admit.status, 200);
+
+    // Flag off: the collection still answers, visibly unavailable, and
+    // creation refuses with the explicit code before anything else.
+    delete process.env.VELVARR_ENABLE_REMOVAL;
+    const wreckedOff = await loginAs("wrecked");
+    const off = await call("GET", "/api/removals", { cookie: wreckedOff });
+    assert.equal(off.status, 200);
+    const offBody = (await off.json()) as {
+      removals: unknown[];
+      enabled: boolean;
+    };
+    assert.equal(offBody.enabled, false);
+    assert.deepEqual(offBody.removals, []);
+    const offCreate = await errorShape(
+      await call("POST", "/api/removals", {
+        cookie: wreckedOff,
+        body: { media: removalMedia, reason: "flag off" },
+      }),
+      403,
+    );
+    assert.equal(offCreate.code, "removal_disabled");
+
+    // Flag on, grant off: refused at the boundary with the storage code.
+    process.env.VELVARR_ENABLE_REMOVAL = "1";
+    const noGrant = await call("POST", "/api/removals", {
+      cookie: wreckedOff,
+      body: { media: removalMedia, reason: "not admitted" },
+    });
+    assert.equal(noGrant.status, 403);
+    assert.equal(
+      ((await noGrant.json()) as { error: { code: string } }).error.code,
+      "account_not_admitted",
+    );
+
+    // The grant, exactly like autoApprove: settable and preserved on
+    // omission (a grant change revokes sessions by design, so re-login).
+    const granted = await call("PATCH", `/api/admin/users/${DISABLED_ID}`, {
+      cookie: owner,
+      body: {
+        enabled: true,
+        role: "requester",
+        libraryIds: [],
+        canRemove: true,
+      },
+    });
+    assert.equal(granted.status, 200);
+    assert.equal(
+      ((await granted.json()) as { account: { canRemove: boolean } }).account
+        .canRemove,
+      true,
+    );
+    const omitted = await call("PATCH", `/api/admin/users/${DISABLED_ID}`, {
+      cookie: owner,
+      body: { enabled: true, role: "requester", libraryIds: [] },
+    });
+    assert.equal(omitted.status, 200);
+    assert.equal(
+      ((await omitted.json()) as { account: { canRemove: boolean } }).account
+        .canRemove,
+      true,
+    );
+    const wrecked = await loginAs("wrecked");
+
+    // Creation: 201 pending with a null level; a supplied level key is
+    // refused outright, never read.
+    const created = await call("POST", "/api/removals", {
+      cookie: wrecked,
+      body: { media: removalMedia, reason: "gone from the library too long" },
+    });
+    assert.equal(created.status, 201);
+    const createdBody = (await created.json()) as {
+      removal: {
+        id: string;
+        decision: string;
+        level: string | null;
+        reason: string;
+      };
+    };
+    assert.equal(createdBody.removal.decision, "pending");
+    assert.equal(createdBody.removal.level, null);
+    assert.equal(createdBody.removal.reason, "gone from the library too long");
+    const removalId = createdBody.removal.id;
+    const withLevel = await call("POST", "/api/removals", {
+      cookie: wrecked,
+      body: {
+        media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE2 },
+        reason: "second",
+        level: "drop",
+      },
+    });
+    assert.equal(withLevel.status, 400);
+    assert.equal(
+      ((await withLevel.json()) as { error: { code: string } }).error.code,
+      "invalid_field",
+    );
+
+    // A requester cannot approve — even holding the removal grant.
+    const selfApprove = await call("PATCH", `/api/removals/${removalId}`, {
+      cookie: wrecked,
+      body: { decision: "approved", level: "drop" },
+    });
+    assert.equal(selfApprove.status, 403);
+    assert.equal(
+      ((await selfApprove.json()) as { error: { code: string } }).error.code,
+      "forbidden",
+    );
+
+    // An elevated approver without the grant is refused too (the owner's
+    // setup session was never revoked: no account change touched it).
+    const noGrantApprove = await call("PATCH", `/api/removals/${removalId}`, {
+      cookie: owner,
+      body: { decision: "approved", level: "drop" },
+    });
+    assert.equal(noGrantApprove.status, 403);
+    assert.equal(
+      ((await noGrantApprove.json()) as { error: { code: string } }).error.code,
+      "forbidden",
+    );
+
+    // Promote member to moderator + grant; the approval level rules bind.
+    const promoted = await call("PATCH", `/api/admin/users/${MEMBER_ID}`, {
+      cookie: owner,
+      body: {
+        enabled: true,
+        role: "moderator",
+        libraryIds: [MOVIES_LIB],
+        canRemove: true,
+      },
+    });
+    assert.equal(promoted.status, 200);
+    member = await loginAs("member");
+
+    const noLevel = await errorShape(
+      await call("PATCH", `/api/removals/${removalId}`, {
+        cookie: member,
+        body: { decision: "approved" },
+      }),
+    );
+    assert.equal(noLevel.code, "invalid_level");
+    const badLevel = await errorShape(
+      await call("PATCH", `/api/removals/${removalId}`, {
+        cookie: member,
+        body: { decision: "approved", level: "delete_everything" },
+      }),
+    );
+    assert.equal(badLevel.code, "invalid_level");
+    const approved = await call("PATCH", `/api/removals/${removalId}`, {
+      cookie: member,
+      body: { decision: "approved", level: "drop" },
+    });
+    assert.equal(approved.status, 200);
+    const approvedBody = (await approved.json()) as {
+      removal: { decision: string; level: string };
+    };
+    assert.equal(approvedBody.removal.decision, "approved");
+    assert.equal(approvedBody.removal.level, "drop");
+
+    // Decline: elevated role only, and a level is rejected there too.
+    const second = await call("POST", "/api/removals", {
+      cookie: wrecked,
+      body: {
+        media: { provider: "tpdb", kind: "movie", id: TPDB_MOVIE2 },
+        reason: "second",
+      },
+    });
+    assert.equal(second.status, 201);
+    const secondId = ((await second.json()) as { removal: { id: string } })
+      .removal.id;
+    await errorShape(
+      await call("PATCH", `/api/removals/${secondId}`, {
+        cookie: wrecked,
+        body: { decision: "declined" },
+      }),
+      403,
+    );
+    const declineLevel = await errorShape(
+      await call("PATCH", `/api/removals/${secondId}`, {
+        cookie: member,
+        body: { decision: "declined", level: "drop" },
+      }),
+    );
+    assert.equal(declineLevel.code, "invalid_level");
+    const declined = await call("PATCH", `/api/removals/${secondId}`, {
+      cookie: member,
+      body: { decision: "declined" },
+    });
+    assert.equal(declined.status, 200);
+    assert.equal(
+      ((await declined.json()) as { removal: { decision: string } }).removal
+        .decision,
+      "declined",
+    );
+
+    // Cancel: the requester's own intent only; a foreign cancel is a bare
+    // 404 with no existence leak.
+    const third = await call("POST", "/api/removals", {
+      cookie: wrecked,
+      body: {
+        media: { provider: "stashdb", kind: "scene", id: STASH_SCENE },
+        reason: "third",
+      },
+    });
+    assert.equal(third.status, 201);
+    const thirdId = ((await third.json()) as { removal: { id: string } })
+      .removal.id;
+    const cancelled = await call("PATCH", `/api/removals/${thirdId}`, {
+      cookie: wrecked,
+      body: { decision: "cancelled" },
+    });
+    assert.equal(cancelled.status, 200);
+    const cancelAgain = await call("PATCH", `/api/removals/${thirdId}`, {
+      cookie: wrecked,
+      body: { decision: "cancelled" },
+    });
+    assert.equal(cancelAgain.status, 409);
+    assert.equal(
+      ((await cancelAgain.json()) as { error: { code: string } }).error.code,
+      "removal_request_not_cancellable",
+    );
+    const foreignCancel = await call("PATCH", `/api/removals/${removalId}`, {
+      cookie: member,
+      body: { decision: "cancelled" },
+    });
+    assert.equal(foreignCancel.status, 404);
+    assert.equal(
+      ((await foreignCancel.json()) as { error: { code: string } }).error.code,
+      "removal_request_not_found",
+    );
+    const unknownId = "9".repeat(8) + "-0000-0000-0000-" + "9".repeat(12);
+    const unknownDecision = await call("PATCH", `/api/removals/${unknownId}`, {
+      cookie: member,
+      body: { decision: "declined" },
+    });
+    assert.equal(unknownDecision.status, 404);
+    assert.equal(
+      ((await unknownDecision.json()) as { error: { code: string } }).error
+        .code,
+      "removal_request_not_found",
+    );
+
+    // Privacy: a requester's list never contains another user's removal;
+    // elevated viewers see the whole collection.
+    const wreckedList = await call("GET", "/api/removals", {
+      cookie: wrecked,
+    });
+    const wreckedListBody = (await wreckedList.json()) as {
+      removals: { id: string; decision: string }[];
+      enabled: boolean;
+    };
+    assert.equal(wreckedListBody.enabled, true);
+    assert.deepEqual(
+      wreckedListBody.removals.map((r) => r.id).sort(),
+      [removalId, secondId, thirdId].sort(),
+    );
+    const ownerList = (await (
+      await call("GET", "/api/removals", { cookie: owner })
+    ).json()) as { removals: { id: string }[] };
+    assert.deepEqual(
+      ownerList.removals.map((r) => r.id).sort(),
+      [removalId, secondId, thirdId].sort(),
+    );
+
+    // Foreign origin is rejected on all three mutating removal routes
+    // before any state changes.
+    await errorShape(
+      await call("POST", "/api/removals", {
+        origin: "https://evil.example",
+        cookie: wrecked,
+        body: { media: removalMedia, reason: "evil" },
+      }),
+      403,
+    );
+    await errorShape(
+      await call("PATCH", `/api/removals/${removalId}`, {
+        origin: "https://evil.example",
+        cookie: member,
+        body: { decision: "declined" },
+      }),
+      403,
+    );
+    const after = (await (
+      await call("GET", "/api/removals", { cookie: wrecked })
+    ).json()) as { removals: { id: string; decision: string }[] };
+    assert.equal(after.removals.length, wreckedListBody.removals.length);
+    assert.equal(
+      after.removals.find((r) => r.id === removalId)?.decision,
+      "approved",
+    );
+
+    // Flag off again: the collection still answers, still refuses mutations.
+    delete process.env.VELVARR_ENABLE_REMOVAL;
+    const offAgain = await errorShape(
+      await call("POST", "/api/removals", {
+        cookie: wrecked,
+        body: { media: removalMedia, reason: "flag off again" },
+      }),
+      403,
+    );
+    assert.equal(offAgain.code, "removal_disabled");
+    const offList = await call("GET", "/api/removals", { cookie: wrecked });
+    assert.equal(
+      ((await offList.json()) as { enabled: boolean }).enabled,
+      false,
+    );
+  } finally {
+    delete process.env.VELVARR_ENABLE_REMOVAL;
+  }
+});
+
+test("removals impact: strictly read-only preview under the caller's own authority", async () => {
+  process.env.VELVARR_ENABLE_REMOVAL = "1";
+  fx.journal = [];
+  fx.journalOn = true;
+  try {
+    // The owner: Jellyfin administrator, so deletion is permitted by the
+    // caller's own policy.
+    const ownerView = await call(
+      "GET",
+      `/api/removals/impact?provider=tpdb&kind=movie&id=${TPDB_MOVIE}`,
+      { cookie: owner },
+    );
+    assert.equal(ownerView.status, 200);
+    const ownerBody = (await ownerView.json()) as {
+      whisparr: {
+        found: boolean;
+        path?: string;
+        fileCount?: number;
+        sizeOnDisk?: number;
+        monitored?: boolean;
+      } | null;
+      jellyfin: { matched: boolean; itemName?: string; libraryName?: string };
+      canDeleteInJellyfin: boolean;
+    };
+    assert.deepEqual(ownerBody.whisparr, {
+      found: true,
+      path: `/data/whisparr/${ITEM_MOVIE}.mkv`,
+      fileCount: 2,
+      sizeOnDisk: 741_234_567,
+      monitored: true,
+    });
+    assert.equal(ownerBody.jellyfin.matched, true);
+    assert.equal(ownerBody.jellyfin.itemName, "Alpha Movie");
+    assert.equal(ownerBody.jellyfin.libraryName, "Movies");
+    assert.equal(ownerBody.canDeleteInJellyfin, true);
+
+    // The member sees the same identity, but their own Jellyfin policy does
+    // not permit deletion — the answer is per-caller, never global.
+    const memberView = await call(
+      "GET",
+      `/api/removals/impact?provider=tpdb&kind=movie&id=${TPDB_MOVIE}`,
+      { cookie: member },
+    );
+    assert.equal(memberView.status, 200);
+    const memberBody = (await memberView.json()) as {
+      jellyfin: { matched: boolean; itemName?: string };
+      canDeleteInJellyfin: boolean;
+    };
+    assert.equal(memberBody.jellyfin.matched, true);
+    assert.equal(memberBody.jellyfin.itemName, "Alpha Movie");
+    assert.equal(memberBody.canDeleteInJellyfin, false);
+
+    // An identity absent from both systems answers honestly.
+    const absent = await call(
+      "GET",
+      `/api/removals/impact?provider=tpdb&kind=movie&id=${TPDB_MOVIE4}`,
+      { cookie: member },
+    );
+    assert.equal(absent.status, 200);
+    const absentBody = (await absent.json()) as {
+      whisparr: { found: boolean } | null;
+      jellyfin: { matched: boolean };
+      canDeleteInJellyfin: boolean;
+    };
+    assert.deepEqual(absentBody.whisparr, { found: false });
+    assert.equal(absentBody.jellyfin.matched, false);
+    assert.equal(absentBody.canDeleteInJellyfin, false);
+  } finally {
+    fx.journalOn = false;
+    delete process.env.VELVARR_ENABLE_REMOVAL;
+  }
+  // Zero destructive requests: only GETs ever reached either fixture server.
+  assert.ok(fx.journal.length > 0, "impact preview contacted the fixtures");
+  assert.deepEqual(
+    fx.journal.filter((entry) => entry.method !== "GET"),
+    [],
+    JSON.stringify(fx.journal),
+  );
 });

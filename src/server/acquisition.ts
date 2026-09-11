@@ -9,11 +9,15 @@ import { AppError } from "./http.ts";
 import * as storage from "./storage.ts";
 import {
   deliverToWhisparr,
+  dropWhisparrItem,
   findWhisparrItem,
   observeWhisparrItem,
+  unmonitorWhisparrItem,
+  whisparrRemovalFlags,
   type WhisparrDeliveryResult,
-  type WhisparrObservation,
   type WhisparrItem,
+  type WhisparrObservation,
+  type WhisparrRemovalResult,
 } from "./whisparr.ts";
 import { notifyRequestEvent, type RequestNotification } from "./notify.ts";
 import type {
@@ -21,6 +25,8 @@ import type {
   AcquisitionRecord,
   IntegrationConfig,
   MediaReference,
+  RemovalExecution,
+  RemovalObservedFacts,
 } from "../lib/contracts.ts";
 
 // ponytail: fixed 60s cadence and 20-item batch are the ceilings; tune only
@@ -54,7 +60,13 @@ export type WorkSummary = {
   failed: number;
   /** Outcomes still unknown; reconciled by identity on a later pass. */
   uncertain: number;
-  /** Honestly blocked: delivery off/unconfigured, or no eligible requester. */
+  /** Approved removals that landed, including provably-already-absent. */
+  removed: number;
+  /** Removal retry guards that refused: possibly re-added content, left
+   * terminal without acting. Never counted as a failure. */
+  refused: number;
+  /** Honestly blocked: delivery off/unconfigured, no eligible requester, or
+   * a user-token removal level the loop can never execute. */
   blocked: number;
   /** Claims lost to a concurrent worker; skipped, never double-sent. */
   contention: number;
@@ -74,6 +86,8 @@ const EMPTY_SUMMARY: WorkSummary = {
   absent: 0,
   failed: 0,
   uncertain: 0,
+  removed: 0,
+  refused: 0,
   blocked: 0,
   contention: 0,
   errors: 0,
@@ -145,6 +159,225 @@ function itemFacts(item: WhisparrItem): {
     path: item.path,
     ...(item.title !== undefined ? { title: item.title } : {}),
   };
+}
+
+// --- removal execution (approved destructive work) ---
+
+/** A user-token level can never run here: the loop holds integration
+ * credentials only, and Jellyfin deletion is authorized only under the
+ * requester's own token (falling back to the admin key is forbidden). The
+ * execution is parked in 'uncertain' — frozen storage has no writer that
+ * parks a row in 'blocked' — carrying this durable reason, and the gate in
+ * processRemoval keeps it from spinning: once attemptAt is set, later passes
+ * skip it without claiming, calling, or writing again. */
+const USER_TOKEN_REQUIRED =
+  "cannot execute delete_jellyfin_item: it requires the requester's own Jellyfin user token and the integration worker holds no user session; execute it interactively under that user's session or approve a Whisparr-only level";
+
+const ALREADY_ABSENT = "identity already absent upstream";
+
+function observedFacts(item: WhisparrItem | null): RemovalObservedFacts {
+  if (item === null) return {};
+  return {
+    whisparrItemId: item.whisparrId,
+    path: item.path,
+    fileCount: item.fileCount,
+    ...(item.sizeOnDisk !== undefined ? { size: item.sizeOnDisk } : {}),
+    ...(item.added !== undefined ? { added: item.added } : {}),
+  };
+}
+
+/** One destructive attempt at the approved level — exactly the calls that
+ * level requires and nothing above it. The attempt row carries the observed
+ * external facts BEFORE any call, so a retry re-resolves by identity and
+ * compares the captured added timestamp instead of acting blindly. */
+async function executeRemoval(
+  record: RemovalExecution,
+  config: IntegrationConfig,
+  claimToken: string,
+  summary: WorkSummary,
+): Promise<void> {
+  let item: WhisparrItem | null;
+  try {
+    item = await findWhisparrItem(config, record.media);
+  } catch (e) {
+    // Lookup outage before any attempt exists: nothing was attempted, so
+    // there is nothing to mark; the execution stays due for the next pass.
+    console.error(`[velvarr:acquisition] removal ${record.id}: ${reasonOf(e)}`);
+    summary.unavailable++;
+    return;
+  }
+  const { attemptToken } = storage.beginRemovalAttempt(
+    record.id,
+    claimToken,
+    observedFacts(item),
+  );
+  if (item === null) {
+    // Provably absent before any destructive call: the approved end state
+    // already holds, and zero calls is the exact call count for this level.
+    storage.completeRemovalAttempt(
+      record.id,
+      claimToken,
+      attemptToken,
+      "done",
+      ALREADY_ABSENT,
+    );
+    summary.removed++;
+    notifyTransition({ kind: "removed", media: record.media });
+    return;
+  }
+  // A retry must prove it is still acting on the item the captured attempt
+  // observed: pass the stored added timestamp so the client's guard refuses
+  // freshly re-added content. record is the pre-attempt snapshot, so this is
+  // the previous attempt's facts even though beginRemovalAttempt just
+  // overwrote the stored ones with the current observation.
+  const expectAdded = record.whisparrAdded ?? undefined;
+  // whisparrRemovalFlags returns null only for unmonitor here; the
+  // user-token level never reaches this function.
+  const flags = whisparrRemovalFlags(record.level);
+  let result: WhisparrRemovalResult;
+  try {
+    result =
+      flags === null
+        ? await unmonitorWhisparrItem(config, record.media, { expectAdded })
+        : await dropWhisparrItem(config, record.media, {
+            ...flags,
+            expectAdded,
+          });
+  } catch (e) {
+    // Preflight threw and nothing was sent; park in uncertain with the
+    // reason. The next pass re-resolves by identity behind the added guard.
+    storage.completeRemovalAttempt(
+      record.id,
+      claimToken,
+      attemptToken,
+      "uncertain",
+      reasonOf(e),
+    );
+    summary.uncertain++;
+    return;
+  }
+  switch (result.outcome) {
+    case "done":
+      storage.completeRemovalAttempt(
+        record.id,
+        claimToken,
+        attemptToken,
+        "done",
+      );
+      summary.removed++;
+      notifyTransition({
+        kind: "removed",
+        media: record.media,
+        ...(item.title !== undefined ? { title: item.title } : {}),
+      });
+      return;
+    case "already_gone":
+      // A proven 404 is success: the requested end state already holds.
+      storage.completeRemovalAttempt(
+        record.id,
+        claimToken,
+        attemptToken,
+        "done",
+        ALREADY_ABSENT,
+      );
+      summary.removed++;
+      notifyTransition({ kind: "removed", media: record.media });
+      return;
+    case "refused":
+      // The retry guard tripped: the identity now resolves to different,
+      // possibly re-added content. Terminal; never blindly retried. A fresh
+      // removal of the new content requires a fresh human approval.
+      storage.completeRemovalAttempt(
+        record.id,
+        claimToken,
+        attemptToken,
+        "failed",
+        result.reason,
+      );
+      summary.refused++;
+      return;
+    case "uncertain":
+      storage.completeRemovalAttempt(
+        record.id,
+        claimToken,
+        attemptToken,
+        "uncertain",
+        result.reason,
+      );
+      summary.uncertain++;
+      return;
+    case "failed":
+      storage.completeRemovalAttempt(
+        record.id,
+        claimToken,
+        attemptToken,
+        "failed",
+        result.reason,
+      );
+      summary.failed++;
+      notifyTransition({ kind: "failed", media: record.media });
+      return;
+  }
+}
+
+/** One due removal execution. Mirrors processOne: local gates, CAS claim,
+ * the work, and the claim release in a finally. */
+async function processRemoval(
+  exec: RemovalExecution,
+  config: IntegrationConfig | null,
+  summary: WorkSummary,
+): Promise<void> {
+  // Local gate before any claim: without ready delivery nothing destructive
+  // can run; state stays honestly due and self-heals when delivery is
+  // (re-)enabled.
+  if (config === null || !deliveryReady(config)) {
+    summary.blocked++;
+    return;
+  }
+  // A user-token level is detected up front and never faked: no downgrade,
+  // no skipped Jellyfin step, no admin-key fallback. Once its reason is
+  // durably recorded (attemptAt set), later passes skip it silently.
+  if (exec.level === "delete_jellyfin_item" && exec.attemptAt !== null) {
+    summary.blocked++;
+    return;
+  }
+  let claim: { record: RemovalExecution; claimToken: string };
+  try {
+    claim = storage.claimRemovalExecution(exec.id);
+  } catch (e) {
+    if (e instanceof AppError && e.status === 409) {
+      // Normal concurrency: another worker holds the claim. Skip it for
+      // this pass; never retry it here.
+      summary.contention++;
+      return;
+    }
+    throw e;
+  }
+  const { record, claimToken } = claim;
+  try {
+    if (record.level === "delete_jellyfin_item") {
+      if (record.attemptAt === null) {
+        const { attemptToken } = storage.beginRemovalAttempt(
+          record.id,
+          claimToken,
+          {},
+        );
+        storage.completeRemovalAttempt(
+          record.id,
+          claimToken,
+          attemptToken,
+          "uncertain",
+          USER_TOKEN_REQUIRED,
+        );
+      }
+      summary.blocked++;
+      return;
+    }
+    await executeRemoval(record, config, claimToken, summary);
+  } finally {
+    // A thrown error must never strand the claim; a stale token no-ops.
+    storage.releaseRemovalClaim(record.id, claimToken);
+  }
 }
 
 /** One delivery attempt. The attempt row is persisted BEFORE any network
@@ -364,6 +597,21 @@ async function processOne(
     summary.blocked++;
     return;
   }
+  // An approved removal owns this identity: re-adding it — a first POST or
+  // an uncertainty re-POST — would fight an explicit approval, including a
+  // removal that completed earlier in this same pass. Observation-only
+  // states keep reporting; they never POST.
+  if (
+    (item.state === "unsent" || item.state === "uncertain") &&
+    storage.getRemovalExecutionByReference(item.media) !== null
+  ) {
+    storage.recordAcquisitionObservation(item.id, {
+      unavailable: true,
+      reason: "a removal is approved or completed for this identity",
+    });
+    summary.blocked++;
+    return;
+  }
   let claim: { record: AcquisitionRecord; claimToken: string };
   try {
     claim = storage.claimAcquisition(item.id);
@@ -411,6 +659,27 @@ export async function runDueWork(
   const summary: WorkSummary = { ...EMPTY_SUMMARY };
   try {
     const config = storage.getConfig();
+    // Removals first: approved destructive work must not lose its turn to a
+    // batch of adds, and the guard in processOne keeps a same-pass add from
+    // racing a removal that just completed. With the operator flag off no
+    // removal work can exist; the due-list read throws removal_disabled and
+    // the pass continues with acquisitions only.
+    try {
+      for (const exec of storage.listDueRemovalExecutions(now, BATCH_SIZE)) {
+        try {
+          await processRemoval(exec, config, summary);
+        } catch (e) {
+          // One bad execution must not kill the batch; the claim was
+          // released in processRemoval's finally and it stays due.
+          summary.errors++;
+          console.error(
+            `[velvarr:acquisition] removal ${exec.id}: ${reasonOf(e)}`,
+          );
+        }
+      }
+    } catch (e) {
+      if (!(e instanceof AppError && e.code === "removal_disabled")) throw e;
+    }
     const due = storage.listDueAcquisitions(now, BATCH_SIZE);
     summary.considered = due.length;
     for (const item of due) {

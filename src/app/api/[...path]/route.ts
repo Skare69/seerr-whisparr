@@ -11,16 +11,21 @@ import type {
   MediaKind,
   MediaReference,
   ProviderStatus,
+  RemovalLevel,
   RequestRecord,
   Role,
   WhisparrPathMapping,
 } from "../../../lib/contracts.ts";
 import {
+  approveRemovalRequest,
   bootstrap,
+  cancelRemovalRequest,
   cancelRequest,
+  createRemovalRequest,
   createRequest,
   createSession,
   decideRequest,
+  declineRemovalRequest,
   getAcquisitionByReference,
   getAccount,
   getConfig,
@@ -31,6 +36,7 @@ import {
   isObservationStale,
   listAccounts,
   listRequests,
+  listRemovalRequests,
   revokeSession,
   saveConfig,
   updateAccount,
@@ -67,7 +73,10 @@ import {
   type CatalogSortKey,
   type ReleaseDateOperation,
 } from "../../../server/providers.ts";
-import { getWhisparrStatus } from "../../../server/whisparr.ts";
+import {
+  findWhisparrItem,
+  getWhisparrStatus,
+} from "../../../server/whisparr.ts";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -635,6 +644,7 @@ async function adminUpdateUser(
   const role = fieldRole(body, "role");
   const libraryIds = fieldIds(body, "libraryIds");
   const autoApprove = optionalBool(body, "autoApprove");
+  const canRemove = optionalBool(body, "canRemove");
   const configured = new Set(ctx.config.jellyfin.libraryIds);
   if (libraryIds.some((libraryId) => !configured.has(libraryId))) {
     throw new AppError(400, "invalid_field", "Unknown library selected.");
@@ -651,6 +661,7 @@ async function adminUpdateUser(
     role,
     libraryIds,
     ...(autoApprove !== undefined ? { autoApprove } : {}),
+    ...(canRemove !== undefined ? { canRemove } : {}),
   });
   return json({ account });
 }
@@ -1436,15 +1447,10 @@ async function catalogImage(request: Request): Promise<Response> {
   });
 }
 
-// Creates one user's request intent from a server-validated MediaReference.
-// A browser-supplied resolved payload is never trusted. With the autoApprove
-// grant the request is decided approved immediately so shared acquisition
-// work is enqueued; otherwise it stays pending for a moderator. No Whisparr
-// call happens anywhere on this path.
-async function createRequestRoute(request: Request): Promise<Response> {
-  guardMutation(request);
-  const ctx = await requireSession(request);
-  const media = (await readJson(request)).media;
+// Server-validated MediaReference from a request body. A browser-supplied
+// resolved payload is never trusted.
+function mediaFromBody(body: Record<string, unknown>): MediaReference {
+  const media = body.media;
   if (media === null || typeof media !== "object" || Array.isArray(media)) {
     throw new AppError(400, "invalid_field", "Invalid media reference.");
   }
@@ -1457,11 +1463,18 @@ async function createRequestRoute(request: Request): Promise<Response> {
   ) {
     throw new AppError(400, "invalid_field", "Invalid media reference.");
   }
-  const record = createRequest(ctx.account.id, {
-    provider: m.provider,
-    kind: m.kind,
-    id: m.id.toLowerCase(),
-  });
+  return { provider: m.provider, kind: m.kind, id: m.id.toLowerCase() };
+}
+
+// Creates one user's request intent from a server-validated MediaReference.
+// With the autoApprove grant the request is decided approved immediately so
+// shared acquisition work is enqueued; otherwise it stays pending for a
+// moderator. No Whisparr call happens anywhere on this path.
+async function createRequestRoute(request: Request): Promise<Response> {
+  guardMutation(request);
+  const ctx = await requireSession(request);
+  const media = mediaFromBody(await readJson(request));
+  const record = createRequest(ctx.account.id, media);
   if (ctx.account.autoApprove) {
     return json(
       {
@@ -1501,6 +1514,242 @@ async function decideRequestRoute(
     "invalid_field",
     "decision must be approved, declined, or cancelled.",
   );
+}
+
+// --- removals: guarded removal intents ---
+
+// The removal ladder, mirrored from contracts for runtime validation. The
+// level is always the approver's explicit choice.
+const REMOVAL_LEVEL_VALUES: readonly string[] = [
+  "unmonitor",
+  "drop",
+  "exclude",
+  "delete_files",
+  "delete_jellyfin_item",
+];
+
+// Runtime check, never a cast.
+function isRemovalLevel(value: string): value is RemovalLevel {
+  return REMOVAL_LEVEL_VALUES.includes(value);
+}
+
+// Boundary mirror of the storage gate so the refusal is legible at the API
+// edge; storage re-checks the flag authoritatively on every mutation.
+function assertRemovalFlag(): void {
+  if (process.env.VELVARR_ENABLE_REMOVAL !== "1") {
+    throw new AppError(
+      403,
+      "removal_disabled",
+      "Removals are turned off by the operator.",
+    );
+  }
+}
+
+function assertRemovalGrant(account: Account): void {
+  if (account.canRemove !== true) {
+    throw new AppError(
+      403,
+      "account_not_admitted",
+      "only admitted accounts holding the removal grant may request removals",
+    );
+  }
+}
+
+function assertRemovalApprover(account: Account): void {
+  if (
+    (account.role !== "admin" && account.role !== "moderator") ||
+    account.canRemove !== true
+  ) {
+    throw new AppError(
+      403,
+      "forbidden",
+      "approving removals requires an elevated role and the removal grant",
+    );
+  }
+}
+
+// Removal state is reported, never hidden: with the operator flag off the
+// collection still answers with enabled:false so the UI can explain the
+// state instead of pretending the feature does not exist.
+async function listRemovalsRoute(request: Request): Promise<Response> {
+  const ctx = await requireSession(request);
+  return json({
+    removals: listRemovalRequests(ctx.account),
+    enabled: process.env.VELVARR_ENABLE_REMOVAL === "1",
+  });
+}
+
+// Creation accepts exactly {media, reason}. A level key is refused outright
+// and no code path reads one: the level is the approver's choice by
+// construction, not an ignored field.
+async function createRemovalRoute(request: Request): Promise<Response> {
+  guardMutation(request);
+  const ctx = await requireSession(request);
+  assertRemovalFlag();
+  assertRemovalGrant(ctx.account);
+  const body = await readJson(request);
+  if (body.level !== undefined) {
+    throw new AppError(
+      400,
+      "invalid_field",
+      "The removal level is chosen at approval, not at creation.",
+    );
+  }
+  const removal = createRemovalRequest(
+    ctx.account.id,
+    mediaFromBody(body),
+    fieldText(body, "reason", 2000),
+  );
+  return json({ removal }, 201);
+}
+
+// Decision authority: approve = elevated role + removal grant + an explicit
+// ladder level; decline = elevated role; cancel = the requester's own intent
+// only. A level is rejected on every non-approved decision. Foreign or
+// unknown requests stay a bare 404 with no existence leak.
+async function decideRemovalRoute(
+  request: Request,
+  id: string,
+): Promise<Response> {
+  guardMutation(request);
+  const ctx = await requireSession(request);
+  const body = await readJson(request);
+  const requestId = requireId(id);
+  if (body.decision === "approved") {
+    assertRemovalFlag();
+    assertRemovalApprover(ctx.account);
+    const level = body.level;
+    if (typeof level !== "string" || !isRemovalLevel(level)) {
+      throw new AppError(
+        400,
+        "invalid_level",
+        "Approval requires an explicit removal level.",
+      );
+    }
+    return json({
+      removal: approveRemovalRequest(ctx.account, requestId, level),
+    });
+  }
+  if (body.decision === "declined" || body.decision === "cancelled") {
+    if (body.level !== undefined) {
+      throw new AppError(
+        400,
+        "invalid_level",
+        "A level is only accepted with an approved decision.",
+      );
+    }
+    const removal =
+      body.decision === "declined"
+        ? declineRemovalRequest(ctx.account, requestId)
+        : cancelRemovalRequest(ctx.account, requestId);
+    return json({ removal });
+  }
+  throw new AppError(
+    400,
+    "invalid_field",
+    "decision must be approved, declined, or cancelled.",
+  );
+}
+
+// Best-effort library name for a matched item: the frozen Jellyfin exports
+// expose no ancestors lookup by external reference, so scan this caller's
+// granted libraries (one bounded page each) for the matched item id. Absent
+// stays absent — never a guessed name.
+// ponytail: one 60-item page per granted library; deeper libraries omit the
+// name until jellyfin.ts exports an item-to-library lookup.
+async function libraryNameOf(
+  config: IntegrationConfig,
+  token: string,
+  account: Account,
+  itemId: string,
+): Promise<string | undefined> {
+  for (const libraryId of config.jellyfin.libraryIds) {
+    if (!account.libraryIds.includes(libraryId)) continue;
+    const page = await listLibraryItems(config, token, account, {
+      start: 0,
+      limit: 60,
+      search: "",
+      libraryId,
+    });
+    if (page.items.some((item) => item.id === itemId)) {
+      const libraries = await listLibraries(config, token);
+      return libraries.find((library) => library.id === libraryId)?.name;
+    }
+  }
+  return undefined;
+}
+
+// Strictly read-only removal preview: what would disappear, named for THIS
+// caller. Whisparr facts come from a stored-item read (GET only); the
+// Jellyfin side runs entirely under the caller's own token, so the match and
+// the deletion verdict reflect that user's real authority. No PUT, POST, or
+// DELETE exists anywhere on this path.
+async function removalImpact(request: Request): Promise<Response> {
+  const ctx = await requireSession(request);
+  const url = new URL(request.url);
+  const media = parseMediaReference(
+    url.searchParams.get("provider") ?? "",
+    url.searchParams.get("kind") ?? "",
+    url.searchParams.get("id") ?? "",
+  );
+  const config = getConfig();
+  if (!config)
+    throw new AppError(409, "not_initialized", "Setup has not been completed.");
+  const stored = config.whisparr ? await findWhisparrItem(config, media) : null;
+  const whisparr =
+    stored === null
+      ? { found: false }
+      : {
+          found: true,
+          path: stored.path,
+          fileCount: stored.fileCount,
+          sizeOnDisk: stored.sizeOnDisk,
+          monitored: stored.monitored,
+        };
+  const [verdict, caller] = await Promise.all([
+    resolvePlaybackAccess(
+      config,
+      ctx.token,
+      ctx.account,
+      stored !== null
+        ? {
+            provider: media.provider,
+            kind: media.kind,
+            id: media.id,
+            whisparrPath: stored.path,
+            ...(stored.title ? { title: stored.title } : {}),
+          }
+        : {
+            provider: media.provider,
+            kind: media.kind,
+            id: media.id,
+          },
+    ),
+    // This caller's own Jellyfin policy. validateUser is the frozen per-user
+    // authority surface: administrators provably hold deletion rights, so
+    // everyone else is conservatively refused.
+    // ponytail: Jellyfin's per-user EnableContentDeletion flag is not mapped
+    // by validateUser; surface it for non-admins if the mapping ever grows it.
+    validateUser(config, ctx.token),
+  ]);
+  const jellyfin =
+    verdict.outcome === "available"
+      ? {
+          matched: true,
+          itemName: verdict.item.name,
+          libraryName: await libraryNameOf(
+            config,
+            ctx.token,
+            ctx.account,
+            verdict.item.id,
+          ),
+        }
+      : { matched: false };
+  return json({
+    whisparr,
+    jellyfin,
+    canDeleteInJellyfin: caller.isAdministrator === true,
+  });
 }
 
 // Per-user playback verdict for one external identity. Runs under THIS
@@ -1882,6 +2131,10 @@ async function routeRequest(
       return globalSearch(request);
     if (root === "availability" && segments.length === 5)
       return availability(request, a!, b!, segments[4]!);
+    if (root === "removals" && segments.length === 2)
+      return listRemovalsRoute(request);
+    if (root === "removals" && a === "impact" && segments.length === 3)
+      return removalImpact(request);
     if (root === "admin" && a === "users" && segments.length === 3)
       return adminUsers(await requireAdmin(request));
     if (root === "admin" && a === "integrations" && segments.length === 3) {
@@ -1908,6 +2161,8 @@ async function routeRequest(
     }
     if (root === "requests" && segments.length === 2)
       return createRequestRoute(request);
+    if (root === "removals" && segments.length === 2)
+      return createRemovalRoute(request);
   } else if (method === "PATCH") {
     if (root === "admin" && a === "users" && segments.length === 4) {
       return adminUpdateUser(
@@ -1918,6 +2173,8 @@ async function routeRequest(
     }
     if (root === "requests" && segments.length === 3)
       return decideRequestRoute(request, segments[2]!);
+    if (root === "removals" && segments.length === 3)
+      return decideRemovalRoute(request, segments[2]!);
     if (root === "admin" && a === "integrations" && segments.length === 3) {
       return adminUpdateIntegrations(request, await requireAdmin(request));
     }

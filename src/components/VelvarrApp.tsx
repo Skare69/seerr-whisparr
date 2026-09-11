@@ -35,6 +35,7 @@ import { MoviesView, PerformersView, ScenesView } from "./catalog.tsx";
 import { DiscoverShelves } from "./discover.tsx";
 import { SearchView } from "./search.tsx";
 import { RequestsView } from "./requests.tsx";
+import { RemovalsView } from "./removals.tsx";
 
 /* ---------- App-local API view records (not in contracts.ts) ---------- */
 
@@ -633,6 +634,7 @@ const VIEWS = [
   "performers",
   "search",
   "requests",
+  "removals",
   "library",
   "admin",
   "settings",
@@ -727,7 +729,7 @@ function Shell() {
     { id: "performers" as View, label: "Performers", show: true },
     { id: "search" as View, label: "Search", show: true },
     { id: "requests" as View, label: "Requests", show: true },
-    { id: "library" as View, label: "Library", show: true },
+    { id: "removals" as View, label: "Removals", show: true },
     { id: "admin" as View, label: "Admin", show: isAdmin },
     { id: "settings" as View, label: "Settings", show: isAdmin },
   ].filter((n) => n.show);
@@ -812,10 +814,12 @@ function Shell() {
           {view === "settings" &&
             (isAdmin ? <SettingsView /> : <ForbiddenPanel />)}
           {view === "search" && <SearchView />}
+          {view === "removals" && <RemovalsView />}
           {view !== "library" &&
             view !== "admin" &&
             view !== "settings" &&
-            view !== "search" && (
+            view !== "search" &&
+            view !== "removals" && (
               <ProviderSurface view={view} onLibrary={() => go("library")} />
             )}
         </main>

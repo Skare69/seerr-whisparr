@@ -12,6 +12,7 @@ import {
   useParamsSetter,
   useSession,
 } from "./shared";
+import { levelLabel } from "./removals";
 import { PerformerView } from "./performer";
 import type {
   AcquisitionState,
@@ -23,6 +24,7 @@ import type {
   PlaybackAccess,
   RequestDecision,
   RequestRecord,
+  RemovalRequest,
 } from "../lib/contracts";
 
 /* ---------- Local shapes for API responses ---------- */
@@ -800,6 +802,196 @@ function AvailabilityBox({
   );
 }
 
+/** Error codes from POST /api/removals, mapped faithfully. */
+function removalRequestError(e: unknown): string {
+  if (e instanceof ApiError) {
+    switch (e.code) {
+      case "removal_disabled":
+        return "Removal is turned off by the operator — it cannot be requested right now.";
+      case "account_not_admitted":
+        return "Your account does not have the removal grant — ask an administrator.";
+      case "removal_request_exists":
+        return "A removal request for this item already exists.";
+      case "invalid_reason":
+        return "Give a reason for the removal.";
+      case "invalid_reference":
+        return "This item is not removable media.";
+      case "forbidden":
+        return "Removal is not available for your account.";
+    }
+  }
+  return messageOf(e);
+}
+
+/** Requester-side removal entry: a reason, never a level — the level is the
+ * approver's explicit choice. Rendered only for removable media kinds
+ * (movie/scene) by MediaActions; visible-but-explained when unavailable. */
+function RemovalAction({
+  target,
+}: {
+  target: { provider: CatalogProvider; kind: MediaKind; id: string };
+}) {
+  const { account } = useSession();
+  const grant = account.canRemove;
+  const [data, setData] = useState<{
+    removals: RemovalRequest[];
+    enabled: boolean;
+  } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reload, setReload] = useState(0);
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [created, setCreated] = useState<RemovalRequest | null>(null);
+  const [announcement, setAnnouncement] = useState("");
+
+  // One read gives the operator flag (enabled) and this user's existing
+  // removal requests, so the surface never guesses its own availability.
+  useEffect(() => {
+    if (!grant) return;
+    let live = true;
+    setLoadError(null);
+    api<{ removals: RemovalRequest[]; enabled: boolean }>("/api/removals")
+      .then((d) => {
+        if (live) setData(d);
+      })
+      .catch((e: unknown) => {
+        if (live) setLoadError(messageOf(e));
+      });
+    return () => {
+      live = false;
+    };
+  }, [grant, target.provider, target.kind, target.id, reload]);
+
+  const existing =
+    data?.removals.find(
+      (r) =>
+        r.media.provider === target.provider &&
+        r.media.kind === target.kind &&
+        r.media.id === target.id &&
+        (r.decision === "pending" || r.decision === "approved"),
+    ) ?? null;
+  const shown = created ?? existing;
+
+  const submit = () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    api<{ removal: RemovalRequest }>("/api/removals", {
+      method: "POST",
+      body: JSON.stringify({
+        media: {
+          provider: target.provider,
+          kind: target.kind,
+          id: target.id,
+        },
+        reason: reason.trim(),
+      }),
+    })
+      .then((d) => {
+        setCreated(d.removal);
+        setReason("");
+        setAnnouncement(
+          "Removal request submitted — an approver will choose the level.",
+        );
+      })
+      .catch((e: unknown) => {
+        const msg = removalRequestError(e);
+        setError(msg);
+        setAnnouncement(msg);
+        if (
+          e instanceof ApiError &&
+          (e.code === "removal_request_exists" || e.code === "forbidden")
+        )
+          setReload((n) => n + 1); // surface the server's real state
+      })
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="mt-4">
+      <div className="label">Removal</div>
+      <div className="sr-only" role="status" aria-live="polite">
+        {announcement}
+      </div>
+      {!grant ? (
+        <p className="mt-1 text-sm text-muted">
+          Removal is not available for your account — an administrator has not
+          granted it. You can still request the title instead.
+        </p>
+      ) : shown ? (
+        <div className="mt-1 flex flex-wrap items-center gap-2">
+          <span
+            className={`chip ${shown.decision === "pending" ? "chip-accent" : ""}`}
+          >
+            Removal {shown.decision}
+          </span>
+          {shown.level !== null && (
+            <span className="chip">Level: {levelLabel(shown.level)}</span>
+          )}
+          <span className="text-xs text-muted">
+            If approved, only the external media is removed — your catalog and
+            request history stay, and every attempt is recorded in the audit
+            trail.
+          </span>
+        </div>
+      ) : loadError !== null ? (
+        <div className="mt-1">
+          <ErrorPanel
+            title="Removal state unavailable"
+            message={loadError}
+            onRetry={() => setReload((n) => n + 1)}
+          />
+        </div>
+      ) : data === null ? (
+        <div className="skel mt-1 h-16 w-full" aria-hidden="true" />
+      ) : !data.enabled ? (
+        <p className="mt-1 text-sm text-muted">
+          Removal is turned off by the operator for this Velvarr instance, so it
+          cannot be requested right now.
+        </p>
+      ) : (
+        <form
+          className="mt-1 max-w-prose"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
+          <label htmlFor="removal-reason" className="label">
+            Why should this be removed? (shown to the approver)
+          </label>
+          <textarea
+            id="removal-reason"
+            className="input mt-1"
+            rows={2}
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+          />
+          <p className="mt-1 text-xs text-muted">
+            You supply only the reason — the removal level is chosen later by an
+            approver, never by you.
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              type="submit"
+              className="btn btn-accent"
+              disabled={busy || reason.trim() === ""}
+            >
+              {busy ? "Requesting…" : "Request removal"}
+            </button>
+            {error !== null && (
+              <span className="text-sm text-danger" role="alert">
+                {error}
+              </span>
+            )}
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
 function MediaActions({
   target,
   mine,
@@ -885,6 +1077,7 @@ function MediaActions({
         </p>
       )}
       <AvailabilityBox target={target} />
+      <RemovalAction target={target} />
       {target.kind === "movie" && (
         <p className="mt-2 text-xs text-muted">
           Owning one scene does not make the movie itself available in your

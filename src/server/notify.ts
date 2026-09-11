@@ -11,7 +11,7 @@ const TIMEOUT_MS = 5_000;
 /** Small local record describing one durable transition. Plain strings so
  * callers can pass a MediaReference-shaped value directly. */
 export type RequestNotification = {
-  kind: "approved" | "acquired" | "available" | "failed";
+  kind: "approved" | "acquired" | "available" | "failed" | "removed";
   media: { provider: string; kind: string; id: string };
   title?: string;
 };
