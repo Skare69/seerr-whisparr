@@ -505,8 +505,22 @@ export function PerformerView({ reference }: { reference: CatalogReference }) {
       ? d.sourceUrl
       : undefined;
 
+  // The performer page is entered with a pushed history entry, so Back returns
+  // to the results that led here. Shown only when there is somewhere to go
+  // back to, so a deep link never offers a control that leaves the app.
+  const canGoBack = typeof window !== "undefined" && window.history.length > 1;
+
   return (
     <section aria-label="Performer">
+      {canGoBack && (
+        <button
+          type="button"
+          className="btn mb-3"
+          onClick={() => window.history.back()}
+        >
+          Back to results
+        </button>
+      )}
       {notConfigured || err?.code === "provider_not_configured" ? (
         <div className="panel p-6" role="note">
           <h3 className="font-semibold">

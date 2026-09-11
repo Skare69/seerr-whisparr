@@ -1158,10 +1158,9 @@ function CatalogDetail() {
   const id = target?.id;
   const refKey = provider && kind && id ? `${provider}:${kind}:${id}` : null;
 
-  const close = useCallback(
-    () => setP({ provider: null, kind: null, id: null }),
-    [setP],
-  );
+  // Closing clears only the detail target. `provider` is also the browse
+  // source, so clearing it silently switched a StashDB browse back to TPDB.
+  const close = useCallback(() => setP({ kind: null, id: null }), [setP]);
   // Studio/tag navigation leaves the dialog for a fresh browse on the
   // matching surface: same provider, provider-native id, the other
   // provider's filter ids never carried across.
@@ -1310,7 +1309,19 @@ function CatalogDetail() {
             payload={payload}
             target={target}
             onNavigate={(r) =>
-              setP({ provider: r.provider, kind: r.kind, id: r.id })
+              setP(
+                {
+                  // A performer lives on the Performers surface; without the
+                  // view switch the reference changed but nothing rendered it.
+                  ...(r.kind === "performer" ? { view: "performers" } : {}),
+                  provider: r.provider,
+                  kind: r.kind,
+                  id: r.id,
+                },
+                // Leaving the browse for a performer page is a surface change,
+                // so Back must return to the results, not exit the app.
+                r.kind === "performer" ? { push: true } : undefined,
+              )
             }
             onBrowse={browseTo}
             onRefetch={() => setReload((n) => n + 1)}

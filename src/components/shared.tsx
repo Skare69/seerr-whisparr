@@ -52,19 +52,25 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 /* ---------- URL helpers ---------- */
 
+/** URL is the source of truth. Filter tweaks replace the entry so typing does
+ * not fill the history stack; a surface change (opting into `push`) leaves an
+ * entry so browser Back returns to the previous surface instead of exiting. */
 export function useParamsSetter() {
   const router = useRouter();
   return useCallback(
-    (updates: Record<string, string | null | undefined>) => {
+    (
+      updates: Record<string, string | null | undefined>,
+      options?: { push?: boolean },
+    ) => {
       const next = new URLSearchParams(window.location.search);
       for (const [k, v] of Object.entries(updates)) {
         if (v == null || v === "") next.delete(k);
         else next.set(k, v);
       }
       const qs = next.toString();
-      router.replace(qs ? `?${qs}` : window.location.pathname, {
-        scroll: false,
-      });
+      const href = qs ? `?${qs}` : window.location.pathname;
+      if (options?.push) router.push(href, { scroll: false });
+      else router.replace(href, { scroll: false });
     },
     [router],
   );
