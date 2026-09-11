@@ -1229,6 +1229,10 @@ test("integration rotation: no re-auth, pinned server, whisparr add/remove", asy
       jellyfinApiKey: "",
     },
   });
+    // ponytail-diag: temporary CI diagnostics, remove after triage.
+    console.error("DIAG", process.version, process.platform);
+  if (rotated.status !== 200)
+    console.error("ROTATEDBODY", rotated.status, await rotated.clone().text());
   assert.equal(rotated.status, 200);
   const rotatedBody = (await rotated.json()) as {
     jellyfin: { externalUrl: string; libraryIds: string[] };
