@@ -43,6 +43,19 @@ jobs:
         run: docker compose config -q
       - name: Build image
         run: docker build -t velvarr:ci .
+      # /data at the image root is the volume mountpoint (created empty), not
+      # build-context content; /app is where the context is copied and where a
+      # leak would land. node_modules/.next are pruned: third-party packages
+      # legitimately contain cache/config directories.
+      - name: Assert image carries no env, config, data, or cache paths
+        run: |
+          leaked=$(docker run --rm --entrypoint /bin/sh velvarr:ci -c \
+            'find /app -path /app/node_modules -prune -o -path /app/.next -prune -o \( -name ".env*" -o -name config -o -name data -o -name cache \) -print')
+          if [ -n "$leaked" ]; then
+            echo "credential or runtime-state paths leaked into the image:"
+            echo "$leaked"
+            exit 1
+          fi
       - name: Run container with throwaway runtime secrets
         run: |
           docker run -d --name velvarr-smoke \

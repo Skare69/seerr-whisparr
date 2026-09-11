@@ -53,6 +53,9 @@ mkdirSync(path.dirname(destination), { recursive: true });
 
 const db = new DatabaseSync(source, { readOnly: true });
 try {
+  // Wait out a concurrent writer instead of failing the backup with a
+  // spurious SQLITE_BUSY while the app holds the write lock for a moment.
+  db.exec("PRAGMA busy_timeout = 5000");
   // VACUUM INTO takes a consistent snapshot (WAL included) and fails if the file exists.
   db.exec(`VACUUM INTO '${destination.replaceAll("'", "''")}'`);
 } finally {

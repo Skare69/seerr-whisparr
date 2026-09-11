@@ -355,8 +355,21 @@ function validateAndMigrate(d: DatabaseSync): void {
       d.exec(`PRAGMA user_version = ${v}`);
       d.exec("COMMIT");
     } catch (e) {
-      d.exec("ROLLBACK");
-      throw e;
+      // DDL is transactional in SQLite: roll back every statement of this
+      // migration, then surface one explicit error instead of a raw driver
+      // error that could echo arbitrary SQL around.
+      try {
+        d.exec("ROLLBACK");
+      } catch {
+        // already rolled back / no transaction
+      }
+      const failure = new AppError(
+        500,
+        "migration_failed",
+        `schema migration to version ${v} failed; the database is left unchanged at version ${v - 1}`,
+      );
+      failure.cause = e;
+      throw failure;
     }
   }
 }

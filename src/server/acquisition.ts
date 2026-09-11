@@ -15,6 +15,7 @@ import {
   type WhisparrObservation,
   type WhisparrItem,
 } from "./whisparr.ts";
+import { notifyRequestEvent, type RequestNotification } from "./notify.ts";
 import type {
   Account,
   AcquisitionRecord,
@@ -31,6 +32,9 @@ const BATCH_SIZE = 20;
 // can never duplicate an add.
 const MAX_BACKOFF_MS = 10 * 60_000;
 const JITTER_MS = 5_000;
+// ponytail: 10s grace matches the container stop window; a pass stuck past
+// it is abandoned to boot-time reconciliation, never waited on longer.
+const SHUTDOWN_GRACE_MS = 10_000;
 
 export type WorkSummary = {
   /** Items the pass pulled from the due list. */
@@ -94,6 +98,14 @@ function reasonOf(e: unknown): string {
     e instanceof Error ? e.message : e instanceof AppError ? e.message : "";
   // AppError messages are sanitized upstream; never echo URLs or config.
   return (raw.trim().slice(0, 2000) || "unknown error").slice(0, 2000);
+}
+
+/** Fire-and-forget household notification. The pass never awaits the
+ * notifier, so a slow or hanging webhook cannot delay delivery or fail the
+ * work; the catch is belt-and-braces — notifyRequestEvent already never
+ * throws — and the event is identity facts, never a credential. */
+function notifyTransition(event: RequestNotification): void {
+  void notifyRequestEvent(event).catch(() => {});
 }
 
 function deliveryReady(config: IntegrationConfig | null): boolean {
@@ -190,6 +202,16 @@ async function dispatch(
         { state: "monitoring", item: itemFacts(result.item) },
         claimToken,
       );
+      // Durable transition recorded (unsent/uncertain → accepted): tell the
+      // household the add landed. Adoption (Whisparr already had the
+      // identity) is the same durable transition, so it notifies too.
+      notifyTransition({
+        kind: "acquired",
+        media: record.media,
+        ...(result.item.title !== undefined
+          ? { title: result.item.title }
+          : {}),
+      });
       if (result.outcome === "adopted") summary.adopted++;
       else summary.delivered++;
       return;
@@ -249,6 +271,14 @@ async function reconcileUncertain(
       claimToken,
     );
     summary.reconciled++;
+    // The earlier attempt WAS accepted upstream (we were blind to it): the
+    // household hears the real transition, once — acquired, or available
+    // when the item had already imported while we were uncertain.
+    notifyTransition({
+      kind: existing.hasFile ? "available" : "acquired",
+      media: record.media,
+      ...(existing.title !== undefined ? { title: existing.title } : {}),
+    });
     return;
   }
   await dispatch(record, config, claimToken, summary);
@@ -286,6 +316,15 @@ async function observe(
       claimToken,
     );
     summary.observed++;
+    // A real transition to imported (terminal) is worth announcing; steady
+    // monitoring/downloading rechecks are not, and neither is a repeat.
+    if (obs.state === "imported" && record.state !== "imported") {
+      notifyTransition({
+        kind: "available",
+        media: record.media,
+        ...(obs.item.title !== undefined ? { title: obs.item.title } : {}),
+      });
+    }
   } else {
     // Proven upstream absence from a successful lookup (removed out of
     // band): an authoritative absence — facts cleared for callers, state
@@ -364,6 +403,10 @@ export async function runDueWork(
     return { ...EMPTY_SUMMARY, overlap: true };
   }
   passInFlight = true;
+  let settle: () => void = () => {};
+  passDone = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
   const summary: WorkSummary = { ...EMPTY_SUMMARY };
   try {
     const config = storage.getConfig();
@@ -381,6 +424,7 @@ export async function runDueWork(
     }
   } finally {
     passInFlight = false;
+    settle();
   }
   return summary;
 }
@@ -388,6 +432,7 @@ export async function runDueWork(
 let timer: NodeJS.Timeout | null = null;
 let loopActive = false;
 let passInFlight = false;
+let passDone: Promise<void> = Promise.resolve();
 let backoffMs = 0;
 
 function schedulePass(delayMs: number): void {
@@ -435,4 +480,56 @@ export function stopAcquisitionLoop(): void {
     clearTimeout(timer);
     timer = null;
   }
+}
+
+export type ShutdownResult = { forced: boolean };
+
+let shutdownPromise: Promise<ShutdownResult> | null = null;
+
+/** Graceful shutdown for SIGTERM/SIGINT: stop scheduling, let an in-flight
+ * pass finish inside the grace window, then leave storage fully reconciled
+ * for the next process and close it. Idempotent — concurrent calls share
+ * one run; a call after completion is a safe no-op. If the grace window
+ * expires (or the pass itself crashes) the in-flight attempt is abandoned
+ * exactly the way a crash is recovered at boot: its persisted submitting
+ * attempt flips to uncertain for identity reconciliation and every claim
+ * dies, so a restart neither waits for a stale claim nor re-POSTs blindly.
+ * Never rejects. */
+export function shutdownAcquisition(
+  graceMs: number = SHUTDOWN_GRACE_MS,
+): Promise<ShutdownResult> {
+  if (shutdownPromise !== null) return shutdownPromise;
+  shutdownPromise = (async () => {
+    stopAcquisitionLoop();
+    let forced = false;
+    if (passInFlight) {
+      forced = await Promise.race([
+        passDone.then(() => false),
+        new Promise<boolean>((resolve) => {
+          const grace = setTimeout(() => resolve(true), graceMs);
+          // The grace timer must never hold a stopping process open.
+          grace.unref?.();
+        }),
+      ]).catch(() => true);
+      if (forced) {
+        try {
+          // ponytail: releases every claim, not just this pass's — compose
+          // runs a single worker; per-owner claims only if that changes.
+          storage.recoverAbandonedWork();
+        } catch (e) {
+          console.error(
+            `[velvarr:acquisition] abandon recovery failed: ${reasonOf(e)}`,
+          );
+        }
+      }
+    }
+    storage.closeStorage();
+    return { forced };
+  })();
+  // Only concurrent calls coalesce; a completed shutdown must not poison a
+  // later start/shutdown cycle (dev hot reload, tests).
+  void shutdownPromise.finally(() => {
+    shutdownPromise = null;
+  });
+  return shutdownPromise;
 }

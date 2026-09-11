@@ -16,7 +16,28 @@ bun run setup    # writes .env.local with fresh secrets; never overwrites existi
 bun run dev      # http://127.0.0.1:5577
 ```
 
-Production: `docker compose up --build`. The image runs the Next standalone server (`node server.js`), which is the supported path for this build's `output: "standalone"`; the image build, readiness, non-root and restart checks run in CI. `bun run build` then `bun run start` is a local preview only and Next prints a warning that `next start` is not the standalone entry point. Checks: `bun run check` (TypeScript strict), `bun run test` (node:test). Operations: `bun run backup <destination>` writes a consistent SQLite snapshot to a fresh destination; restore by copying it into a new data directory as `velvarr.sqlite` with the same `VELVARR_SECRET_KEY`.
+Production: `docker compose up --build`. The image runs the Next standalone server (`node server.js`), which is the supported path for this build's `output: "standalone"`; the image build, readiness, non-root, restart and no-secrets checks run in CI. `bun run build` then `bun run start` is a local preview only and Next prints a warning that `next start` is not the standalone entry point. Checks: `bun run check` (TypeScript strict), `bun run test` (node:test).
+
+## Environment variables
+
+`bun run setup` writes `VELVARR_ORIGIN`, `VELVARR_SECRET_KEY`, and `VELVARR_SETUP_SECRET` to the git-ignored `.env.local`. The container reads them from the environment at runtime only; no credential enters the image as a build argument, copied file, or layer.
+
+| Variable                | Required        | Meaning                                                                                                                                            |
+| ----------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `VELVARR_SECRET_KEY`    | yes             | Exactly 64 hex characters. Decrypts credentials stored in the database; losing it loses the stored data and every backup.                            |
+| `VELVARR_SETUP_SECRET`  | until bootstrap | At least 32 characters; gates the one-time owner setup.                                                                                             |
+| `VELVARR_ORIGIN`        | no              | Public origin; default `http://127.0.0.1:5577`.                                                                                                     |
+| `VELVARR_DATA_DIR`      | no              | Data directory; default `./data`, `/data` in the container.                                                                                         |
+| `VELVARR_ALLOW_HTTP`    | no              | `1` allows plain HTTP to trusted private addresses; loopback is always allowed.                                                                     |
+| `VELVARR_DISCORD_WEBHOOK_URL` | no        | Discord webhook for request notifications; unset disables the notifier entirely. Only https `discord.com`/`discordapp.com` webhook URLs are accepted (plain http only for loopback, which is how the test fixture works), and the URL is never logged or embedded in errors. |
+| `VELVARR_DISCORD_DETAIL` | no             | `1` includes titles in notifications. Off by default: messages carry only the event kind and the media identity (provider/kind/external id), never titles or artwork. |
+
+## Operations
+
+- **Backup and restore:** `bun run backup <destination>` writes a consistent SQLite snapshot to a fresh destination. To restore, copy the snapshot into a new data directory or fresh volume as `velvarr.sqlite` and start with the same `VELVARR_SECRET_KEY`; the key is never stored in the backup.
+- **Failed migration:** each schema version runs inside its own transaction; a failure rolls that version back and startup refuses the database rather than half-migrating it. Foreign or future databases are refused without being touched.
+- **Shutdown:** the acquisition loop uses unref'd timers and persists every attempt before dispatching, so stopping the process never delays exit and never loses or duplicates work; the next boot recovers anything left in flight.
+- **Container verification:** image build, readiness, non-root, restart on a persistent volume, and the no-secrets-in-image assertion run in CI, because this workstation has no container runtime.
 
 ## Repository layout
 

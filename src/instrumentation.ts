@@ -17,7 +17,7 @@ export async function register(): Promise<void> {
     // runtime this hook is invoked in.
     const [
       { initializeStorage, recoverAbandonedWork },
-      { startAcquisitionLoop },
+      { startAcquisitionLoop, shutdownAcquisition },
     ] = await Promise.all([
       import("./server/storage.ts"),
       import("./server/acquisition.ts"),
@@ -25,6 +25,24 @@ export async function register(): Promise<void> {
     initializeStorage();
     recoverAbandonedWork();
     startAcquisitionLoop();
+    // SIGTERM (container stop) / SIGINT (ctrl-c): stop scheduling, give an
+    // in-flight pass a bounded grace window, release claims, close storage.
+    // once() per signal plus the coalescing inside shutdownAcquisition make
+    // repeated signals safe; the explicit exit is what lets the process
+    // actually terminate despite the listening HTTP server (and reaps a
+    // pass still stuck past the grace window).
+    const onSignal = () => {
+      void shutdownAcquisition().then(({ forced }) => {
+        if (forced) {
+          console.error(
+            "[velvarr] shutdown grace expired; in-flight pass abandoned for boot-time reconciliation",
+          );
+        }
+        process.exit(0);
+      });
+    };
+    process.once("SIGTERM", onSignal);
+    process.once("SIGINT", onSignal);
   } catch (e) {
     // Visible in logs without leaking secrets (error messages here are the
     // sanitized AppError texts), and never rethrown: a broken boot must not

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createCipheriv, randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
+  copyFileSync,
   existsSync,
   mkdtempSync,
   readdirSync,
@@ -10,6 +12,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { AppError } from "../src/server/http.ts";
 import type {
   Account,
   CatalogDetail,
@@ -1362,7 +1366,7 @@ test("observations update changed facts; a proven absence is distinct from an ou
   assert.equal(absent.state, "downloading", "absence keeps the recorded state");
   assert.equal(
     absent.lastObservedAt,
-    moved.lastObservedAt,
+    healed.lastObservedAt,
     "absence never overwrites the last real observation",
   );
   const outage2 = storage.recordAcquisitionObservation(work.id, {
@@ -1374,4 +1378,400 @@ test("observations update changed facts; a proven absence is distinct from an ou
     true,
     "an outage after a proven absence keeps the authoritative absence",
   );
+});
+
+// --- M5 durability: failed migrations, backup/restore, restart reconciliation ---
+
+const BACKUP_SCRIPT = fileURLToPath(
+  new URL("../scripts/backup.mjs", import.meta.url),
+);
+
+/** Runs the real backup script against a data directory. */
+function runBackup(dataDir: string, destination: string): void {
+  const res = spawnSync(process.execPath, [BACKUP_SCRIPT, destination], {
+    env: {
+      ...process.env,
+      VELVARR_DATA_DIR: dataDir,
+      VELVARR_SECRET_KEY: KEY_A,
+    },
+    encoding: "utf8",
+  });
+  assert.equal(res.status, 0, `backup script failed: ${res.stderr}`);
+}
+
+/** Fabricates a schema-v3 database whose data rejects migration 4: the
+ * unique identity index is missing and two catalog rows share one identity,
+ * so migration 4's LAST statement (CREATE UNIQUE INDEX) fails only after
+ * CREATE TABLE / INSERT / DROP TABLE / RENAME all succeeded in-transaction. */
+function fabricateV3(dir: string): void {
+  const v3 = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  v3.exec("PRAGMA application_id = 0x564c5652");
+  v3.exec(`
+    CREATE TABLE config (
+      id INTEGER PRIMARY KEY CHECK (id = 0),
+      data BLOB NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE accounts (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('admin', 'moderator', 'requester')),
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+      library_ids TEXT NOT NULL CHECK (json_valid(library_ids)),
+      is_owner INTEGER NOT NULL CHECK (is_owner IN (0, 1)),
+      created_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX accounts_single_owner ON accounts (is_owner) WHERE is_owner = 1;
+    CREATE TABLE sessions (
+      token_hash TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+      jellyfin_token BLOB NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL CHECK (expires_at > 0)
+    );
+    CREATE INDEX sessions_account ON sessions (account_id);
+    ALTER TABLE accounts ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0
+      CHECK (auto_approve IN (0, 1));
+    CREATE TABLE catalog_identities (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene', 'performer')),
+      external_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE requests (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene')),
+      external_id TEXT NOT NULL,
+      decision TEXT NOT NULL
+        CHECK (decision IN ('pending', 'approved', 'declined', 'cancelled')),
+      created_at INTEGER NOT NULL,
+      decided_at INTEGER
+    );
+    CREATE UNIQUE INDEX requests_active_intent
+      ON requests (account_id, provider, kind, external_id)
+      WHERE decision IN ('pending', 'approved');
+    CREATE TABLE acquisitions (
+      id TEXT PRIMARY KEY,
+      instance_id TEXT NOT NULL,
+      provider TEXT NOT NULL CHECK (provider IN ('tpdb', 'stashdb')),
+      kind TEXT NOT NULL CHECK (kind IN ('movie', 'scene')),
+      external_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (
+        state IN (
+          'unsent', 'submitting', 'uncertain', 'monitoring',
+          'downloading', 'imported', 'failed', 'blocked'
+        )
+      ),
+      claim_token TEXT,
+      attempt_token TEXT,
+      claimed_at INTEGER,
+      attempt_at INTEGER,
+      due_at INTEGER,
+      submitted_at INTEGER,
+      last_observed_at INTEGER,
+      last_error_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX acquisitions_identity
+      ON acquisitions (instance_id, provider, kind, external_id);
+    CREATE INDEX acquisitions_due ON acquisitions (due_at);
+    ALTER TABLE acquisitions ADD COLUMN whisparr_id INTEGER;
+    ALTER TABLE acquisitions ADD COLUMN whisparr_path TEXT;
+    ALTER TABLE acquisitions ADD COLUMN whisparr_title TEXT;
+  `);
+  v3.exec("PRAGMA user_version = 3");
+  const now = Date.now();
+  v3.prepare(
+    "INSERT INTO accounts (id, name, role, enabled, library_ids, is_owner, created_at) VALUES (?, 'Owner', 'admin', 1, ?, 1, ?)",
+  ).run(ownerUser().id, JSON.stringify(testConfig().jellyfin.libraryIds), now);
+  v3.prepare("INSERT INTO config (id, data, updated_at) VALUES (0, ?, ?)").run(
+    encryptForTest(JSON.stringify(testConfig())),
+    now,
+  );
+  v3.prepare(
+    "INSERT INTO catalog_identities (id, provider, kind, external_id, title, created_at, updated_at) VALUES ('cat-v3-1', 'tpdb', 'movie', ?, 'Restore Target', ?, ?)",
+  ).run(MOVIE.id, now, now);
+  v3.prepare(
+    "INSERT INTO catalog_identities (id, provider, kind, external_id, title, created_at, updated_at) VALUES ('cat-v3-2', 'tpdb', 'movie', ?, 'Restore Duplicate', ?, ?)",
+  ).run(MOVIE.id, now, now);
+  v3.prepare(
+    "INSERT INTO requests (id, account_id, provider, kind, external_id, decision, created_at, decided_at) VALUES ('req-v3-1', ?, 'tpdb', 'movie', ?, 'approved', ?, ?)",
+  ).run(ownerUser().id, MOVIE.id, now, now);
+  v3.prepare(
+    "INSERT INTO acquisitions (id, instance_id, provider, kind, external_id, state, attempt_token, attempt_at, due_at, created_at, updated_at) VALUES ('acq-v3-1', 'instance-v3', 'tpdb', 'movie', ?, 'submitting', 'attempt-v3', ?, ?, ?, ?)",
+  ).run(MOVIE.id, now, now, now, now);
+  v3.close();
+}
+
+/** Logical dump: identity, version, schema objects, and every row of every
+ * table — journal-mode and byte-level churn from failed open attempts ignored. */
+function logicalState(file: string): {
+  applicationId: number;
+  userVersion: number;
+  objects: string[];
+  rows: Record<string, unknown[]>;
+} {
+  const d = new DatabaseSync(file);
+  try {
+    // Trusted shape: the module's own PRAGMA result rows.
+    const appIdRow = d.prepare("PRAGMA application_id").get() as {
+      application_id: number;
+    };
+    const verRow = d.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    const masterRows = d
+      .prepare("SELECT type || ':' || name AS o FROM sqlite_master ORDER BY o")
+      .all() as { o: string }[];
+    const tableRows = d
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      )
+      .all() as { name: string }[];
+    const rows: Record<string, unknown[]> = {};
+    for (const t of tableRows) {
+      rows[t.name] = d
+        .prepare(`SELECT * FROM "${t.name}" ORDER BY rowid`)
+        .all();
+    }
+    return {
+      applicationId: appIdRow.application_id,
+      userVersion: verRow.user_version,
+      objects: masterRows.map((r) => r.o),
+      rows,
+    };
+  } finally {
+    d.close();
+  }
+}
+
+function rawConfigBlob(dir: string): Buffer {
+  const d = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  try {
+    const row = d.prepare("SELECT data FROM config WHERE id = 0").get() as {
+      data: Buffer;
+    };
+    return row.data;
+  } finally {
+    d.close();
+  }
+}
+
+test("a failed migration rolls back completely: version, schema, and every row survive; the error names the version without leaking paths or keys", () => {
+  const dir = freshDir();
+  storage.closeStorage();
+  for (const suffix of ["", "-wal", "-shm"])
+    rmSync(join(dir, `velvarr.sqlite${suffix}`), { force: true });
+
+  fabricateV3(dir);
+  const before = logicalState(join(dir, "velvarr.sqlite"));
+  assert.equal(before.userVersion, 3);
+
+  let failure: unknown;
+  try {
+    storage.isInitialized();
+  } catch (e) {
+    failure = e;
+  }
+  // Storage contract: open/migration failures surface as AppError with a code.
+  assert.ok(
+    failure instanceof AppError,
+    "failure must surface as an explicit error",
+  );
+  assert.equal(failure.code, "migration_failed");
+  assert.match(failure.message, /version 4/);
+  assert.ok(!failure.message.includes(dir), "must not leak the data dir path");
+  assert.ok(!failure.message.includes(KEY_A), "must not leak key material");
+
+  // Nothing moved: same version, same schema objects, same rows — including
+  // the duplicate rows. No catalog_identities_new may survive.
+  const after = logicalState(join(dir, "velvarr.sqlite"));
+  assert.equal(after.userVersion, 3, "user_version must be unchanged");
+  assert.deepEqual(after.objects, before.objects, "no partial schema survives");
+  assert.deepEqual(after.rows, before.rows, "every pre-existing row intact");
+  assert.ok(after.objects.includes("table:catalog_identities"));
+  assert.ok(!after.objects.includes("table:catalog_identities_new"));
+
+  // Conflict resolved, the same database migrates and pre-existing rows are
+  // readable with the same key.
+  const repair = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  repair.prepare("DELETE FROM catalog_identities WHERE id = 'cat-v3-2'").run();
+  repair.close();
+  assert.equal(storage.isInitialized(), true);
+  const raw = new DatabaseSync(join(dir, "velvarr.sqlite"));
+  const versionRow = raw.prepare("PRAGMA user_version").get() as {
+    user_version: number;
+  };
+  raw.close();
+  assert.equal(versionRow.user_version, 4);
+  assert.deepEqual(storage.getConfig(), testConfig());
+  const owner = storage.getAccount(ownerUser().id);
+  assert.ok(owner);
+  assert.equal(owner.isOwner, true);
+  assert.equal(storage.getRequest("req-v3-1", owner)?.decision, "approved");
+  const acq = storage.getAcquisitionByReference(MOVIE, "instance-v3");
+  assert.equal(acq?.state, "submitting");
+  assert.equal(acq?.attemptToken, "attempt-v3");
+  const catalog = storage.getCatalogRecordByReference({
+    provider: "tpdb",
+    kind: "movie",
+    id: MOVIE.id,
+  });
+  assert.equal(catalog?.title, "Restore Target");
+});
+
+test("backup restores into a fresh data directory with everything intact; a wrong key fails safely", () => {
+  const dir = freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  // getConfig includes the storage-owned whisparr instanceId; compare against
+  // the stored form, not the input shape.
+  const savedConfig = storage.getConfig();
+  assert.ok(savedConfig);
+  const owner = storage.getAccount(ownerUser().id) as Account;
+  const [imported] = storage.importAccounts([otherUser()]);
+  assert.ok(imported);
+  const admitted = admit(imported.id);
+  const catalog = storage.upsertCatalogRecord(movieDetail());
+  const request = storage.createRequest(admitted.id, MOVIE);
+  const decided = storage.decideRequest(owner, request.id, "approved");
+  const due = storage.listDueAcquisitions(Date.now() + 60_000);
+  assert.equal(due.length, 1);
+  const work = due[0];
+  assert.ok(work);
+  const workId = work.id;
+  const claimed = storage.claimAcquisition(workId);
+  storage.recordAcquisitionObservation(
+    workId,
+    {
+      state: "monitoring",
+      item: { whisparrId: 42, path: "/data/xxx", title: "Pirates II" },
+    },
+    claimed.claimToken,
+  );
+  storage.releaseAcquisitionClaim(workId, claimed.claimToken);
+  const grant = storage.createSession(admitted.id, "jf-restore-session");
+  const before = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(before);
+
+  // Snapshot while the database is in use: this handle and its live WAL stay open.
+  const snapshot = join(dir, "snapshot.sqlite");
+  runBackup(dir, snapshot);
+  assert.ok(existsSync(snapshot));
+  assert.ok(
+    storage.getSession(grant.token),
+    "live db keeps working after snapshot",
+  );
+
+  // Restore = copy the snapshot in as velvarr.sqlite of a NEW data directory.
+  const restored = mkdtempSync(join(tmpdir(), "velvarr-restore-"));
+  copyFileSync(snapshot, join(restored, "velvarr.sqlite"));
+  storage.closeStorage();
+  process.env.VELVARR_DATA_DIR = restored;
+  assert.equal(storage.isInitialized(), true);
+  assert.deepEqual(storage.getConfig(), savedConfig);
+  assert.deepEqual(storage.getAccount(ownerUser().id), owner);
+  assert.deepEqual(storage.getAccount(admitted.id), admitted);
+  assert.equal(storage.getSession(grant.token)?.account.id, admitted.id);
+  assert.deepEqual(storage.getCatalogRecord(catalog.id), catalog);
+  assert.deepEqual(storage.getRequest(request.id, owner), decided);
+  assert.deepEqual(storage.getAcquisitionByReference(MOVIE), before);
+
+  // A wrong key fails loudly and corrupts nothing on the restored copy.
+  storage.closeStorage();
+  const wrongKey = mkdtempSync(join(tmpdir(), "velvarr-wrongkey-"));
+  copyFileSync(snapshot, join(wrongKey, "velvarr.sqlite"));
+  process.env.VELVARR_DATA_DIR = wrongKey;
+  process.env.VELVARR_SECRET_KEY = KEY_B;
+  assert.equal(storage.isInitialized(), true);
+  const blobBefore = rawConfigBlob(wrongKey);
+  assert.throws(
+    () => storage.getConfig(),
+    (e: { code: string }) => e.code === "secret_key_mismatch",
+  );
+  assert.deepEqual(rawConfigBlob(wrongKey), blobBefore);
+  storage.closeStorage();
+
+  // The right key still opens the untouched copy.
+  process.env.VELVARR_SECRET_KEY = KEY_A;
+  assert.deepEqual(storage.getConfig(), savedConfig);
+  storage.closeStorage();
+  rmSync(restored, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 50,
+  });
+  rmSync(wrongKey, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 50,
+  });
+});
+
+test("restored in-flight submissions reconcile to uncertain, never unsent; identity and audit evidence survive", () => {
+  const dir = freshDir();
+  storage.bootstrap(deliveryConfig(true), ownerUser(), "jf-owner-token");
+  const savedConfig = storage.getConfig();
+  assert.ok(savedConfig);
+  const owner = storage.getAccount(ownerUser().id) as Account;
+  const request = storage.createRequest(owner.id, MOVIE);
+  storage.decideRequest(owner, request.id, "approved");
+  const due = storage.listDueAcquisitions(Date.now() + 60_000);
+  assert.equal(due.length, 1);
+  const work = due[0];
+  assert.ok(work);
+  const workId = work.id;
+  const claimed = storage.claimAcquisition(workId);
+  const attempt = storage.beginSubmission(workId, claimed.claimToken);
+  const submitting = storage.getAcquisitionByReference(MOVIE);
+  assert.equal(submitting?.state, "submitting");
+  const beforeRequest = storage.getRequest(request.id, owner);
+
+  // Crash-equivalent: snapshot mid-submission, restore elsewhere.
+  const snapshot = join(dir, "snapshot.sqlite");
+  runBackup(dir, snapshot);
+  const restored = mkdtempSync(join(tmpdir(), "velvarr-reconcile-"));
+  copyFileSync(snapshot, join(restored, "velvarr.sqlite"));
+  storage.closeStorage();
+  process.env.VELVARR_DATA_DIR = restored;
+  assert.equal(storage.isInitialized(), true);
+
+  // Opening alone must not touch the work; recovery is an explicit step.
+  const untouched = storage.getAcquisitionByReference(MOVIE);
+  assert.equal(untouched?.state, "submitting");
+  assert.equal(untouched?.attemptToken, attempt.attemptToken);
+
+  storage.recoverAbandonedWork();
+  const reconciled = storage.getAcquisitionByReference(MOVIE);
+  assert.ok(reconciled);
+  assert.equal(reconciled.state, "uncertain", "uncertain, not unsent");
+  assert.equal(reconciled.submittedAt, null);
+  assert.equal(reconciled.attemptAt, submitting?.attemptAt);
+  assert.equal(
+    reconciled.attemptToken,
+    attempt.attemptToken,
+    "attempt evidence survives recovery",
+  );
+  assert.equal(reconciled.claimToken, null);
+  assert.match(reconciled.lastError ?? "", /unknown/i);
+  assert.equal(reconciled.instanceId, submitting?.instanceId);
+  assert.deepEqual(reconciled.media, MOVIE);
+  assert.equal(reconciled.createdAt, submitting?.createdAt);
+  assert.deepEqual(storage.getRequest(request.id, owner), beforeRequest);
+  assert.deepEqual(storage.getConfig(), savedConfig);
+  storage.closeStorage();
+  rmSync(restored, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 50,
+  });
 });

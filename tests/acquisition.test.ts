@@ -15,6 +15,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+// No top-level side effects: hoisting this above the env setup is safe.
+import { register } from "../src/instrumentation.ts";
 import type {
   Account,
   AcquisitionRecord,
@@ -272,6 +274,18 @@ async function until(cond: () => boolean): Promise<void> {
   for (let i = 0; i < 500 && !cond(); i++) {
     const { promise, resolve } = Promise.withResolvers<void>();
     setImmediate(resolve);
+    await promise;
+  }
+}
+
+/** Waits for cond() with a wall-clock ceiling. Needed for real network I/O
+ * (a loopback webhook POST): fake timers cannot drive undici sockets, and a
+ * fixed spin budget flakes under load. Kept to the notifier tests. */
+async function eventually(cond: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (!cond() && Date.now() < deadline) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 5);
     await promise;
   }
 }
@@ -725,4 +739,215 @@ test("changed facts persist; a proven removal is authoritative while an outage i
     observedAt,
     "removal never overwrites the last real observation",
   );
+});
+
+// --- shutdown ---------------------------------------------------------
+
+function rawRow(id: string): { state: string; claim_token: string | null } {
+  probeDb ??= new DatabaseSync(join(dir, "velvarr.sqlite"));
+  return probeDb
+    .prepare("SELECT state, claim_token FROM acquisitions WHERE id = ?")
+    .get(id) as { state: string; claim_token: string | null };
+}
+
+test("shutdown past the grace window releases the claim, recovers the attempt, and stale writes land nowhere", async () => {
+  const owner = boot();
+  approve(owner.id, MOVIE_A);
+  const id = workId(MOVIE_A);
+
+  const { promise, resolve } = Promise.withResolvers<void>();
+  knobs.holdAdd = promise;
+  const pass = acquisition.runDueWork();
+  await until(() => rawState(id).attempt === 1);
+
+  // Concurrent shutdown calls coalesce into one run.
+  const s1 = acquisition.shutdownAcquisition(150);
+  const s2 = acquisition.shutdownAcquisition(150);
+  assert.equal(s1, s2, "concurrent shutdown calls share one run");
+  assert.equal((await s1).forced, true, "grace expiry abandons the stuck pass");
+  assert.equal(
+    rawRow(id).claim_token,
+    null,
+    "claim released, never left for the next process to age out",
+  );
+  assert.equal(
+    rawRow(id).state,
+    "uncertain",
+    "the half-written submitting attempt is boot-reconcilable",
+  );
+  // Unstick the pass: it now holds stale tokens and must write nothing.
+  resolve();
+  const summary = await pass;
+  assert.equal(summary.errors, 1, "the stale write surfaces as a caught error");
+  assert.equal(postCount(), 1, "no re-POST after recovery");
+  assert.equal(rawRow(id).claim_token, null);
+  assert.equal(rawRow(id).state, "uncertain");
+  // A sequential second shutdown after the pass settled is safe and
+  // reports nothing forced.
+  assert.equal((await acquisition.shutdownAcquisition(50)).forced, false);
+});
+
+test("shutdown lets an in-flight pass finish inside the grace window", async () => {
+  const owner = boot();
+  approve(owner.id, MOVIE_B);
+  const id = workId(MOVIE_B);
+
+  const { promise, resolve } = Promise.withResolvers<void>();
+  knobs.holdAdd = promise;
+  const pass = acquisition.runDueWork();
+  await until(() => postCount() === 1);
+  const shutdown = acquisition.shutdownAcquisition(5_000);
+  resolve();
+  assert.equal((await shutdown).forced, false);
+  assert.equal((await pass).delivered, 1);
+  assert.equal(
+    probe(id).state,
+    "monitoring",
+    "completed pass resolves its own attempt; nothing stranded",
+  );
+  assert.equal(postCount(), 1);
+});
+
+test("after shutdown the loop schedules no further passes until restarted", async (t) => {
+  const owner = boot();
+  approve(owner.id, MOVIE_C);
+
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  acquisition.startAcquisitionLoop();
+  await t.mock.timers.tick(5);
+  await until(() => postCount() === 1);
+
+  assert.equal((await acquisition.shutdownAcquisition(1_000)).forced, false);
+  await t.mock.timers.tick(600_000);
+  await until(() => false);
+  assert.equal(postCount(), 1, "shutdown stopped all scheduling");
+
+  // A fresh cycle after shutdown works (dev hot reload, next boot).
+  approve(owner.id, MOVIE_A);
+  acquisition.startAcquisitionLoop();
+  await t.mock.timers.tick(5);
+  await until(() => postCount() === 2);
+  // Settle the pass before mock timers are torn down: its response handling
+  // needs real I/O turns, and an unsettled pass wedges passInFlight.
+  await until(() => false);
+  acquisition.stopAcquisitionLoop();
+});
+
+test("server-start hook registers idempotent SIGTERM/SIGINT handlers", async () => {
+  freshDb(); // nothing due: the hook's immediate pass is a no-op
+  // register() is Node-runtime gated; the test process pretends to be the
+  // server runtime for this call and restores the env after.
+  process.env.NEXT_RUNTIME = "nodejs";
+  const beforeTerm = process.listenerCount("SIGTERM");
+  const beforeInt = process.listenerCount("SIGINT");
+  await register();
+  assert.equal(process.listenerCount("SIGTERM"), beforeTerm + 1);
+  assert.equal(process.listenerCount("SIGINT"), beforeInt + 1);
+  await register(); // once-per-process guard: no double handlers
+  assert.equal(process.listenerCount("SIGTERM"), beforeTerm + 1);
+  assert.equal(process.listenerCount("SIGINT"), beforeInt + 1);
+  delete process.env.NEXT_RUNTIME;
+});
+
+// --- notifier ---------------------------------------------------------
+
+test("notifier fires exactly once per real transition and carries no credential", async () => {
+  const owner = boot();
+  const webhookBodies: string[] = [];
+  const webhook = createServer((req, res) => {
+    let raw = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
+      raw += chunk;
+    });
+    req.on("end", () => {
+      webhookBodies.push(raw);
+      res.writeHead(200);
+      res.end();
+    });
+  });
+  const listening = Promise.withResolvers<void>();
+  webhook.listen(0, "127.0.0.1", listening.resolve);
+  await listening.promise;
+  process.env.VELVARR_DISCORD_WEBHOOK_URL = `http://127.0.0.1:${
+    (webhook.address() as AddressInfo).port
+  }/api/webhooks/1/fixture-token`;
+  try {
+    approve(owner.id, MOVIE_A);
+    const delivered = await acquisition.runDueWork();
+    assert.equal(delivered.delivered, 1);
+    // Notification is fire-and-forget: let the POST land before counting.
+    await eventually(() => webhookBodies.length >= 1);
+    assert.equal(webhookBodies.length, 1, "one notification for the add");
+
+    const steady = await acquisition.runDueWork(later());
+    assert.equal(steady.observed, 1, "steady monitoring recheck");
+
+    knobs.inQueue = true;
+    await acquisition.runDueWork(later());
+
+    knobs.hasFile = true;
+    await acquisition.runDueWork(later());
+    await eventually(() => webhookBodies.length >= 2);
+    // Drain any slow stragglers: a wrongful notification fired during the
+    // steady/downloading passes would have landed by now.
+    await eventually(() => false);
+    assert.equal(
+      webhookBodies.length,
+      2,
+      "exactly one notification per real transition",
+    );
+
+    const all = webhookBodies.join("\n");
+    assert.ok(all.includes(EXT_A), "identity-only message names the media");
+    assert.ok(!all.includes(KEY), "webhook body carries no Whisparr key");
+    assert.ok(
+      !all.includes("jf-owner-token"),
+      "webhook body carries no session token",
+    );
+  } finally {
+    delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    webhook.closeAllConnections();
+    webhook.close();
+  }
+});
+
+test("a hanging or rejecting notifier neither fails nor delays the pass", async () => {
+  const owner = boot();
+  let mode: "hang" | "reject" = "hang";
+  const webhook = createServer((_req, res) => {
+    if (mode === "hang") return; // never respond
+    res.writeHead(500);
+    res.end("{}");
+  });
+  const listening = Promise.withResolvers<void>();
+  webhook.listen(0, "127.0.0.1", listening.resolve);
+  await listening.promise;
+  process.env.VELVARR_DISCORD_WEBHOOK_URL = `http://127.0.0.1:${
+    (webhook.address() as AddressInfo).port
+  }/api/webhooks/1/fixture-token`;
+  try {
+    approve(owner.id, MOVIE_A);
+    const start = Date.now();
+    const first = await acquisition.runDueWork();
+    const elapsed = Date.now() - start;
+    assert.equal(first.delivered, 1, "hung notifier never fails the work");
+    assert.ok(
+      elapsed < 2_000,
+      `hung notifier must not delay the pass (${elapsed}ms)`,
+    );
+
+    mode = "reject";
+    approve(owner.id, MOVIE_B);
+    const second = await acquisition.runDueWork();
+    assert.equal(
+      second.delivered,
+      1,
+      "rejecting notifier never fails the work",
+    );
+  } finally {
+    delete process.env.VELVARR_DISCORD_WEBHOOK_URL;
+    webhook.closeAllConnections();
+    webhook.close();
+  }
 });
