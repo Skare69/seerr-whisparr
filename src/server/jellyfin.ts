@@ -160,6 +160,40 @@ export async function getServer(
   };
 }
 
+export interface JellyfinStatus {
+  configured: boolean;
+  serverName?: string;
+  version?: string;
+}
+
+/** Admin connectivity probe for the SAVED configuration: one authenticated
+ * GET /System/Info with the stored API key. Unconfigured is returned, never
+ * faked; unreachable servers and rejected keys reject so the card can say
+ * "unavailable" instead of pretending. */
+export async function getJellyfinStatus(
+  config: IntegrationConfig,
+): Promise<JellyfinStatus> {
+  const jellyfin = config?.jellyfin;
+  if (!jellyfin?.url || !jellyfin.apiKey || !jellyfin.serverId) {
+    return { configured: false };
+  }
+  const info = await requestJson<{ ServerName?: unknown; Version?: unknown }>(
+    jellyfin.url,
+    "/System/Info",
+    jellyfin.apiKey,
+    { service: "jellyfin" },
+  );
+  return {
+    configured: true,
+    ...(typeof info?.ServerName === "string"
+      ? { serverName: info.ServerName.slice(0, 200) }
+      : {}),
+    ...(typeof info?.Version === "string"
+      ? { version: info.Version.slice(0, 64) }
+      : {}),
+  };
+}
+
 export async function authenticate(
   url: string,
   username: string,

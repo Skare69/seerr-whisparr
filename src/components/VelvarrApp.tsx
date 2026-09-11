@@ -48,6 +48,11 @@ interface WhisparrStatus {
   profiles?: { id: number; name: string }[];
 }
 
+interface JellyfinStatus {
+  configured: boolean;
+  serverName?: string;
+  version?: string;
+}
 interface IntegrationsInfo {
   jellyfin: {
     url: string;
@@ -1534,6 +1539,8 @@ function SettingsView() {
     <div className="space-y-6">
       <h2 className="text-lg font-semibold">Settings</h2>
       <IntegrationsForm onForbidden={() => setForbidden(true)} />
+      <JellyfinCard onForbidden={() => setForbidden(true)} />
+      <WhisparrCard onForbidden={() => setForbidden(true)} />
       <ProvidersCard providers={providers} />
       <LimitsPanel />
       <ReleaseStatusPanel />
@@ -2096,6 +2103,72 @@ function WhisparrCard({ onForbidden }: { onForbidden: () => void }) {
               ) : (
                 <span className="text-muted">None returned</span>
               )}
+            </dd>
+          </div>
+        </dl>
+      )}
+    </div>
+  );
+}
+function JellyfinCard({ onForbidden }: { onForbidden: () => void }) {
+  const [status, setStatus] = useState<JellyfinStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    api<JellyfinStatus>("/api/admin/jellyfin")
+      .then((s) => {
+        setStatus(s);
+        setLoading(false);
+      })
+      .catch((e) => {
+        if (e instanceof ApiError && e.status === 403) onForbidden();
+        else {
+          setError(messageOf(e));
+          setLoading(false);
+        }
+      });
+  }, [onForbidden]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <div className="panel p-5">
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="font-semibold">Jellyfin</h3>
+        <button type="button" className="btn" onClick={load} disabled={loading}>
+          Test connection
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="mt-3 space-y-2" aria-label="Checking Jellyfin">
+          <div className="skel h-5 w-1/2" />
+        </div>
+      ) : error ? (
+        <div className="mt-3">
+          <ErrorPanel
+            title="Jellyfin unavailable"
+            message={error}
+            onRetry={load}
+          />
+        </div>
+      ) : !status?.configured ? (
+        <p className="mt-3 text-sm text-muted">
+          Not configured. Save the Jellyfin URL and API key above to enable the
+          connection check.
+        </p>
+      ) : (
+        <dl className="mt-3 space-y-2 text-sm">
+          <div className="flex gap-2">
+            <dt className="text-muted">Connected</dt>
+            <dd className="font-medium">
+              {status.serverName ?? "Jellyfin"}
+              {status.version ? ` ${status.version}` : ""}
             </dd>
           </div>
         </dl>

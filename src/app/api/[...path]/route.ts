@@ -60,6 +60,7 @@ import {
   listUsers,
   resolvePlaybackAccess,
   validateUser,
+  getJellyfinStatus,
 } from "../../../server/jellyfin.ts";
 import {
   crossProviderLink,
@@ -849,6 +850,9 @@ async function adminUpdateIntegrations(
 
 async function adminWhisparr(ctx: AuthContext): Promise<Response> {
   return json(await getWhisparrStatus(ctx.config));
+}
+async function adminJellyfin(ctx: AuthContext): Promise<Response> {
+  return json(await getJellyfinStatus(ctx.config));
 }
 
 // --- catalog, requests, availability ---
@@ -2142,6 +2146,8 @@ async function routeRequest(
     }
     if (root === "admin" && a === "whisparr" && segments.length === 3)
       return adminWhisparr(await requireAdmin(request));
+    if (root === "admin" && a === "jellyfin" && segments.length === 3)
+      return adminJellyfin(await requireAdmin(request));
     if (root === "admin" && a === "providers" && segments.length === 3)
       return adminProviders(await requireAdmin(request));
   } else if (method === "POST") {

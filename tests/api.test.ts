@@ -214,6 +214,10 @@ async function jellyfinHandler(
 
   if (p === "/System/Info/Public")
     return json(res, 200, { Id: fx.serverId, ServerName: "FixtureJF" });
+  if (p === "/System/Info") {
+    if (token !== fx.adminKey) return json(res, 401, {});
+    return json(res, 200, { ServerName: "FixtureJF", Version: "10.9.0" });
+  }
   if (p === "/Users/AuthenticateByName" && req.method === "POST") {
     const body = await readBody(req);
     const match = fx.users.find(
@@ -1012,6 +1016,10 @@ test("admin import creates disabled grantless accounts; privilege boundary holds
     cookie: member,
   });
   await errorShape(memberWhisparr, 403);
+  const memberJellyfin = await call("GET", "/api/admin/jellyfin", {
+    cookie: member,
+  });
+  await errorShape(memberJellyfin, 403);
 });
 
 test("request and body validation bounds", async () => {
@@ -1280,6 +1288,20 @@ test("integration rotation: fresh password auth, pinned server, whisparr add/rem
   assert.equal(statusBody.configured, true);
   assert.equal(statusBody.version, "3.4.0.1387");
   assert.ok(Array.isArray(statusBody.rootFolders));
+
+  // The Jellyfin twin probe: saved URL + admin key, honestly verified.
+  const jellyfinStatus = await call("GET", "/api/admin/jellyfin", {
+    cookie: owner,
+  });
+  assert.equal(jellyfinStatus.status, 200);
+  const jellyfinBody = (await jellyfinStatus.json()) as {
+    configured: boolean;
+    serverName?: string;
+    version?: string;
+  };
+  assert.equal(jellyfinBody.configured, true);
+  assert.equal(jellyfinBody.serverName, "FixtureJF");
+  assert.equal(jellyfinBody.version, "10.9.0");
 
   const omit = await call("PATCH", "/api/admin/integrations", {
     cookie: owner,
