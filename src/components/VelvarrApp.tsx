@@ -36,6 +36,7 @@ import { DiscoverShelves } from "./discover.tsx";
 import { SearchView } from "./search.tsx";
 import { RequestsView } from "./requests.tsx";
 import { RemovalsView } from "./removals.tsx";
+import { LimitsPanel, ReleaseStatusPanel } from "./limits.tsx";
 
 /* ---------- App-local API view records (not in contracts.ts) ---------- */
 
@@ -1533,8 +1534,9 @@ function SettingsView() {
     <div className="space-y-6">
       <h2 className="text-lg font-semibold">Settings</h2>
       <IntegrationsForm onForbidden={() => setForbidden(true)} />
-      <WhisparrCard onForbidden={() => setForbidden(true)} />
       <ProvidersCard providers={providers} />
+      <LimitsPanel />
+      <ReleaseStatusPanel />
     </div>
   );
 }
