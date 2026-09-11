@@ -2059,3 +2059,152 @@ test("stashdb studio detail carries provider-supplied child count; absent stays 
     restore();
   }
 });
+
+// --- bounded release-date filter: emitted, rejected, and never leaked into
+// ordinary browse ---
+
+test("tpdb releaseDate emits the upstream date + date_operation pair; ordinary browse stays unbounded", async () => {
+  const restore = setEnv({ TPDB_API_TOKEN: TPDB_TOKEN });
+  const fixture = await startFixture((req, res) => {
+    if (req.url.startsWith("/movies?") || req.url.startsWith("/scenes?")) {
+      replyJson(res, 200, {
+        data: [{ ...tpdbMovieRow() }],
+        links: { next: null },
+        meta: { total: 1 },
+      });
+      return;
+    }
+    replyJson(res, 404, {});
+  });
+  try {
+    process.env.TPDB_BASE_URL = fixture.origin;
+    const bound = { cutoff: "2026-09-11", operation: "<=" } as const;
+    await searchCatalog({
+      provider: "tpdb",
+      kind: "movie",
+      releaseDate: { ...bound },
+      sort: "recency",
+      direction: "desc",
+    });
+    const movieParams = queryParams(fixture, 0);
+    assert.equal(movieParams.get("date"), "2026-09-11");
+    assert.equal(movieParams.get("date_operation"), "<=");
+    assert.equal(movieParams.get("orderBy"), "recently_released");
+    await searchCatalog({
+      provider: "tpdb",
+      kind: "scene",
+      releaseDate: { cutoff: "2026-01-01", operation: ">" },
+    });
+    const sceneParams = queryParams(fixture, 1);
+    assert.equal(sceneParams.get("date"), "2026-01-01");
+    assert.equal(sceneParams.get("date_operation"), ">");
+    assert.equal(sceneParams.get("orderBy"), null);
+
+    // Ordinary browse without the bound is byte-for-byte today's request:
+    // neither param appears at all.
+    await searchCatalog({ provider: "tpdb", kind: "movie" });
+    const browseParams = queryParams(fixture, 2);
+    assert.equal(browseParams.get("date"), null);
+    assert.equal(browseParams.get("date_operation"), null);
+    assert.equal(fixture.requests[2]?.url, "/movies?page=1&per_page=24");
+  } finally {
+    await fixture.close();
+    restore();
+  }
+});
+
+test("releaseDate is rejected explicitly where unsupported or malformed, before any upstream call", async () => {
+  const bound = { cutoff: "2026-09-11", operation: "<=" } as const;
+  const cases: {
+    query: CatalogSearchQuery;
+    match: RegExp;
+  }[] = [
+    {
+      query: {
+        provider: "stashdb",
+        kind: "scene",
+        releaseDate: bound,
+      } as CatalogSearchQuery,
+      match: /only supported on TPDB movie and scene/,
+    },
+    {
+      query: {
+        provider: "stashdb",
+        kind: "performer",
+        query: "anna",
+        releaseDate: bound,
+      } as CatalogSearchQuery,
+      match: /only supported on TPDB movie and scene/,
+    },
+    {
+      query: {
+        provider: "stashdb",
+        kind: "studio",
+        query: "vixen",
+        releaseDate: bound,
+      } as CatalogSearchQuery,
+      match: /only supported on TPDB movie and scene/,
+    },
+    {
+      query: {
+        provider: "tpdb",
+        kind: "performer",
+        query: "anna",
+        releaseDate: bound,
+      } as CatalogSearchQuery,
+      match: /only supported on TPDB movie and scene/,
+    },
+    {
+      query: {
+        provider: "tpdb",
+        kind: "studio",
+        query: "vixen",
+        releaseDate: bound,
+      } as CatalogSearchQuery,
+      match: /only supported on TPDB movie and scene/,
+    },
+    {
+      // filmography paging cannot carry the bound either
+      query: {
+        provider: "tpdb",
+        kind: "movie",
+        performer: CANON_PERFORMER_ID,
+        releaseDate: bound,
+      },
+      match: /release-date/,
+    },
+    {
+      // Invalid values a typed caller cannot express; these prove the
+      // runtime guard an untyped caller would hit.
+      query: {
+        provider: "tpdb",
+        kind: "movie",
+        releaseDate: { cutoff: "2026-09-11", operation: "lte" },
+      } as Record<string, unknown> as CatalogSearchQuery,
+      match: /operation of </,
+    },
+    {
+      query: {
+        provider: "tpdb",
+        kind: "scene",
+        releaseDate: { cutoff: "2026-02-30", operation: "<=" },
+      } as CatalogSearchQuery,
+      match: /ISO cutoff date/,
+    },
+    {
+      query: {
+        provider: "tpdb",
+        kind: "movie",
+        releaseDate: "2026-09-11",
+      } as Record<string, unknown> as CatalogSearchQuery,
+      match: /ISO cutoff date/,
+    },
+  ];
+  for (const { query, match } of cases) {
+    await assert.rejects(searchCatalog(query), (err: unknown) => {
+      assertProviderError(err, 400, "invalid_search");
+      assert.match(err instanceof AppError ? err.message : "", match);
+      return true;
+    });
+  }
+});

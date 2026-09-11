@@ -202,28 +202,33 @@ function CatalogCard({
   const performers =
     kind === "scene" ? item.credits.map((c) => c.name).join(", ") : "";
   return (
-    <button
-      type="button"
-      className={`card shrink-0 text-left ${width}`}
-      onClick={() => onOpen(item.reference)}
-    >
-      <div className={`relative w-full bg-raised ${aspect}`}>
-        <ItemImage
-          name={item.title}
-          src={imgSrc(item.imageUrl)}
-          className="absolute inset-0 h-full w-full object-cover"
-        />
-      </div>
-      <div className="p-2">
-        <div className="truncate text-sm font-medium">{item.title}</div>
-        <div className="truncate text-xs text-muted">
-          {meta.filter(Boolean).join(" · ")}
+    /* Sized wrapper: .card is unlayered CSS with width:100%, so sizing
+     * utilities on the button itself lose the cascade — the wrapper owns
+     * the tile width, the card fills it. */
+    <div className={`shrink-0 ${width}`}>
+      <button
+        type="button"
+        className="card"
+        onClick={() => onOpen(item.reference)}
+      >
+        <div className={`relative w-full bg-raised ${aspect}`}>
+          <ItemImage
+            name={item.title}
+            src={imgSrc(item.imageUrl)}
+            className="absolute inset-0 h-full w-full object-cover"
+          />
         </div>
-        {performers && (
-          <div className="truncate text-xs text-muted">with {performers}</div>
-        )}
-      </div>
-    </button>
+        <div className="p-2">
+          <div className="truncate text-sm font-medium">{item.title}</div>
+          <div className="truncate text-xs text-muted">
+            {meta.filter(Boolean).join(" · ")}
+          </div>
+          {performers && (
+            <div className="truncate text-xs text-muted">with {performers}</div>
+          )}
+        </div>
+      </button>
+    </div>
   );
 }
 

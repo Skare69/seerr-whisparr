@@ -63,6 +63,7 @@ import {
   type CatalogSearchQuery,
   type CatalogSortDirection,
   type CatalogSortKey,
+  type ReleaseDateOperation,
 } from "../../../server/providers.ts";
 import { getWhisparrStatus } from "../../../server/whisparr.ts";
 
@@ -938,10 +939,22 @@ interface CatalogSearchParams {
   tags: string[] | undefined;
   tagsAll: string[] | undefined;
   tagsExclude: string[] | undefined;
+  /** Bounded release-date filter, upstream-native `date` + `date_operation`
+   * pair. Null when absent; the pair is always provided together. */
+  date: string | null;
+  dateOperation: ReleaseDateOperation | null;
   sort: CatalogSortKey | undefined;
   direction: CatalogSortDirection | undefined;
   page: number;
   perPage: number;
+}
+
+// Runtime check, never a cast: the vocabulary mirrors providers'
+// CatalogSortKey so an unknown sort is the route's explicit 400.
+// TPDB date_operation values verified live 2026-09-11: only these operator
+// strings; word forms are an upstream 422.
+function isTpdbDateOperation(v: string): v is ReleaseDateOperation {
+  return ["<", "<=", "=", ">", ">="].includes(v);
 }
 
 // Runtime check, never a cast: the vocabulary mirrors providers'
@@ -1051,6 +1064,20 @@ function catalogSearchParams(
   ) {
     throw new AppError(400, "invalid_query", "Invalid year.");
   }
+  const dateRaw = params.get("date");
+  if (dateRaw !== null && !/^\d{4}-\d{2}-\d{2}$/.test(dateRaw))
+    throw new AppError(400, "invalid_query", "Invalid date.");
+  const dateOperationRaw = params.get("date_operation");
+  if (dateOperationRaw !== null && !isTpdbDateOperation(dateOperationRaw))
+    throw new AppError(400, "invalid_query", "Invalid date_operation.");
+  // Upstream `date` alone is an exact-match filter: the pair is meaningful
+  // only together, so a lone half is an explicit 400, never a dropped bound.
+  if ((dateRaw === null) !== (dateOperationRaw === null))
+    throw new AppError(
+      400,
+      "invalid_query",
+      "date and date_operation must be provided together.",
+    );
   const performer = params.get("performer");
   if (performer !== null && (performer === "" || performer.length > 128))
     throw new AppError(400, "invalid_query", "Invalid performer.");
@@ -1095,6 +1122,8 @@ function catalogSearchParams(
     performer,
     studio,
     studioMode,
+    date: dateRaw,
+    dateOperation: dateOperationRaw,
     tags: tagList(params, "tags"),
     tagsAll: tagList(params, "tagsAll"),
     tagsExclude: tagList(params, "tagsExclude"),
@@ -1170,7 +1199,9 @@ function stashdbSearchQuery(
       s.performer !== null ||
       s.studio !== null ||
       s.tags !== undefined ||
-      s.tagsExclude !== undefined
+      s.tagsExclude !== undefined ||
+      s.date !== null ||
+      s.dateOperation !== null
     ) {
       throw new AppError(
         400,
@@ -1199,6 +1230,13 @@ function stashdbSearchQuery(
       400,
       "invalid_query",
       "StashDB scene search does not support year.",
+    );
+  }
+  if (s.date !== null || s.dateOperation !== null) {
+    throw new AppError(
+      400,
+      "invalid_query",
+      "date/date_operation is a TPDB-only filter; StashDB scenes filter dates through their own criterion with modifiers, which is not emulated here.",
     );
   }
   return {
@@ -1256,7 +1294,9 @@ function tpdbSearchQuery(
       s.year !== undefined ||
       s.studio !== null ||
       s.tags !== undefined ||
-      s.tagsAll !== undefined
+      s.tagsAll !== undefined ||
+      s.date !== null ||
+      s.dateOperation !== null
     ) {
       throw new AppError(
         400,
@@ -1282,6 +1322,9 @@ function tpdbSearchQuery(
   const filters = {
     ...(s.q !== null ? { query: s.q } : {}),
     ...(s.year !== undefined ? { year: s.year } : {}),
+    ...(s.date !== null && s.dateOperation !== null
+      ? { releaseDate: { cutoff: s.date, operation: s.dateOperation } }
+      : {}),
     ...(s.performer !== null ? { performer: s.performer } : {}),
     ...(s.studio !== null ? { studio: s.studio } : {}),
     ...(s.tags !== undefined ? { tags: s.tags } : {}),
@@ -1559,11 +1602,15 @@ async function discover(request: Request): Promise<Response> {
     ctx.account.role === "requester"
       ? "Your recent requests."
       : "Recent requests across all accounts you can moderate.";
+  // UTC server date: the shared "today" cutoff for both TPDB recency shelves
+  // and their browse-all links.
+  const today = new Date().toISOString().slice(0, 10);
   const [tpdbMovies, tpdbScenes, stashTrending, recentlyAdded, requests] =
     await Promise.allSettled([
       searchCatalog({
         provider: "tpdb",
         kind: "movie",
+        releaseDate: { cutoff: today, operation: "<=" },
         sort: "recency",
         direction: "desc",
         page: 1,
@@ -1572,6 +1619,7 @@ async function discover(request: Request): Promise<Response> {
       searchCatalog({
         provider: "tpdb",
         kind: "scene",
+        releaseDate: { cutoff: today, operation: "<=" },
         sort: "recency",
         direction: "desc",
         page: 1,
@@ -1595,8 +1643,7 @@ async function discover(request: Request): Promise<Response> {
         {
           id: "tpdb-recent-movies",
           title: "Recently released movies",
-          scope:
-            "TPDB movies in release-date order, newest first — release recency, not popularity.",
+          scope: `TPDB movies released on or before ${today} (UTC), newest first — records without a release date are not listed; release recency, not popularity.`,
           source: "tpdb",
           kind: "catalog",
           browse: {
@@ -1606,6 +1653,8 @@ async function discover(request: Request): Promise<Response> {
               kind: "movie",
               sort: "recency",
               direction: "desc",
+              date: today,
+              date_operation: "<=",
             },
           },
         },
@@ -1615,8 +1664,7 @@ async function discover(request: Request): Promise<Response> {
         {
           id: "tpdb-recent-scenes",
           title: "Recently released scenes",
-          scope:
-            "TPDB scenes in release-date order, newest first — release recency, not popularity.",
+          scope: `TPDB scenes released on or before ${today} (UTC), newest first — records without a release date are not listed; release recency, not popularity.`,
           source: "tpdb",
           kind: "catalog",
           browse: {
@@ -1626,6 +1674,8 @@ async function discover(request: Request): Promise<Response> {
               kind: "scene",
               sort: "recency",
               direction: "desc",
+              date: today,
+              date_operation: "<=",
             },
           },
         },

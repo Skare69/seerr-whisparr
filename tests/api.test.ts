@@ -2134,16 +2134,16 @@ test("discover: five isolated shelves, honest scopes, grants, not-configured", a
   assert.match(trending?.scope ?? "", /StashDB/);
   assert.match(trending?.scope ?? "", /trending/i);
 
-  // Browse destinations mirror the shelf's actual upstream order.
-  assert.deepEqual(movies?.browse, {
-    view: "catalog",
-    params: {
-      provider: "tpdb",
-      kind: "movie",
-      sort: "recency",
-      direction: "desc",
-    },
-  });
+  // Browse destinations mirror the shelf's actual upstream query, including
+  // the release-date bound, so clicking through shows the same set.
+  assert.deepEqual(movies?.browse?.view, "catalog");
+  const browseParams = movies?.browse?.params ?? {};
+  assert.equal(browseParams.provider, "tpdb");
+  assert.equal(browseParams.kind, "movie");
+  assert.equal(browseParams.sort, "recency");
+  assert.equal(browseParams.direction, "desc");
+  assert.equal(browseParams.date_operation, "<=");
+  assert.match(browseParams.date ?? "", /^\d{4}-\d{2}-\d{2}$/);
 
   // Catalog shelves carry provider-labeled references.
   assert.deepEqual(movies?.items?.[0]?.reference, {

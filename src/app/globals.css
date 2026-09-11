@@ -24,6 +24,12 @@ body {
     sans-serif;
 }
 
+/* NOTE: the component classes below (.btn, .input, .panel, .card, .chip, …)
+ * are UNLAYERED, so they beat Tailwind's @layer utilities on any colliding
+ * property regardless of specificity — e.g. `w-36` cannot override
+ * `.card { width: 100% }`. Put sizing/other conflicting utilities on a
+ * wrapper element instead; don't `!important` or move these into a layer
+ * (app-wide blast radius). */
 .btn {
   display: inline-flex;
   align-items: center;

@@ -877,6 +877,15 @@ export type CatalogSearchQuery =
       studio?: string;
       tags?: string[];
       tagsAll?: string[];
+      /** Bounded release-date filter, TPDB-native `date` + `date_operation`.
+       * Only the operator strings TPDB actually accepts are exposed (<=, <, =,
+       * >, >= verified live 2026-09-11; word forms are upstream 422). Rejected
+       * explicitly for every other provider+kind — StashDB scenes have their
+       * own date criterion with modifiers, which is never emulated here. */
+      releaseDate?: {
+        cutoff: string;
+        operation: ReleaseDateOperation;
+      };
       sort?: CatalogSortKey;
       direction?: CatalogSortDirection;
       page?: number;
@@ -891,6 +900,10 @@ export type CatalogSearchQuery =
       studio?: string;
       tags?: string[];
       tagsAll?: string[];
+      releaseDate?: {
+        cutoff: string;
+        operation: ReleaseDateOperation;
+      };
       sort?: CatalogSortKey;
       direction?: CatalogSortDirection;
       page?: number;
@@ -931,6 +944,49 @@ export type CatalogSearchQuery =
     }
   | { provider: "stashdb"; kind: "performer"; query: string }
   | { provider: "stashdb"; kind: "studio"; query: string };
+/** TPDB date_operation values verified live 2026-09-11 on /movies and
+ * /scenes: only these operator strings; every word form (lte, before, ...)
+ * is an upstream 422. `date` without an operation is an exact-match filter,
+ * so the route and this provider always emit the pair together. */
+export type ReleaseDateOperation = "<" | "<=" | "=" | ">" | ">=";
+
+const RELEASE_DATE_OPS: readonly ReleaseDateOperation[] = [
+  "<",
+  "<=",
+  "=",
+  ">",
+  ">=",
+];
+
+function isReleaseDateOperation(v: unknown): v is ReleaseDateOperation {
+  return (
+    typeof v === "string" &&
+    RELEASE_DATE_OPS.some((operation) => operation === v)
+  );
+}
+
+/** Validates the bounded release-date filter: a real calendar cutoff date
+ * paired with an upstream-accepted operation. Anything else is an explicit
+ * 400, never a silently dropped bound. */
+function cleanReleaseDate(
+  v: unknown,
+): { cutoff: string; operation: ReleaseDateOperation } | undefined {
+  if (v === undefined) return undefined;
+  const raw =
+    typeof v === "object" && v !== null
+      ? (v as Record<string, unknown>)
+      : undefined;
+  const cutoff = raw?.cutoff;
+  const operation = raw?.operation;
+  if (!isIsoDate(cutoff) || !isReleaseDateOperation(operation)) {
+    throw new AppError(
+      400,
+      "invalid_search",
+      "releaseDate requires an ISO cutoff date (YYYY-MM-DD) and an operation of <, <=, =, >, or >=.",
+    );
+  }
+  return { cutoff, operation };
+}
 
 export interface CatalogSearchPage {
   provider: "tpdb" | "stashdb";
@@ -1169,6 +1225,22 @@ export async function searchCatalog(
       );
     }
   }
+  // releaseDate is real only on TPDB movie/scene searches (upstream `date` +
+  // `date_operation`). Every other carrier is rejected before any upstream
+  // request — a bound is never silently dropped, and StashDB's date criterion
+  // with modifiers is never emulated through it.
+  if (raw.releaseDate !== undefined) {
+    if (
+      query.provider !== "tpdb" ||
+      (query.kind !== "movie" && query.kind !== "scene")
+    ) {
+      throw new AppError(
+        400,
+        "invalid_search",
+        "releaseDate is only supported on TPDB movie and scene searches.",
+      );
+    }
+  }
   if (query.provider === "stashdb" && query.kind === "performer") {
     rejectUnusedFilters(
       raw,
@@ -1329,12 +1401,13 @@ export async function searchCatalog(
       // paging only; query/year filters are rejected, not ignored.
       if (
         cleanQueryTerm(query.query) !== undefined ||
-        cleanYear(query.year) !== undefined
+        cleanYear(query.year) !== undefined ||
+        query.releaseDate !== undefined
       ) {
         throw new AppError(
           400,
           "invalid_search",
-          "TPDB filmography paging cannot be combined with query, year, studio, tag, or sort filters.",
+          "TPDB filmography paging cannot be combined with query, year, release-date, studio, tag, or sort filters.",
         );
       }
       rejectUnusedFilters(
@@ -1374,9 +1447,12 @@ export async function searchCatalog(
       );
     }
     const studioFilter = await resolveTpdbStudioFilter(query.studio);
+    const releaseDate = cleanReleaseDate(query.releaseDate);
     const path = tpdbQuery({
       q: cleanQueryTerm(query.query),
       year: cleanYear(query.year),
+      date: releaseDate?.cutoff,
+      date_operation: releaseDate?.operation,
       tags: includeTags ?? allTags,
       site_id: studioFilter,
       tag_and: allTags !== undefined ? 1 : undefined,
