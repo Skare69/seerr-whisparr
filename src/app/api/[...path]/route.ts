@@ -154,6 +154,9 @@ function fieldText(
 ): string {
   const value = body[key];
   if (typeof value !== "string" || value.length === 0 || value.length > max) {
+    // ponytail-diag: temporary CI diagnostics, remove after triage.
+    if (key === "password")
+      console.error("PWSTACK", new Error("trace").stack);
     throw new AppError(400, "invalid_field", `Invalid ${key}.`);
   }
   return value;
@@ -673,36 +676,13 @@ async function adminUpdateIntegrations(
 ): Promise<Response> {
   guardMutation(request);
   const body = await readJson(request);
-  const password = fieldText(body, "password", 512);
   const jellyfinUrl = fieldUrl(body, "jellyfinUrl");
   const jellyfinExternalUrl = fieldUrl(body, "jellyfinExternalUrl");
-  // Fresh password authentication of the current administrator against the current URL.
-  // A rejected re-auth is a privilege denial for this action, not a lapsed session,
-  // so it must surface as 403 identity_mismatch rather than upstream_auth 401.
-  let user: ExternalUser;
-  try {
-    ({ user } = await authenticate(
-      ctx.config.jellyfin.url,
-      ctx.account.name,
-      password,
-    ));
-  } catch (err) {
-    if (err instanceof AppError && (err.status === 401 || err.status === 403)) {
-      throw new AppError(
-        403,
-        "identity_mismatch",
-        "Credentials do not match this administrator account.",
-      );
-    }
-    throw err;
-  }
-  if (user.id !== ctx.account.id) {
-    throw new AppError(
-      403,
-      "identity_mismatch",
-      "Credentials do not match this administrator account.",
-    );
-  }
+  // Authorization for this change is the admin session itself: requireAdmin
+  // re-validates the caller upstream on every request (identity, disabled,
+  // remote access) and guardMutation rejects foreign origins. No password
+  // re-auth here: it re-authenticated under the shared DeviceId, which
+  // invalidated the caller's own Jellyfin token and logged the admin out.
   const jellyfinApiKey = optionalText(body, "jellyfinApiKey", 512);
   const apiKey =
     jellyfinApiKey !== undefined && jellyfinApiKey !== ""

@@ -1564,7 +1564,6 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
   const [whisparrStatus, setWhisparrStatus] = useState<WhisparrStatus | null>(
     null,
   );
-  const [password, setPassword] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
@@ -1632,10 +1631,6 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
     e.preventDefault();
     setError(null);
     setSaved(null);
-    if (!password) {
-      setError("Re-enter your Jellyfin password to confirm this change.");
-      return;
-    }
     if (!jellyfinUrl.trim() || !externalUrl.trim()) {
       setError("Jellyfin URL and external URL are required.");
       return;
@@ -1660,7 +1655,6 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
       await api<unknown>("/api/admin/integrations", {
         method: "PATCH",
         body: JSON.stringify({
-          password,
           jellyfinUrl: jellyfinUrl.trim(),
           jellyfinExternalUrl: externalUrl.trim(),
           ...(jellyfinApiKey ? { jellyfinApiKey } : {}),
@@ -1691,7 +1685,6 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
             : {}),
         }),
       });
-      setPassword("");
       setJellyfinApiKey("");
       setWhisparrApiKey("");
       setSaved("Integrations updated.");
@@ -1817,19 +1810,6 @@ function IntegrationsForm({ onForbidden }: { onForbidden: () => void }) {
             }
             value={whisparrApiKey}
             onChange={(e) => setWhisparrApiKey(e.target.value)}
-          />
-        </div>
-        <div>
-          <label className="label" htmlFor="int-pass">
-            Your Jellyfin password (confirms the change)
-          </label>
-          <input
-            id="int-pass"
-            type="password"
-            className="input"
-            autoComplete="current-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
           />
         </div>
       </div>
