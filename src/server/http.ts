@@ -314,32 +314,42 @@ async function readBounded(
     throw err;
   }
 }
+// Metadata-provider cache: TPDB/StashDB reads only. Short-TTL freshness with
+// stale-on-error fallback, so an upstream blip serves the last good payload
+// instead of erroring a whole shelf. In-memory only, resets on restart.
+// ponytail: one global TTL and a FIFO cap; per-endpoint tuning or durability
+// only if real evidence demands it.
+const META_CACHE_TTL_MS = 10 * 60_000;
+const META_CACHE_MAX = 500;
+const metaCache = new Map<string, { at: number; bytes: Uint8Array }>();
 
-export async function requestJson<T>(
-  baseUrl: string,
-  path: string,
-  token: string,
-  // timeoutMs is an internal/test knob; callers use the 15s default.
-  options: {
-    method?: string;
-    body?: unknown;
-    service?: Service;
-    timeoutMs?: number;
-  } = {},
-): Promise<T> {
-  const service = options.service ?? "jellyfin";
-  const { bytes } = await requestBounded(
-    baseUrl,
-    path,
-    token,
-    service,
-    options.method ?? "GET",
-    options.body,
-    options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    "application/json",
-    JSON_LIMIT,
-    true,
+/** Test seam: the suite reuses one fixture upstream per file; tests reset
+ * between phases so cached reads never mask a scripted outage. */
+export function resetMetaCache(): void {
+  metaCache.clear();
+}
+
+function isCacheable(service: Service, method: string, body: unknown): boolean {
+  if (service !== "tpdb" && service !== "stashdb") return false;
+  if (method === "GET") return true;
+  // StashDB GraphQL reads arrive as POSTs; never cache a mutation. The
+  // substring check can only over-reject (a read whose variables mention
+  // "mutation" skips the cache), never serve stale writes.
+  return (
+    service === "stashdb" && !JSON.stringify(body ?? "").includes("mutation")
   );
+}
+
+function cachePut(key: string, bytes: Uint8Array): void {
+  if (metaCache.size >= META_CACHE_MAX) {
+    const oldest = metaCache.keys().next().value;
+    if (oldest !== undefined) metaCache.delete(oldest);
+  }
+  metaCache.delete(key);
+  metaCache.set(key, { at: Date.now(), bytes });
+}
+
+function parseJson<T>(bytes: Uint8Array, service: Service): T {
   try {
     return JSON.parse(new TextDecoder().decode(bytes)) as T;
   } catch {
@@ -348,6 +358,59 @@ export async function requestJson<T>(
       "upstream_bad_response",
       `${serviceName(service)} returned malformed JSON.`,
     );
+  }
+}
+
+export async function requestJson<T>(
+  baseUrl: string,
+  path: string,
+  token: string,
+  // timeoutMs and cacheTtlMs are internal/test knobs; callers use the 15s
+  // default and the 10-minute metadata TTL.
+  options: {
+    method?: string;
+    body?: unknown;
+    service?: Service;
+    timeoutMs?: number;
+    cacheTtlMs?: number;
+  } = {},
+): Promise<T> {
+  const service = options.service ?? "jellyfin";
+  const method = options.method ?? "GET";
+  const ttl = options.cacheTtlMs ?? META_CACHE_TTL_MS;
+  // ttl only governs fresh-hit refresh; 0 means "always revalidate", and the
+  // stale-on-error fallback still applies.
+  const cacheable = isCacheable(service, method, options.body);
+  const key = cacheable
+    ? `${service} ${method} ${baseUrl}${path} ${JSON.stringify(options.body ?? null)}`
+    : "";
+  const hit = cacheable ? metaCache.get(key) : undefined;
+  if (hit && Date.now() - hit.at < ttl) return parseJson<T>(hit.bytes, service);
+  try {
+    const { bytes } = await requestBounded(
+      baseUrl,
+      path,
+      token,
+      service,
+      method,
+      options.body,
+      options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      "application/json",
+      JSON_LIMIT,
+      true,
+    );
+    if (cacheable) cachePut(key, bytes);
+    return parseJson<T>(bytes, service);
+  } catch (error) {
+    // Only flaky infrastructure justifies stale data: an outage or timeout
+    // serves the last good payload instead of erroring a shelf. Authoritative
+    // answers (404, 401, malformed) always surface.
+    const staleWorthy =
+      error instanceof AppError &&
+      (error.code === "upstream_unavailable" ||
+        error.code === "upstream_timeout");
+    if (hit && staleWorthy) return parseJson<T>(hit.bytes, service);
+    throw error;
   }
 }
 

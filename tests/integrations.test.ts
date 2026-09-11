@@ -588,6 +588,96 @@ test("overall deadline fires while a stalled response body streams", async () =>
   );
 });
 
+test("requestJson caches metadata reads and serves stale on upstream failure", async () => {
+  let fail = false;
+  let hits = 0;
+  await withFixture(
+    (req, res) => {
+      const path = pathOf(req.url ?? "");
+      if (fail) return sendJson(res, 503, { down: true });
+      if (path === "/d") {
+        hits += 1;
+        return sendJson(res, 200, { n: hits });
+      }
+      sendJson(res, 200, { ok: true });
+    },
+    async (fx) => {
+      const count = (p: string) =>
+        fx.log.filter((r) => pathOf(r.url) === p).length;
+      // TTL 0 forces a refresh on every call; stale-on-error must still win.
+      const refresh = {
+        service: "tpdb" as const,
+        cacheTtlMs: 0,
+      };
+      const first = await requestJson<{ n: number }>(
+        fx.origin,
+        "/d",
+        TOKEN,
+        refresh,
+      );
+      assert.equal(first.n, 1);
+      fail = true;
+      const stale = await requestJson<{ n: number }>(
+        fx.origin,
+        "/d",
+        TOKEN,
+        refresh,
+      );
+      assert.equal(stale.n, 1);
+      assert.equal(count("/d"), 2);
+      // Without a cached payload the same outage still surfaces honestly.
+      await assert.rejects(
+        requestJson(fx.origin, "/fresh", TOKEN, refresh),
+        appError(502, "upstream_unavailable"),
+      );
+      fail = false;
+      // Fresh-TTL hits: both reads are served from the phase-1 entry, zero
+      // new upstream calls.
+      const cached = { service: "tpdb" as const, cacheTtlMs: 60_000 };
+      await requestJson(fx.origin, "/d", TOKEN, cached);
+      const again = await requestJson<{ n: number }>(
+        fx.origin,
+        "/d",
+        TOKEN,
+        cached,
+      );
+      assert.equal(again.n, 1);
+      assert.equal(count("/d"), 2);
+      // Jellyfin reads are never cached.
+      await requestJson(fx.origin, "/j", TOKEN);
+      await requestJson(fx.origin, "/j", TOKEN);
+      assert.equal(count("/j"), 2);
+      // StashDB GraphQL reads cache; mutations never do.
+      await requestJson(fx.origin, "/graphql", TOKEN, {
+        service: "stashdb",
+        method: "POST",
+        body: { query: "query { version }" },
+        cacheTtlMs: 60_000,
+      });
+      await requestJson(fx.origin, "/graphql", TOKEN, {
+        service: "stashdb",
+        method: "POST",
+        body: { query: "query { version }" },
+        cacheTtlMs: 60_000,
+      });
+      assert.equal(count("/graphql"), 1);
+      await requestJson(fx.origin, "/graphql", TOKEN, {
+        service: "stashdb",
+        method: "POST",
+        body: { query: "mutation { x }" },
+        cacheTtlMs: 60_000,
+      });
+      await requestJson(fx.origin, "/graphql", TOKEN, {
+        service: "stashdb",
+        method: "POST",
+        body: { query: "mutation { x }" },
+        cacheTtlMs: 60_000,
+      });
+      assert.equal(count("/graphql"), 3);
+    },
+  );
+});
+
 // --- Jellyfin identity ---
 
 test("getServer reads public info and canonicalizes the server id", async () => {

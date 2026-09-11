@@ -8,9 +8,9 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, beforeEach } from "node:test";
 
-import { AppError } from "../src/server/http.ts";
+import { AppError, resetMetaCache } from "../src/server/http.ts";
 import {
   crossProviderLink,
   fetchProviderArtwork,
@@ -24,6 +24,12 @@ import {
 } from "../src/server/providers.ts";
 import type { CatalogSearchQuery } from "../src/server/providers.ts";
 import type { CatalogDetail } from "../src/lib/contracts.ts";
+
+// One shared fixture upstream per file; every test starts with a cold cache
+// so cached reads never mask a scripted upstream change.
+beforeEach(() => {
+  resetMetaCache();
+});
 
 // --- constants and fixture helpers ---
 
@@ -1926,18 +1932,20 @@ test("stashdb studioMode withChildren emits parentStudio; default keeps studios 
     });
     assert.equal("parentStudio" in exact, false);
 
-    // omitted studioMode is byte-for-byte today's behavior
+    // omitted studioMode is byte-for-byte today's behavior (a distinct
+    // studio id keeps it a distinct upstream request rather than a cache hit
+    // on the exact variant above).
     await searchCatalog({
       provider: "stashdb",
       kind: "scene",
-      studio: STASH_STUDIO_ID,
+      studio: STASH_PARENT_STUDIO_ID,
     });
     const omitted = stashBody(fixture, 2).variables.f as {
       studios?: { value: string[]; modifier: string };
       parentStudio?: unknown;
     };
     assert.deepEqual(omitted.studios, {
-      value: [STASH_STUDIO_ID],
+      value: [STASH_PARENT_STUDIO_ID],
       modifier: "INCLUDES",
     });
     assert.equal("parentStudio" in omitted, false);

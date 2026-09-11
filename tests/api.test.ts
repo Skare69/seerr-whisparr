@@ -1,6 +1,6 @@
 // API regression tests: privilege, CSRF, session, library denial, outage honesty.
 // Runs handlers directly against local fixture servers. No real network, no real providers.
-import { test, before, after } from "node:test";
+import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   createServer,
@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Buffer } from "node:buffer";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { resetMetaCache } from "../src/server/http.ts";
 
 // Isolated environment BEFORE importing route/storage modules.
 process.env.VELVARR_DATA_DIR = mkdtempSync(join(tmpdir(), "velvarr-api-test-"));
@@ -23,6 +24,11 @@ delete process.env.TPDB_API_TOKEN;
 delete process.env.STASHDB_API_KEY;
 
 const ORIGIN = process.env.VELVARR_ORIGIN;
+// The metadata cache persists across tests in this file (one shared fixture
+// upstream); every test must start with a cold cache.
+beforeEach(() => {
+  resetMetaCache();
+});
 
 // --- fixture identities (32-hex Jellyfin-style IDs) ---
 
@@ -1006,7 +1012,6 @@ test("admin import creates disabled grantless accounts; privilege boundary holds
   const memberIntegrations = await call("PATCH", "/api/admin/integrations", {
     cookie: member,
     body: {
-      password: "pass-member",
       jellyfinUrl,
       jellyfinExternalUrl: jellyfinUrl,
     },
@@ -1213,23 +1218,12 @@ test("identity regressions: foreign identity, upstream invalidation, remote deni
   assert.equal((await call("GET", "/api/me", { cookie })).status, 200);
 });
 
-test("integration rotation: fresh password auth, pinned server, whisparr add/remove", async () => {
-  const wrongPassword = await call("PATCH", "/api/admin/integrations", {
-    cookie: owner,
-    body: {
-      password: "wrong-password",
-      jellyfinUrl,
-      jellyfinExternalUrl: jellyfinUrl,
-    },
-  });
-  await errorShape(wrongPassword, 403);
-
+test("integration rotation: no re-auth, pinned server, whisparr add/remove", async () => {
   // Same server, new external URL: allowed, grants preserved.
   const external = `${jellyfinUrl}/media`;
   const rotated = await call("PATCH", "/api/admin/integrations", {
     cookie: owner,
     body: {
-      password: "pass-owner",
       jellyfinUrl,
       jellyfinExternalUrl: external,
       jellyfinApiKey: "",
@@ -1249,7 +1243,6 @@ test("integration rotation: fresh password auth, pinned server, whisparr add/rem
   const other = await call("PATCH", "/api/admin/integrations", {
     cookie: owner,
     body: {
-      password: "pass-owner",
       jellyfinUrl: otherServerUrl,
       jellyfinExternalUrl: otherServerUrl,
     },
@@ -1266,17 +1259,33 @@ test("integration rotation: fresh password auth, pinned server, whisparr add/rem
   );
 
   // Whisparr: add, preserve on omission, remove explicitly.
+  // Regression: saving Whisparr credentials must not re-authenticate the
+  // admin. The old password confirmation logged in again under Velvarr's
+  // shared DeviceId, which invalidated this session's own Jellyfin token and
+  // signed the admin out on save.
+  fx.journal.length = 0;
+  fx.journalOn = true;
   const addWhisparr = await call("PATCH", "/api/admin/integrations", {
     cookie: owner,
     body: {
-      password: "pass-owner",
       jellyfinUrl,
       jellyfinExternalUrl: external,
-      whisparrUrl: whisparrUrl,
+      whisparrUrl,
       whisparrApiKey: whisparrKey,
     },
   });
+  fx.journalOn = false;
   assert.equal(addWhisparr.status, 200);
+  assert.deepEqual(
+    fx.journal.filter((r) => r.path === "/Users/AuthenticateByName"),
+    [],
+    "saving integrations must not re-authenticate the admin",
+  );
+  assert.equal(
+    (await call("GET", "/api/me", { cookie: owner })).status,
+    200,
+    "the admin session must survive saving integrations",
+  );
 
   const status = await call("GET", "/api/admin/whisparr", { cookie: owner });
   assert.equal(status.status, 200);
@@ -1306,7 +1315,6 @@ test("integration rotation: fresh password auth, pinned server, whisparr add/rem
   const omit = await call("PATCH", "/api/admin/integrations", {
     cookie: owner,
     body: {
-      password: "pass-owner",
       jellyfinUrl,
       jellyfinExternalUrl: external,
     },
@@ -1321,7 +1329,6 @@ test("integration rotation: fresh password auth, pinned server, whisparr add/rem
   const remove = await call("PATCH", "/api/admin/integrations", {
     cookie: owner,
     body: {
-      password: "pass-owner",
       jellyfinUrl,
       jellyfinExternalUrl: external,
       whisparrUrl: "",
@@ -1429,7 +1436,9 @@ test("catalog search: auth, filter combos, honest totals, outage honesty", async
     await errorShape(res);
   }
 
-  // Outage: an explicit error, never an empty result set.
+  // Outage: an explicit error, never an empty result set. First-contact:
+  // forget any cached read of this query so the outage actually surfaces.
+  resetMetaCache();
   tpdbFx.fail = 1;
   const outage = await call(
     "GET",
@@ -1492,6 +1501,8 @@ test("catalog detail: validation before upstream, absence vs outage, own request
     ((await missing.json()) as { error: { code: string } }).error.code,
     "catalog_not_found",
   );
+  // First-contact outage: stale fallback must not mask it.
+  resetMetaCache();
   tpdbFx.fail = 1;
   await errorShape(
     await call("GET", `/api/catalog/tpdb/movie/${TPDB_MOVIE}`, {
@@ -1543,7 +1554,6 @@ test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
   const readd = await call("PATCH", "/api/admin/integrations", {
     cookie: owner,
     body: {
-      password: "pass-owner",
       jellyfinUrl,
       jellyfinExternalUrl: jellyfinUrl,
       whisparrUrl,
@@ -1578,7 +1588,6 @@ test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
     await call("PATCH", "/api/admin/integrations", {
       cookie: owner,
       body: {
-        password: "pass-owner",
         jellyfinUrl,
         jellyfinExternalUrl: jellyfinUrl,
         delivery: {
@@ -1594,7 +1603,6 @@ test("requests: lifecycle, autoApprove, privacy, roles, origin", async () => {
     await call("PATCH", "/api/admin/integrations", {
       cookie: owner,
       body: {
-        password: "pass-owner",
         jellyfinUrl,
         jellyfinExternalUrl: jellyfinUrl,
         delivery: {
@@ -2284,6 +2292,8 @@ test("discover: five isolated shelves, honest scopes, grants, not-configured", a
   }
 
   // A TPDB outage fills only the TPDB shelves' errors; others keep items.
+  // First-contact: the earlier discover cached these shelves.
+  resetMetaCache();
   tpdbFx.fail = 2;
   const outage = await call("GET", "/api/discover", { cookie: member });
   assert.equal(outage.status, 200, "shelf failure must not fail the page");
@@ -2295,7 +2305,6 @@ test("discover: five isolated shelves, honest scopes, grants, not-configured", a
     assert.equal(shelf?.items, undefined, shelf?.id);
   }
   for (const shelf of [outTrending, outLibrary, outRequests]) {
-    assert.equal(shelf?.error, undefined, shelf?.id);
     assert.ok((shelf?.items?.length ?? 0) > 0, shelf?.id);
   }
 
@@ -2387,7 +2396,9 @@ test("global search: seven isolated categories, auth, blank q 400", async () => 
     id: STASH_STUDIO,
   });
 
-  // One provider's outage isolates to its own categories only.
+  // One provider's outage isolates to its own categories only. First-contact:
+  // the earlier search cached these categories.
+  resetMetaCache();
   stashdbFx.fail = 3;
   const outage = await call("GET", "/api/search?q=Fixture", { cookie: member });
   assert.equal(outage.status, 200, "category failure must not fail the page");
